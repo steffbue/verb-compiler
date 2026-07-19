@@ -45,6 +45,23 @@ fn type_error_aborts() { run_err("err_types", "operands must be numbers"); }
 fn div_zero_aborts() { run_err("err_divzero", "division by zero"); }
 
 #[test]
+fn vars() { run_ok("vars"); }
+
+#[test]
+fn control() { run_ok("control"); }
+
+#[test]
+fn undefined_var_is_compile_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/err_undef.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("undefined variable"), "stderr: {stderr}");
+}
+
+#[test]
 fn emits_llvm_ir() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run", "tests/fixtures/literals.verb", "--emit-llvm"])

@@ -522,9 +522,84 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
+    fn lookup(&self, name: &str) -> Option<PointerValue<'ctx>> {
+        self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
             Stmt::ExprStmt(e) => { self.gen_expr(e)?; Ok(()) }
+            Stmt::Assign { name, value } => {
+                let v = self.gen_expr(value)?;
+                let cell = self.malloc_bytes(16);
+                self.builder.build_store(cell, v).unwrap();
+                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                Ok(())
+            }
+            Stmt::Reassign { name, value, line, col } => {
+                let cell = self.lookup(name).ok_or_else(|| CompileError::new(
+                    format!("undefined variable '{name}' (declare with 'assign')"), *line, *col))?;
+                let v = self.gen_expr(value)?;
+                self.builder.build_store(cell, v).unwrap();
+                Ok(())
+            }
+            Stmt::Block(stmts) => {
+                self.scopes.push(HashMap::new());
+                let r = self.gen_stmts(stmts);
+                self.scopes.pop();
+                r
+            }
+            Stmt::If { cond, then_body, else_body } => {
+                let cv = self.gen_expr(cond)?;
+                let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
+                let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let then_bb = self.ctx.append_basic_block(f, "if.then");
+                let else_bb = self.ctx.append_basic_block(f, "if.else");
+                let merge = self.ctx.append_basic_block(f, "if.end");
+                self.builder.build_conditional_branch(t, then_bb, else_bb).unwrap();
+
+                self.builder.position_at_end(then_bb);
+                self.scopes.push(HashMap::new());
+                self.gen_stmts(then_body)?;
+                self.scopes.pop();
+                if self.cur_block_open() {
+                    self.builder.build_unconditional_branch(merge).unwrap();
+                }
+
+                self.builder.position_at_end(else_bb);
+                if let Some(eb) = else_body {
+                    self.scopes.push(HashMap::new());
+                    self.gen_stmts(eb)?;
+                    self.scopes.pop();
+                }
+                if self.cur_block_open() {
+                    self.builder.build_unconditional_branch(merge).unwrap();
+                }
+                self.builder.position_at_end(merge);
+                Ok(())
+            }
+            Stmt::While { cond, body } => {
+                let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let cond_bb = self.ctx.append_basic_block(f, "while.cond");
+                let body_bb = self.ctx.append_basic_block(f, "while.body");
+                let end_bb = self.ctx.append_basic_block(f, "while.end");
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+                self.builder.position_at_end(cond_bb);
+                let cv = self.gen_expr(cond)?;
+                let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
+                self.builder.build_conditional_branch(t, body_bb, end_bb).unwrap();
+
+                self.builder.position_at_end(body_bb);
+                self.scopes.push(HashMap::new());
+                self.gen_stmts(body)?;
+                self.scopes.pop();
+                if self.cur_block_open() {
+                    self.builder.build_unconditional_branch(cond_bb).unwrap();
+                }
+                self.builder.position_at_end(end_bb);
+                Ok(())
+            }
             other => Err(CompileError::new(
                 format!("codegen not yet implemented for {other:?}"), 0, 0)),
         }
@@ -546,6 +621,11 @@ impl<'ctx> Codegen<'ctx> {
             }
             Expr::Bool(b) => Ok(self.make_val(TAG_BOOL, self.ctx.i64_type().const_int(*b as u64, false))),
             Expr::Nil => Ok(self.nil_val()),
+            Expr::Var(name, line, col) => {
+                let cell = self.lookup(name).ok_or_else(|| CompileError::new(
+                    format!("undefined variable '{name}'"), *line, *col))?;
+                Ok(self.builder.build_load(self.value_ty, cell, name).unwrap().into_struct_value())
+            }
             Expr::Binary { op, lhs, rhs } => self.gen_binary(*op, lhs, rhs),
             Expr::Unary { op, expr } => {
                 let v = self.gen_expr(expr)?;

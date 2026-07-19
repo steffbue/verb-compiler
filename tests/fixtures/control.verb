@@ -1,0 +1,16 @@
+assign n 3;
+if (n hi 5) {
+  print("big");
+} else if (n hi 2) {
+  print("mid");
+} else {
+  print("small");
+}
+assign i 0;
+while (i lo 3) {
+  print(i);
+  i be i plus 1;
+}
+for (assign j 0; j lo 3; j be j plus 1) {
+  print(j mul 10);
+}
