@@ -1,5 +1,7 @@
+mod ast;
 mod error;
 mod lexer;
+mod parser;
 
 fn main() {
     // smoke: prove LLVM links
