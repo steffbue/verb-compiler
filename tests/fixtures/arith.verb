@@ -1,0 +1,16 @@
+print(1 plus 2 mul 3);
+print(7 div 2);
+print(7.0 div 2);
+print(7 mod 3);
+print(minus 5);
+print(1 plus 2.5);
+print(1 lo 2);
+print(2.5 hieq 2.5);
+print(1 eqeq 1.0);
+print("a" eqeq "a");
+print("a" eqeq "b");
+print(1 neq 2);
+print(not nil);
+print(false or 3);
+print(false and 3);
+print(nil eqeq false);

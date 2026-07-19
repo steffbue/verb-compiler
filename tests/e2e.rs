@@ -33,6 +33,18 @@ fn run_err(name: &str, msg: &str) {
 fn literals() { run_ok("literals"); }
 
 #[test]
+fn arith() { run_ok("arith"); }
+
+#[test]
+fn strings() { run_ok("strings"); }
+
+#[test]
+fn type_error_aborts() { run_err("err_types", "operands must be numbers"); }
+
+#[test]
+fn div_zero_aborts() { run_err("err_divzero", "division by zero"); }
+
+#[test]
 fn emits_llvm_ir() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run", "tests/fixtures/literals.verb", "--emit-llvm"])
