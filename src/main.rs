@@ -1,4 +1,5 @@
 mod error;
+mod lexer;
 
 fn main() {
     // smoke: prove LLVM links
