@@ -50,11 +50,124 @@ impl Parser {
         }
     }
 
-    // ----- statements (Task 4 fills the rest; ExprStmt suffices for expr tests) -----
     fn statement(&mut self) -> Result<Stmt, CompileError> {
-        let e = self.expression()?;
+        match self.peek() {
+            TokenKind::Assign => self.assign_stmt(true),
+            TokenKind::Fn => self.fn_stmt(),
+            TokenKind::Return => self.return_stmt(),
+            TokenKind::If => self.if_stmt(),
+            TokenKind::While => self.while_stmt(),
+            TokenKind::For => self.for_stmt(),
+            TokenKind::LBrace => Ok(Stmt::Block(self.block()?)),
+            TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true),
+            _ => {
+                let e = self.expression()?;
+                self.expect(&TokenKind::Semi, "';'")?;
+                Ok(Stmt::ExprStmt(e))
+            }
+        }
+    }
+
+    fn assign_stmt(&mut self, semi: bool) -> Result<Stmt, CompileError> {
+        self.advance(); // assign
+        let (name, _, _) = self.expect_ident("variable name after 'assign'")?;
+        let value = self.expression()?;
+        if semi { self.expect(&TokenKind::Semi, "';'")?; }
+        Ok(Stmt::Assign { name, value })
+    }
+
+    fn reassign_stmt(&mut self, semi: bool) -> Result<Stmt, CompileError> {
+        let (name, line, col) = self.expect_ident("variable name")?;
+        self.expect(&TokenKind::Be, "'be'")?;
+        let value = self.expression()?;
+        if semi { self.expect(&TokenKind::Semi, "';'")?; }
+        Ok(Stmt::Reassign { name, value, line, col })
+    }
+
+    fn fn_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
+        self.advance(); // fn
+        let (name, _, _) = self.expect_ident("function name")?;
+        self.expect(&TokenKind::LParen, "'('")?;
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                params.push(self.expect_ident("parameter name")?.0);
+                if !self.matches(&TokenKind::Comma) { break; }
+            }
+        }
+        self.expect(&TokenKind::RParen, "')'")?;
+        self.fn_depth += 1;
+        let body = self.block()?;
+        self.fn_depth -= 1;
+        Ok(Stmt::Fn { name, params, body, line, col })
+    }
+
+    fn return_stmt(&mut self) -> Result<Stmt, CompileError> {
+        if self.fn_depth == 0 {
+            return Err(self.err("'return' outside function"));
+        }
+        self.advance(); // return
+        let value = if self.check(&TokenKind::Semi) { None } else { Some(self.expression()?) };
         self.expect(&TokenKind::Semi, "';'")?;
-        Ok(Stmt::ExprStmt(e))
+        Ok(Stmt::Return { value })
+    }
+
+    fn if_stmt(&mut self) -> Result<Stmt, CompileError> {
+        self.advance(); // if
+        self.expect(&TokenKind::LParen, "'('")?;
+        let cond = self.expression()?;
+        self.expect(&TokenKind::RParen, "')'")?;
+        let then_body = self.block()?;
+        let else_body = if self.matches(&TokenKind::Else) {
+            if self.check(&TokenKind::If) {
+                Some(vec![self.if_stmt()?]) // else if
+            } else {
+                Some(self.block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If { cond, then_body, else_body })
+    }
+
+    fn while_stmt(&mut self) -> Result<Stmt, CompileError> {
+        self.advance(); // while
+        self.expect(&TokenKind::LParen, "'('")?;
+        let cond = self.expression()?;
+        self.expect(&TokenKind::RParen, "')'")?;
+        let body = self.block()?;
+        Ok(Stmt::While { cond, body })
+    }
+
+    fn for_stmt(&mut self) -> Result<Stmt, CompileError> {
+        self.advance(); // for
+        self.expect(&TokenKind::LParen, "'('")?;
+        let init = match self.peek() {
+            TokenKind::Assign => self.assign_stmt(true)?, // consumes ';'
+            TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true)?,
+            _ => return Err(self.err("expected 'assign' or reassignment in for-init")),
+        };
+        let cond = self.expression()?;
+        self.expect(&TokenKind::Semi, "';'")?;
+        let incr = match self.peek() {
+            TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(false)?,
+            _ => Stmt::ExprStmt(self.expression()?),
+        };
+        self.expect(&TokenKind::RParen, "')'")?;
+        let mut body = self.block()?;
+        body.push(incr);
+        Ok(Stmt::Block(vec![init, Stmt::While { cond, body }]))
+    }
+
+    fn block(&mut self) -> Result<Vec<Stmt>, CompileError> {
+        self.expect(&TokenKind::LBrace, "'{'")?;
+        let mut stmts = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            stmts.push(self.statement()?);
+        }
+        self.expect(&TokenKind::RBrace, "'}'")?;
+        Ok(stmts)
     }
 
     // ----- expressions: precedence climbing -----
@@ -251,5 +364,58 @@ mod tests {
         // a or b and c  =>  a or (b and c)
         let e = expr("true or false and true");
         assert!(matches!(e, Expr::Binary { op: BinOp::Or, .. }));
+    }
+
+    #[test]
+    fn parses_assign_and_reassign() {
+        let s = parse(lex("assign x 10; x be x plus 1;").unwrap()).unwrap();
+        assert!(matches!(&s[0], Stmt::Assign { name, .. } if name == "x"));
+        assert!(matches!(&s[1], Stmt::Reassign { name, .. } if name == "x"));
+    }
+
+    #[test]
+    fn parses_if_else_chain() {
+        let s = parse(lex("if (true) { print(1); } else if (false) { print(2); } else { print(3); }").unwrap()).unwrap();
+        match &s[0] {
+            Stmt::If { else_body: Some(eb), .. } => {
+                assert!(matches!(&eb[0], Stmt::If { else_body: Some(_), .. }));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn desugars_for_to_while() {
+        let s = parse(lex("for (assign i 0; i lo 10; i be i plus 1) { print(i); }").unwrap()).unwrap();
+        match &s[0] {
+            Stmt::Block(inner) => {
+                assert!(matches!(&inner[0], Stmt::Assign { name, .. } if name == "i"));
+                match &inner[1] {
+                    Stmt::While { body, .. } => {
+                        assert!(matches!(body.last().unwrap(), Stmt::Reassign { name, .. } if name == "i"));
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fn_and_return() {
+        let s = parse(lex("fn add(a, b) { return a plus b; }").unwrap()).unwrap();
+        match &s[0] {
+            Stmt::Fn { name, params, body, .. } => {
+                assert_eq!(name, "add");
+                assert_eq!(params, &vec!["a".to_string(), "b".to_string()]);
+                assert!(matches!(&body[0], Stmt::Return { value: Some(_) }));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_return_at_top_level() {
+        assert!(parse(lex("return 1;").unwrap()).is_err());
     }
 }
