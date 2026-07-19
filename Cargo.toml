@@ -1,0 +1,7 @@
+[package]
+name = "verb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inkwell = { version = "0.9", features = ["llvm20-1"] }
