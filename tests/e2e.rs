@@ -147,9 +147,7 @@ fn emits_llvm_ir() {
 }
 
 #[test]
-fn multi_file_error_reports_correct_filename() {
-    // Written against fixtures added by a later task; for this task, verify
-    // only the CLI-level no-files-given usage error, which needs no new fixtures:
+fn no_files_given_shows_usage() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run"])
         .output()
