@@ -1,0 +1,93 @@
+%% demo.verb — tour of every Verb feature
+!?!
+  block comment: run with
+    cargo run -- run examples/demo.verb
+!?!
+
+%% --- literals & variables ---
+assign lang "Verb";
+assign version 0.1;
+assign answer 42;
+assign ready true;
+assign nothing nil;
+
+print("language" c ": " c lang);
+print(version);
+print(answer);
+print(ready);
+print(nothing);
+
+%% --- arithmetic & reassignment ---
+assign x 10;
+x be x plus 5;      %% 15
+x be x mul 2;       %% 30
+x be x minus 6;     %% 24
+x be x div 4;       %% 6
+print(x);
+print(x mod 4);     %% 2
+print(minus x);     %% unary negation: -6
+
+%% --- comparisons & logic ---
+print(x eqeq 6);            %% true
+print(x neq 6);             %% false
+print(x lo 10 and x hi 0);  %% true
+print(x hieq 7 or not ready); %% false
+
+%% --- strings ---
+assign greeting "hello" c " " c "world";
+print(greeting);
+
+%% --- control flow ---
+if (x hi 10) {
+  print("big");
+} else if (x hi 3) {
+  print("medium");
+} else {
+  print("small");
+}
+
+assign count 0;
+while (count lo 3) {
+  print(count);
+  count be count plus 1;
+}
+
+%% --- fizzbuzz via for loop ---
+for (assign i 1; i loeq 15; i be i plus 1) {
+  if (i mod 15 eqeq 0) {
+    print("FizzBuzz");
+  } else if (i mod 3 eqeq 0) {
+    print("Fizz");
+  } else if (i mod 5 eqeq 0) {
+    print("Buzz");
+  } else {
+    print(i);
+  }
+}
+
+%% --- functions ---
+fn square(n) {
+  return n mul n;
+}
+print(square(7));   %% 49
+
+fn fib(n) {
+  if (n lo 2) { return n; }
+  return fib(n minus 1) plus fib(n minus 2);
+}
+print(fib(20));     %% 6765
+
+fn max(a, b) {
+  if (a hi b) { return a; }
+  return b;
+}
+
+%% functions are values
+assign pick max;
+print(pick(3, 11)); %% 11
+print(pick);        %% <fn>
+
+fn shout(word) {
+  print(word c "!");
+}
+shout("done");
