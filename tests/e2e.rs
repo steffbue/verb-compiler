@@ -280,6 +280,21 @@ fn imports_cpp_library_and_calls_extern_functions() {
     build_and_run_ok("import_mathlib", &lib_dir);
 }
 
+#[test]
+fn verb_std_io_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_std_io_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_std_io.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_std_io.cpp");
+    assert!(status.success(), "runtime/verb_std_io.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
 // ----- AOT host / cross build + multi-file (from main) -----
 
 #[test]
