@@ -1,0 +1,4 @@
+%% library file: helper function only, no top-level executable code
+make double(x) begin
+  return x times 2;
+end

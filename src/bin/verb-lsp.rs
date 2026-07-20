@@ -235,7 +235,8 @@ fn compute_diagnostics(src: &str) -> Vec<Value> {
     }
     let ctx = Context::create();
     let mut cg = Codegen::new(&ctx);
-    if let Err(e) = cg.compile_program(&program) {
+    let stmt_files = vec![String::new(); program.body.len()];
+    if let Err(e) = cg.compile_program(&program.body, &stmt_files, &program.imports) {
         return vec![diagnostic_from(&e)];
     }
     vec![]
