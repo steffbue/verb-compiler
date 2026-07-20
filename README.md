@@ -18,6 +18,29 @@ lexer → parser → AST → LLVM IR (inkwell) → JIT or native binary.
 
 `compile` is an alias for `build` — `cargo run -- compile ...` behaves identically.
 
+### Using the `verb` binary directly
+
+The crate's package name is `verb`, so `cargo build`/`cargo install` produce a
+binary named `verb` — you don't have to go through `cargo run -- ...` every
+time.
+
+Build once, then call the binary directly:
+
+    cargo build --release
+    ./target/release/verb run examples/hello.verb
+    ./target/release/verb build examples/hello.verb -o hello
+
+Or install it onto your `PATH` (`~/.cargo/bin`) so plain `verb` works
+anywhere, like a normal CLI tool:
+
+    cargo install --path .
+    verb run examples/hello.verb
+    verb build examples/hello.verb -o hello
+    verb compile examples/hello.verb -o hello   # alias for build
+
+Re-run `cargo install --path .` after pulling new changes to refresh the
+installed binary.
+
 ## Cross-compiling
 
     cargo run -- build examples/hello.verb -o hello --target linux-x86_64
