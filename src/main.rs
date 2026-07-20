@@ -1,4 +1,4 @@
-use std::process::exit;
+use std::process::{exit, Command};
 
 use verb::codegen;
 use verb::error::CompileError;
@@ -24,8 +24,7 @@ fn die(e: CompileError, src: &str) -> ! {
 
 fn usage() -> ! {
     eprintln!("usage: verb run <file.verb> [--emit-llvm]");
-    eprintln!("       verb build <file.verb> -o <out> [--emit-llvm]");
-    eprintln!("       verb compile <file.verb> -o <out> [--emit-llvm]  (alias for build)");
+    eprintln!("       verb build <file.verb> -o <out> [-L<dir>]... [--emit-llvm]");
     exit(2)
 }
 
@@ -38,6 +37,10 @@ fn main() {
     let out = args.iter().position(|a| a == "-o").map(|i| {
         args.get(i + 1).cloned().unwrap_or_else(|| usage())
     });
+    let lib_dirs: Vec<String> = args.iter()
+        .filter(|a| a.starts_with("-L") && a.as_str() != "-L")
+        .cloned()
+        .collect();
 
     let src = match std::fs::read_to_string(file) {
         Ok(s) => s,
@@ -56,6 +59,13 @@ fn main() {
 
     match cmd {
         "run" => {
+            if !prog.imports.is_empty() {
+                eprintln!(
+                    "error: 'verb run' does not support imports ({}); use 'verb build' instead",
+                    prog.imports.join(", ")
+                );
+                exit(1);
+            }
             let ee = cg.module()
                 .create_jit_execution_engine(inkwell::OptimizationLevel::None)
                 .unwrap_or_else(|e| { eprintln!("JIT error: {e}"); exit(1); });
@@ -65,15 +75,57 @@ fn main() {
                 exit(main_fn.call());
             }
         }
-        "build" | "compile" => {
+        "build" => {
             let out = out.unwrap_or_else(|| usage());
-            build_aot(&cg, &out); // implemented in Task 9; stub for now
+            build_aot(&cg, &out, &prog.imports, &lib_dirs);
         }
         _ => usage(),
     }
 }
 
-fn build_aot(_cg: &codegen::Codegen, _out: &str) {
-    eprintln!("build: not implemented yet");
-    exit(1);
+fn build_aot(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs: &[String]) {
+    use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
+
+    Target::initialize_native(&InitializationConfig::default())
+        .unwrap_or_else(|e| { eprintln!("error: failed to initialize target: {e}"); exit(1); });
+
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple)
+        .unwrap_or_else(|e| { eprintln!("error: unsupported target: {e}"); exit(1); });
+    let tm = target
+        .create_target_machine(
+            &triple,
+            &TargetMachine::get_host_cpu_name().to_string(),
+            &TargetMachine::get_host_cpu_features().to_string(),
+            inkwell::OptimizationLevel::None,
+            RelocMode::Default,
+            CodeModel::Default,
+        )
+        .expect("failed to create target machine");
+
+    cg.module().set_triple(&triple);
+    cg.module().set_data_layout(&tm.get_target_data().get_data_layout());
+
+    let obj_path = format!("{out}.o");
+    tm.write_to_file(cg.module(), FileType::Object, std::path::Path::new(&obj_path))
+        .unwrap_or_else(|e| { eprintln!("error: failed to emit object file: {e}"); exit(1); });
+
+    let linker = if imports.is_empty() { "cc" } else { "c++" };
+    let mut cmd = Command::new(linker);
+    cmd.arg(&obj_path).arg("-o").arg(out);
+    for dir in lib_dirs {
+        cmd.arg(dir);
+    }
+    for lib in imports {
+        cmd.arg(format!("-l{lib}"));
+    }
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("error: failed to run linker '{linker}': {e}");
+        exit(1);
+    });
+    let _ = std::fs::remove_file(&obj_path);
+    if !status.success() {
+        eprintln!("error: link failed");
+        exit(1);
+    }
 }

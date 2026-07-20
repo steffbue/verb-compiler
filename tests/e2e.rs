@@ -171,3 +171,31 @@ fn extern_arity_mismatch_across_call_sites_is_a_compile_error() {
         "extern fn 'c_sqrt' called with 2 argument(s), previously called with 1",
     ]);
 }
+
+#[test]
+fn build_produces_a_runnable_binary_for_import_free_programs() {
+    let out_path = std::env::temp_dir().join("verb_test_build_literals");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/literals.verb", "-o", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success());
+    let expected = std::fs::read_to_string("tests/fixtures/literals.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn run_rejects_programs_with_imports() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/import_extern_call.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("mathlib"), "stderr: {stderr}");
+}
