@@ -4,7 +4,8 @@ use crate::error::CompileError;
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
     Assign, Be, Declare, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
-    Add, Sub, Neg, Times, Div, Mod,
+    Import, Mod,
+    Add, Sub, Neg, Times, Div,
     Equals, Differs, Trails, Beats, Atmost, Atleast,
     And, Or, Not, Join,
     LParen, RParen, Semi, Comma,
@@ -160,8 +161,9 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), Compil
                     "check" => Check, "orelse" => Orelse, "repeat" => Repeat, "loop" => Loop,
                     "true" => True, "false" => False, "nil" => Nil,
                     "begin" => Begin, "end" => End,
+                    "import" => Import, "mod" => Mod,
                     "add" => Add, "sub" => Sub, "neg" => Neg,
-                    "times" => Times, "div" => Div, "mod" => Mod,
+                    "times" => Times, "div" => Div,
                     "equals" => Equals, "differs" => Differs, "trails" => Trails,
                     "beats" => Beats, "atmost" => Atmost, "atleast" => Atleast,
                     "and" => And, "or" => Or, "not" => Not, "join" => Join,
@@ -248,6 +250,15 @@ mod tests {
         assert_eq!(
             kinds("repeat x trails 1 begin end"),
             vec![Repeat, Ident("x".into()), Trails, Int(1), Begin, End, Eof]
+        );
+    }
+
+    #[test]
+    fn scans_import_keywords() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("import mod mathlib;"),
+            vec![Import, Mod, Ident("mathlib".into()), Semi, Eof]
         );
     }
 
