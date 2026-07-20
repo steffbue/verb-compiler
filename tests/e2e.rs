@@ -231,3 +231,100 @@ fn aot_build_target_all_produces_six_binaries_with_summary() {
         assert!(path.exists(), "missing {path:?}");
     }
 }
+
+#[test]
+fn no_files_given_shows_usage() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "stderr: {stderr}");
+}
+
+fn run_ok_multi(names: &[&str], expected_name: &str) {
+    let files: Vec<String> = names
+        .iter()
+        .map(|n| format!("tests/fixtures/{n}.verb"))
+        .collect();
+    let mut args = vec!["run".to_string()];
+    args.extend(files);
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = std::fs::read_to_string(format!("tests/fixtures/{expected_name}.expected")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn multi_file_links_and_runs() {
+    run_ok_multi(&["multifile_a", "multifile_b"], "multifile");
+}
+
+#[test]
+fn multi_file_emits_single_merged_llvm_module() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "run",
+            "tests/fixtures/multifile_a.verb",
+            "tests/fixtures/multifile_b.verb",
+            "--emit-llvm",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("define i32 @main"), "no main in IR: {ir}");
+}
+
+#[test]
+fn multi_file_error_names_the_correct_file() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "run",
+            "tests/fixtures/multifile_err_a.verb",
+            "tests/fixtures/multifile_err_b.verb",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("multifile_err_b.verb"),
+        "expected error attributed to multifile_err_b.verb, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("multifile_err_a.verb"),
+        "error should not be attributed to multifile_err_a.verb, got: {stderr}"
+    );
+    assert!(stderr.contains("undefined variable 'zz'"), "stderr: {stderr}");
+}
+
+#[test]
+fn multi_file_build_path_accepts_multiple_files() {
+    let dir = std::env::temp_dir().join("verb_multifile_build_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("multifile_bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/multifile_a.verb",
+            "tests/fixtures/multifile_b.verb",
+            "-o",
+            bin.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = Command::new(&bin).output().unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
