@@ -3,10 +3,10 @@ use crate::error::CompileError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
-    Assign, Be, Fn, Return, If, Else, While, For, True, False, Nil, Begin, End,
-    Plus, Minus, Mul, Div, Mod,
-    Eqeq, Neq, Lo, Hi, Loeq, Hieq,
-    And, Or, Not, Concat,
+    Assign, Be, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
+    Add, Sub, Neg, Times, Div, Mod,
+    Equals, Differs, Trails, Beats, Atmost, Atleast,
+    And, Or, Not, Join,
     LParen, RParen, Semi, Comma,
     Eof,
 }
@@ -103,14 +103,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 let word: String = chars[start..i].iter().collect();
                 use TokenKind::*;
                 let kind = match word.as_str() {
-                    "assign" => Assign, "be" => Be, "fn" => Fn, "return" => Return,
-                    "if" => If, "else" => Else, "while" => While, "for" => For,
+                    "assign" => Assign, "be" => Be, "make" => Make, "return" => Return,
+                    "check" => Check, "orelse" => Orelse, "repeat" => Repeat, "loop" => Loop,
                     "true" => True, "false" => False, "nil" => Nil,
                     "begin" => Begin, "end" => End,
-                    "plus" => Plus, "minus" => Minus, "mul" => Mul, "div" => Div, "mod" => Mod,
-                    "eqeq" => Eqeq, "neq" => Neq, "lo" => Lo, "hi" => Hi,
-                    "loeq" => Loeq, "hieq" => Hieq,
-                    "and" => And, "or" => Or, "not" => Not, "c" => Concat,
+                    "add" => Add, "sub" => Sub, "neg" => Neg,
+                    "times" => Times, "div" => Div, "mod" => Mod,
+                    "equals" => Equals, "differs" => Differs, "trails" => Trails,
+                    "beats" => Beats, "atmost" => Atmost, "atleast" => Atleast,
+                    "and" => And, "or" => Or, "not" => Not, "join" => Join,
                     _ => Ident(word),
                 };
                 toks.push(Token { kind, line: tl, col: tc });
@@ -136,9 +137,29 @@ mod tests {
     fn scans_keywords_and_operators() {
         use TokenKind::*;
         assert_eq!(
-            kinds("assign x 10; x be x plus 1;"),
+            kinds("assign x 10; x be x add 1;"),
             vec![Assign, Ident("x".into()), Int(10), Semi,
-                 Ident("x".into()), Be, Ident("x".into()), Plus, Int(1), Semi, Eof]
+                 Ident("x".into()), Be, Ident("x".into()), Add, Int(1), Semi, Eof]
+        );
+    }
+
+    #[test]
+    fn scans_verb_keywords() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("make check orelse repeat loop sub neg times join equals differs trails beats atmost atleast"),
+            vec![Make, Check, Orelse, Repeat, Loop, Sub, Neg, Times, Join,
+                 Equals, Differs, Trails, Beats, Atmost, Atleast, Eof]
+        );
+    }
+
+    #[test]
+    fn old_keywords_are_plain_identifiers() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("plus if while fn c"),
+            vec![Ident("plus".into()), Ident("if".into()), Ident("while".into()),
+                 Ident("fn".into()), Ident("c".into()), Eof]
         );
     }
 
@@ -159,7 +180,7 @@ mod tests {
 
     #[test]
     fn tracks_position() {
-        let t = &lex("\n  fn").unwrap()[0];
+        let t = &lex("\n  make").unwrap()[0];
         assert_eq!((t.line, t.col), (2, 3));
     }
 
@@ -172,8 +193,8 @@ mod tests {
     fn scans_begin_end_keywords() {
         use TokenKind::*;
         assert_eq!(
-            kinds("while x lo 1 begin end"),
-            vec![While, Ident("x".into()), Lo, Int(1), Begin, End, Eof]
+            kinds("repeat x trails 1 begin end"),
+            vec![Repeat, Ident("x".into()), Trails, Int(1), Begin, End, Eof]
         );
     }
 

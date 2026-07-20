@@ -1,16 +1,16 @@
 assign n 3;
-if n hi 5 begin
+check n beats 5 begin
   print("big");
-end else if n hi 2 begin
+end orelse check n beats 2 begin
   print("mid");
-end else begin
+end orelse begin
   print("small");
 end
 assign i 0;
-while i lo 3 begin
+repeat i trails 3 begin
   print(i);
-  i be i plus 1;
+  i be i add 1;
 end
-for assign j 0; j lo 3; j be j plus 1 begin
-  print(j mul 10);
+loop assign j 0; j trails 3; j be j add 1 begin
+  print(j times 10);
 end

@@ -33,34 +33,38 @@ Modeled closest to **Lox** (Crafting Interpreters) — C-like braces, dynamic ty
 ```
 assign x 10;
 assign name "compiler";
-x be x plus 1;
+x be x add 1;
 ```
 
 ## Operators
 
-- Arithmetic: `plus minus mul div mod`
-- Comparison: `eqeq neq lo hi loeq hieq`
+All operators are verbs (language is called Verb — keywords read as actions):
+
+- Arithmetic: `add sub times div mod`, unary negation `neg x`
+- Comparison: `equals differs trails beats atmost atleast` (== != < > <= >=)
 - Logical: `and or not`
-- String concat via `c` (e.g. `"a" c "b"`)
+- String concat via `join` (e.g. `"a" join "b"`)
+
+`sub` is strictly binary, `neg` strictly prefix — no token does double duty.
 
 ## Control flow
 
 Blocks are delimited by `begin` / `end`. Conditions and loop headers take no parentheses (parens remain valid as expression grouping).
 
 ```
-if cond begin
+check cond begin
   ...
-end else if other begin
+end orelse check other begin
   ...
-end else begin
-  ...
-end
-
-while cond begin
+end orelse begin
   ...
 end
 
-for assign i 0; i lo 10; i be i plus 1 begin
+repeat cond begin
+  ...
+end
+
+loop assign i 0; i trails 10; i be i add 1 begin
   ...
 end
 ```
@@ -68,11 +72,11 @@ end
 ## Functions
 
 ```
-fn add(a, b) begin
-  return a plus b;
+make sum(a, b) begin
+  return a add b;
 end
 
-result be add(1, 2);
+result be sum(1, 2);
 ```
 
 ## Built-in I/O

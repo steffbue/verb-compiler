@@ -1,25 +1,25 @@
 %% user-defined functions
-fn add(a, b) begin
-  return a plus b;
+make add2(a, b) begin
+  return a add b;
 end
-print(add(1, 2));
+print(add2(1, 2));
 
-fn greet() begin
+make greet() begin
   print("hi");
 end
 greet();
 
-fn noret(a) begin
-  a be a plus 1;
+make noret(a) begin
+  a be a add 1;
 end
 print(noret(5));
 
-fn fib(n) begin
-  if n lo 2 begin return n; end
-  return fib(n minus 1) plus fib(n minus 2);
+make fib(n) begin
+  check n trails 2 begin return n; end
+  return fib(n sub 1) add fib(n sub 2);
 end
 print(fib(10));
 
-assign f add;
+assign f add2;
 print(f(3, 4));
-print(add);
+print(add2);

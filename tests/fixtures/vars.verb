@@ -1,6 +1,6 @@
 assign x 10;
 assign name "compiler";
-x be x plus 1;
+x be x add 1;
 print(x);
 print(name);
 begin

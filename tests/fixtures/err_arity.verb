@@ -1,2 +1,2 @@
-fn one(a) begin return a; end
+make one(a) begin return a; end
 one(1, 2);

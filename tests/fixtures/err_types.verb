@@ -1,1 +1,1 @@
-print(1 plus "x");
+print(1 add "x");

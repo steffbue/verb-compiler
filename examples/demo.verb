@@ -11,7 +11,7 @@ assign answer 42;
 assign ready true;
 assign nothing nil;
 
-print("language" c ": " c lang);
+print("language" join ": " join lang);
 print(version);
 print(answer);
 print(ready);
@@ -19,66 +19,66 @@ print(nothing);
 
 %% --- arithmetic & reassignment ---
 assign x 10;
-x be x plus 5;      %% 15
-x be x mul 2;       %% 30
-x be x minus 6;     %% 24
+x be x add 5;       %% 15
+x be x times 2;     %% 30
+x be x sub 6;       %% 24
 x be x div 4;       %% 6
 print(x);
 print(x mod 4);     %% 2
-print(minus x);     %% unary negation: -6
+print(neg x);       %% unary negation: -6
 
 %% --- comparisons & logic ---
-print(x eqeq 6);            %% true
-print(x neq 6);             %% false
-print(x lo 10 and x hi 0);  %% true
-print(x hieq 7 or not ready); %% false
+print(x equals 6);              %% true
+print(x differs 6);             %% false
+print(x trails 10 and x beats 0);  %% true
+print(x atleast 7 or not ready);   %% false
 
 %% --- strings ---
-assign greeting "hello" c " " c "world";
+assign greeting "hello" join " " join "world";
 print(greeting);
 
 %% --- control flow ---
-if x hi 10 begin
+check x beats 10 begin
   print("big");
-end else if x hi 3 begin
+end orelse check x beats 3 begin
   print("medium");
-end else begin
+end orelse begin
   print("small");
 end
 
 assign count 0;
-while count lo 3 begin
+repeat count trails 3 begin
   print(count);
-  count be count plus 1;
+  count be count add 1;
 end
 
-%% --- fizzbuzz via for loop ---
-for assign i 1; i loeq 15; i be i plus 1 begin
-  if i mod 15 eqeq 0 begin
+%% --- fizzbuzz via loop ---
+loop assign i 1; i atmost 15; i be i add 1 begin
+  check i mod 15 equals 0 begin
     print("FizzBuzz");
-  end else if i mod 3 eqeq 0 begin
+  end orelse check i mod 3 equals 0 begin
     print("Fizz");
-  end else if i mod 5 eqeq 0 begin
+  end orelse check i mod 5 equals 0 begin
     print("Buzz");
-  end else begin
+  end orelse begin
     print(i);
   end
 end
 
 %% --- functions ---
-fn square(n) begin
-  return n mul n;
+make square(n) begin
+  return n times n;
 end
 print(square(7));   %% 49
 
-fn fib(n) begin
-  if n lo 2 begin return n; end
-  return fib(n minus 1) plus fib(n minus 2);
+make fib(n) begin
+  check n trails 2 begin return n; end
+  return fib(n sub 1) add fib(n sub 2);
 end
 print(fib(20));     %% 6765
 
-fn max(a, b) begin
-  if a hi b begin return a; end
+make max(a, b) begin
+  check a beats b begin return a; end
   return b;
 end
 
@@ -87,7 +87,7 @@ assign pick max;
 print(pick(3, 11)); %% 11
 print(pick);        %% <fn>
 
-fn shout(word) begin
-  print(word c "!");
+make shout(word) begin
+  print(word join "!");
 end
 shout("done");

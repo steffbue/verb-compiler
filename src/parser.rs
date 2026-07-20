@@ -53,11 +53,11 @@ impl Parser {
     fn statement(&mut self) -> Result<Stmt, CompileError> {
         match self.peek() {
             TokenKind::Assign => self.assign_stmt(true),
-            TokenKind::Fn => self.fn_stmt(),
+            TokenKind::Make => self.fn_stmt(),
             TokenKind::Return => self.return_stmt(),
-            TokenKind::If => self.if_stmt(),
-            TokenKind::While => self.while_stmt(),
-            TokenKind::For => self.for_stmt(),
+            TokenKind::Check => self.if_stmt(),
+            TokenKind::Repeat => self.while_stmt(),
+            TokenKind::Loop => self.for_stmt(),
             TokenKind::Begin => Ok(Stmt::Block(self.block()?)),
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true),
             _ => {
@@ -86,7 +86,7 @@ impl Parser {
 
     fn fn_stmt(&mut self) -> Result<Stmt, CompileError> {
         let (line, col) = self.here();
-        self.advance(); // fn
+        self.advance(); // make
         let (name, _, _) = self.expect_ident("function name")?;
         self.expect(&TokenKind::LParen, "'('")?;
         let mut params = Vec::new();
@@ -114,12 +114,12 @@ impl Parser {
     }
 
     fn if_stmt(&mut self) -> Result<Stmt, CompileError> {
-        self.advance(); // if
+        self.advance(); // check
         let cond = self.expression()?;
         let then_body = self.block()?;
-        let else_body = if self.matches(&TokenKind::Else) {
-            if self.check(&TokenKind::If) {
-                Some(vec![self.if_stmt()?]) // else if
+        let else_body = if self.matches(&TokenKind::Orelse) {
+            if self.check(&TokenKind::Check) {
+                Some(vec![self.if_stmt()?]) // orelse check …
             } else {
                 Some(self.block()?)
             }
@@ -130,14 +130,14 @@ impl Parser {
     }
 
     fn while_stmt(&mut self) -> Result<Stmt, CompileError> {
-        self.advance(); // while
+        self.advance(); // repeat
         let cond = self.expression()?;
         let body = self.block()?;
         Ok(Stmt::While { cond, body })
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, CompileError> {
-        self.advance(); // for
+        self.advance(); // loop
         let init = match self.peek() {
             TokenKind::Assign => self.assign_stmt(true)?, // consumes ';'
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true)?,
@@ -187,8 +187,8 @@ impl Parser {
         let mut e = self.comparison()?;
         loop {
             let op = match self.peek() {
-                TokenKind::Eqeq => BinOp::Eq,
-                TokenKind::Neq => BinOp::Ne,
+                TokenKind::Equals => BinOp::Eq,
+                TokenKind::Differs => BinOp::Ne,
                 _ => break,
             };
             self.advance();
@@ -201,10 +201,10 @@ impl Parser {
         let mut e = self.term()?;
         loop {
             let op = match self.peek() {
-                TokenKind::Lo => BinOp::Lt,
-                TokenKind::Hi => BinOp::Gt,
-                TokenKind::Loeq => BinOp::Le,
-                TokenKind::Hieq => BinOp::Ge,
+                TokenKind::Trails => BinOp::Lt,
+                TokenKind::Beats => BinOp::Gt,
+                TokenKind::Atmost => BinOp::Le,
+                TokenKind::Atleast => BinOp::Ge,
                 _ => break,
             };
             self.advance();
@@ -217,9 +217,9 @@ impl Parser {
         let mut e = self.factor()?;
         loop {
             let op = match self.peek() {
-                TokenKind::Plus => BinOp::Add,
-                TokenKind::Minus => BinOp::Sub,
-                TokenKind::Concat => BinOp::Concat,
+                TokenKind::Add => BinOp::Add,
+                TokenKind::Sub => BinOp::Sub,
+                TokenKind::Join => BinOp::Concat,
                 _ => break,
             };
             self.advance();
@@ -232,7 +232,7 @@ impl Parser {
         let mut e = self.unary()?;
         loop {
             let op = match self.peek() {
-                TokenKind::Mul => BinOp::Mul,
+                TokenKind::Times => BinOp::Mul,
                 TokenKind::Div => BinOp::Div,
                 TokenKind::Mod => BinOp::Mod,
                 _ => break,
@@ -246,7 +246,7 @@ impl Parser {
     fn unary(&mut self) -> Result<Expr, CompileError> {
         let op = match self.peek() {
             TokenKind::Not => Some(UnOp::Not),
-            TokenKind::Minus => Some(UnOp::Neg),
+            TokenKind::Neg => Some(UnOp::Neg),
             _ => None,
         };
         if let Some(op) = op {
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn precedence_mul_over_plus() {
         assert_eq!(
-            expr("1 plus 2 mul 3"),
+            expr("1 add 2 times 3"),
             Expr::Binary {
                 op: BinOp::Add,
                 lhs: Box::new(Expr::Int(1)),
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn unary_and_grouping() {
         assert_eq!(
-            expr("minus (1 plus 2)"),
+            expr("neg (1 add 2)"),
             Expr::Unary {
                 op: UnOp::Neg,
                 expr: Box::new(Expr::Binary {
@@ -343,10 +343,10 @@ mod tests {
 
     #[test]
     fn call_with_args() {
-        let e = expr("add(1, 2)");
+        let e = expr("sum(1, 2)");
         match e {
             Expr::Call { callee, args, .. } => {
-                assert!(matches!(*callee, Expr::Var(ref n, _, _) if n == "add"));
+                assert!(matches!(*callee, Expr::Var(ref n, _, _) if n == "sum"));
                 assert_eq!(args, vec![Expr::Int(1), Expr::Int(2)]);
             }
             other => panic!("{other:?}"),
@@ -362,14 +362,14 @@ mod tests {
 
     #[test]
     fn parses_assign_and_reassign() {
-        let s = parse(lex("assign x 10; x be x plus 1;").unwrap()).unwrap();
+        let s = parse(lex("assign x 10; x be x add 1;").unwrap()).unwrap();
         assert!(matches!(&s[0], Stmt::Assign { name, .. } if name == "x"));
         assert!(matches!(&s[1], Stmt::Reassign { name, .. } if name == "x"));
     }
 
     #[test]
     fn parses_if_else_chain() {
-        let s = parse(lex("if true begin print(1); end else if false begin print(2); end else begin print(3); end").unwrap()).unwrap();
+        let s = parse(lex("check true begin print(1); end orelse check false begin print(2); end orelse begin print(3); end").unwrap()).unwrap();
         match &s[0] {
             Stmt::If { else_body: Some(eb), .. } => {
                 assert!(matches!(&eb[0], Stmt::If { else_body: Some(_), .. }));
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn desugars_for_to_while() {
-        let s = parse(lex("for assign i 0; i lo 10; i be i plus 1 begin print(i); end").unwrap()).unwrap();
+        let s = parse(lex("loop assign i 0; i trails 10; i be i add 1 begin print(i); end").unwrap()).unwrap();
         match &s[0] {
             Stmt::Block(inner) => {
                 assert!(matches!(&inner[0], Stmt::Assign { name, .. } if name == "i"));
@@ -397,10 +397,10 @@ mod tests {
 
     #[test]
     fn parses_fn_and_return() {
-        let s = parse(lex("fn add(a, b) begin return a plus b; end").unwrap()).unwrap();
+        let s = parse(lex("make sum(a, b) begin return a add b; end").unwrap()).unwrap();
         match &s[0] {
             Stmt::Fn { name, params, body, .. } => {
-                assert_eq!(name, "add");
+                assert_eq!(name, "sum");
                 assert_eq!(params, &vec!["a".to_string(), "b".to_string()]);
                 assert!(matches!(&body[0], Stmt::Return { value: Some(_) }));
             }
