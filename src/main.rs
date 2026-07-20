@@ -171,7 +171,26 @@ fn build_aot_cross(cg: &codegen::Codegen, out: &str, target: &targets::Target) -
     Ok(())
 }
 
-fn build_aot_all(_cg: &codegen::Codegen, _out: &str) {
-    eprintln!("--target all: not implemented yet");
-    exit(1);
+fn build_aot_all(cg: &codegen::Codegen, out: &str) {
+    check_zig_available();
+    let mut failures = 0;
+    let mut results: Vec<(String, Result<(), String>)> = Vec::new();
+    for target in targets::ALL {
+        let labeled_out = format!("{out}-{}", target.label());
+        let res = build_aot_cross(cg, &labeled_out, &target);
+        if res.is_err() {
+            failures += 1;
+        }
+        results.push((target.label(), res));
+    }
+    println!("build --target all summary:");
+    for (label, res) in &results {
+        match res {
+            Ok(()) => println!("  {label}: ok"),
+            Err(e) => println!("  {label}: FAILED — {e}"),
+        }
+    }
+    if failures > 0 {
+        exit(1);
+    }
 }

@@ -201,3 +201,33 @@ fn aot_build_invalid_target_is_usage_error() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("invalid --target"), "stderr: {stderr}");
 }
+
+#[test]
+fn aot_build_target_all_produces_six_binaries_with_summary() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_aot_all_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("functions_all");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/functions.verb", "-o", base.to_str().unwrap(), "--target", "all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build --target all failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("linux-x86_64: ok"), "summary missing linux-x86_64: {stdout}");
+    assert!(stdout.contains("windows-arm64: ok"), "summary missing windows-arm64: {stdout}");
+
+    for suffix in [
+        "linux-x86_64", "linux-arm64", "macos-x86_64", "macos-arm64",
+    ] {
+        let path = dir.join(format!("functions_all-{suffix}"));
+        assert!(path.exists(), "missing {path:?}");
+    }
+    for suffix in ["windows-x86_64", "windows-arm64"] {
+        let path = dir.join(format!("functions_all-{suffix}.exe"));
+        assert!(path.exists(), "missing {path:?}");
+    }
+}
