@@ -145,3 +145,16 @@ fn emits_llvm_ir() {
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("define i32 @main"), "no main in IR: {ir}");
 }
+
+#[test]
+fn multi_file_error_reports_correct_filename() {
+    // Written against fixtures added by a later task; for this task, verify
+    // only the CLI-level no-files-given usage error, which needs no new fixtures:
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "stderr: {stderr}");
+}

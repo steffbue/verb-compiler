@@ -51,15 +51,18 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     Some(ParsedArgs { cmd, files, out, emit_llvm })
 }
 
-fn die(e: CompileError, src: &str) -> ! {
-    eprintln!("error [{}:{}]: {}", e.line, e.col, e.msg);
+fn die(e: CompileError, sources: &[(String, String)]) -> ! {
+    let file = e.file.as_deref().unwrap_or("<unknown>");
+    eprintln!("error [{file}:{}:{}]: {}", e.line, e.col, e.msg);
     if e.line > 0 {
-        if let Some(text) = src.lines().nth(e.line as usize - 1) {
-            let num = e.line.to_string();
-            eprintln!(" {num} | {text}");
-            let pad = " ".repeat(num.len());
-            let offset = " ".repeat(e.col.saturating_sub(1) as usize);
-            eprintln!(" {pad} | {offset}^");
+        if let Some((_, src)) = sources.iter().find(|(name, _)| name.as_str() == file) {
+            if let Some(text) = src.lines().nth(e.line as usize - 1) {
+                let num = e.line.to_string();
+                eprintln!(" {num} | {text}");
+                let pad = " ".repeat(num.len());
+                let offset = " ".repeat(e.col.saturating_sub(1) as usize);
+                eprintln!(" {pad} | {offset}^");
+            }
         }
     }
     if let Some(hint) = &e.hint {
@@ -69,50 +72,67 @@ fn die(e: CompileError, src: &str) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: verb run <file.verb> [--emit-llvm]");
-    eprintln!("       verb build <file.verb> -o <out> [--emit-llvm]");
+    eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
+    eprintln!("       verb build <file.verb>... -o <out> [--emit-llvm]");
     exit(2)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 { usage(); }
-    let cmd = args[1].as_str();
-    let file = args[2].as_str();
-    let emit_llvm = args.iter().any(|a| a == "--emit-llvm");
-    let out = args.iter().position(|a| a == "-o").map(|i| {
-        args.get(i + 1).cloned().unwrap_or_else(|| usage())
-    });
+    let parsed = parse_cli(&args).unwrap_or_else(|| usage());
 
-    let src = match std::fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => { eprintln!("error: cannot read {file}: {e}"); exit(1); }
-    };
-    let toks = lexer::lex(&src).unwrap_or_else(|e| die(e, &src));
-    let prog = parser::parse(toks).unwrap_or_else(|e| die(e, &src));
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut stmts = Vec::new();
+    let mut stmt_files = Vec::new();
+
+    for file in &parsed.files {
+        let src = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read {file}: {e}");
+                exit(1);
+            }
+        };
+        sources.push((file.clone(), src.clone()));
+
+        let toks = lexer::lex(&src)
+            .map_err(|e| e.with_file(file.clone()))
+            .unwrap_or_else(|e| die(e, &sources));
+        let file_stmts = parser::parse(toks)
+            .map_err(|e| e.with_file(file.clone()))
+            .unwrap_or_else(|e| die(e, &sources));
+
+        stmt_files.extend(std::iter::repeat(file.clone()).take(file_stmts.len()));
+        stmts.extend(file_stmts);
+    }
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
-    cg.compile_program(&prog).unwrap_or_else(|e| die(e, &src));
+    cg.compile_program(&stmts, &stmt_files).unwrap_or_else(|e| die(e, &sources));
 
-    if emit_llvm {
+    if parsed.emit_llvm {
         println!("{}", cg.module().print_to_string().to_string());
     }
 
-    match cmd {
+    match parsed.cmd.as_str() {
         "run" => {
-            let ee = cg.module()
+            let ee = cg
+                .module()
                 .create_jit_execution_engine(inkwell::OptimizationLevel::None)
-                .unwrap_or_else(|e| { eprintln!("JIT error: {e}"); exit(1); });
+                .unwrap_or_else(|e| {
+                    eprintln!("JIT error: {e}");
+                    exit(1);
+                });
             unsafe {
-                let main_fn = ee.get_function::<unsafe extern "C" fn() -> i32>("main")
+                let main_fn = ee
+                    .get_function::<unsafe extern "C" fn() -> i32>("main")
                     .expect("no main");
                 exit(main_fn.call());
             }
         }
         "build" => {
-            let out = out.unwrap_or_else(|| usage());
-            build_aot(&cg, &out); // implemented in Task 9; stub for now
+            let out = parsed.out.unwrap_or_else(|| usage());
+            build_aot(&cg, &out);
         }
         _ => usage(),
     }
