@@ -71,13 +71,37 @@ fn main() {
         }
         "build" | "compile" => {
             let out = out.unwrap_or_else(|| usage());
-            build_aot(&cg, &out); // implemented in Task 9; stub for now
+            build_aot_host(&cg, &out);
         }
         _ => usage(),
     }
 }
 
-fn build_aot(_cg: &codegen::Codegen, _out: &str) {
-    eprintln!("build: not implemented yet");
-    exit(1);
+fn build_aot_host(cg: &codegen::Codegen, out: &str) {
+    use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
+
+    Target::initialize_native(&InitializationConfig::default())
+        .unwrap_or_else(|e| { eprintln!("target init error: {e}"); exit(1); });
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple)
+        .unwrap_or_else(|e| { eprintln!("target error: {e}"); exit(1); });
+    let tm = target
+        .create_target_machine(&triple, "generic", "",
+            inkwell::OptimizationLevel::Default, RelocMode::PIC, CodeModel::Default)
+        .unwrap_or_else(|| { eprintln!("cannot create target machine"); exit(1); });
+    cg.module().set_triple(&triple);
+
+    let obj = format!("{out}.o");
+    tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
+        .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
+
+    let status = std::process::Command::new("cc")
+        .args([obj.as_str(), "-o", out])
+        .status()
+        .unwrap_or_else(|e| { eprintln!("cc failed to start: {e}"); exit(1); });
+    let _ = std::fs::remove_file(&obj);
+    if !status.success() {
+        eprintln!("link failed");
+        exit(1);
+    }
 }

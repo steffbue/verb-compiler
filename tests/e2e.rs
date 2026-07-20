@@ -145,3 +145,18 @@ fn emits_llvm_ir() {
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("define i32 @main"), "no main in IR: {ir}");
 }
+
+#[test]
+fn aot_build_produces_working_binary() {
+    let dir = std::env::temp_dir().join("verb_aot_host_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("functions_bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/functions.verb", "-o", bin.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = Command::new(&bin).output().unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/functions.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
