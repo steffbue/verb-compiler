@@ -10,7 +10,7 @@ assign version 0.1;
 assign answer 42;
 assign ready true;
 assign nothing nil;
-declare later;        %% no value yet — starts as nil
+declare later; %% no value yet — starts as nil
 later be "filled in";
 
 print("language" join ": " join lang);
@@ -21,19 +21,19 @@ print(nothing);
 
 %% --- arithmetic & reassignment ---
 assign x 10;
-x be x add 5;       %% 15
-x be x times 2;     %% 30
-x be x sub 6;       %% 24
-x be x div 4;       %% 6
+x be x add 5; %% 15
+x be x times 2; %% 30
+x be x sub 6; %% 24
+x be x div 4; %% 6
 print(x);
-print(x mod 4);     %% 2
-print(neg x);       %% unary negation: -6
+print(x mod 4); %% 2
+print(neg x); %% unary negation: -6
 
 %% --- comparisons & logic ---
-print(x equals 6);              %% true
-print(x differs 6);             %% false
-print(x trails 10 and x beats 0);  %% true
-print(x atleast 7 or not ready);   %% false
+print(x equals 6); %% true
+print(x differs 6); %% false
+print(x trails 10 and x beats 0); %% true
+print(x atleast 7 or not ready); %% false
 
 %% --- strings ---
 assign greeting "hello" join " " join "world";
@@ -41,6 +41,7 @@ print(greeting);
 
 %% --- control flow ---
 check x beats 10 begin
+
   print("big");
 end orelse check x beats 3 begin
   print("medium");
@@ -71,23 +72,27 @@ end
 make square(n) begin
   return n times n;
 end
-print(square(7));   %% 49
+print(square(7)); %% 49
 
 make fib(n) begin
-  check n trails 2 begin return n; end
+  check n trails 2 begin
+    return n;
+  end
   return fib(n sub 1) add fib(n sub 2);
 end
-print(fib(20));     %% 6765
+print(fib(20)); %% 6765
 
 make max(a, b) begin
-  check a beats b begin return a; end
+  check a beats b begin
+    return a;
+  end
   return b;
 end
 
 %% functions are values
 assign pick max;
 print(pick(3, 11)); %% 11
-print(pick);        %% <fn>
+print(pick); %% <fn>
 
 make shout(word) begin
   print(word join "!");

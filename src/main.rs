@@ -1,13 +1,9 @@
-mod ast;
-mod codegen;
-mod error;
-mod lexer;
-mod parser;
-mod value;
-
 use std::process::exit;
 
-use error::CompileError;
+use verb::codegen;
+use verb::error::CompileError;
+use verb::lexer;
+use verb::parser;
 
 fn die(e: CompileError, src: &str) -> ! {
     eprintln!("error [{}:{}]: {}", e.line, e.col, e.msg);

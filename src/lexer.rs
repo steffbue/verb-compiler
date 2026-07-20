@@ -48,9 +48,26 @@ pub fn renamed_keyword(word: &str) -> Option<&'static str> {
     })
 }
 
+/// A comment the lexer would otherwise discard, kept for tools (the
+/// formatter) that need to reproduce it. `text` is the full comment
+/// including its delimiters (`%% ...` or `!?! ... !?!`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comment {
+    pub text: String,
+    pub line: u32,
+    pub col: u32,
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
+    lex_with_comments(src).map(|(toks, _)| toks)
+}
+
+/// Same scan as `lex`, but also returns every comment encountered
+/// (normally discarded) with its source position, for the formatter.
+pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), CompileError> {
     let chars: Vec<char> = src.chars().collect();
     let mut toks = Vec::new();
+    let mut comments = Vec::new();
     let mut i = 0usize;
     let (mut line, mut col) = (1u32, 1u32);
 
@@ -61,9 +78,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
             ' ' | '\t' | '\r' => { i += 1; col += 1; }
             '\n' => { i += 1; line += 1; col = 1; }
             '%' if chars.get(i + 1) == Some(&'%') => {
+                let start = i;
                 while i < chars.len() && chars[i] != '\n' { i += 1; col += 1; }
+                let text: String = chars[start..i].iter().collect();
+                comments.push(Comment { text, line: tl, col: tc });
             }
             '!' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'!') => {
+                let start = i;
                 i += 3; col += 3;
                 loop {
                     if i + 2 >= chars.len() + 1 && i >= chars.len() {
@@ -78,6 +99,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                         return Err(CompileError::new("unterminated block comment", tl, tc));
                     }
                 }
+                let text: String = chars[start..i].iter().collect();
+                comments.push(Comment { text, line: tl, col: tc });
             }
             '(' => { toks.push(Token { kind: TokenKind::LParen, line: tl, col: tc }); i += 1; col += 1; }
             ')' => { toks.push(Token { kind: TokenKind::RParen, line: tl, col: tc }); i += 1; col += 1; }
@@ -152,7 +175,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
         }
     }
     toks.push(Token { kind: TokenKind::Eof, line, col });
-    Ok(toks)
+    Ok((toks, comments))
 }
 
 #[cfg(test)]

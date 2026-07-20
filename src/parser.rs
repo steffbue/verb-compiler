@@ -11,6 +11,45 @@ pub fn parse(toks: Vec<Token>) -> Result<Vec<Stmt>, CompileError> {
     Ok(stmts)
 }
 
+/// Same grammar as `parse`, but doesn't stop at the first syntax error:
+/// after a bad statement it synchronizes to the next likely statement
+/// boundary and keeps going, collecting every statement it could parse
+/// and every error it hit along the way. Meant for editor tooling (an
+/// LSP wants every syntax mistake in a file at once); the compiler proper
+/// keeps using `parse`, which stops at the first error like a normal
+/// compiler.
+pub fn parse_recovering(toks: Vec<Token>) -> (Vec<Stmt>, Vec<CompileError>) {
+    let mut p = Parser { toks, pos: 0, fn_depth: 0 };
+    let mut stmts = Vec::new();
+    let mut errors = Vec::new();
+    while !p.check(&TokenKind::Eof) {
+        let pos_before = p.pos;
+        match p.statement() {
+            Ok(s) => stmts.push(s),
+            Err(e) => {
+                errors.push(e);
+                // An error deep inside an unfinished `make` body leaves
+                // fn_depth incremented (the decrement after `block()?`
+                // never runs); recovery always resumes at top level, so
+                // depth tracking mid-error can't be trusted regardless.
+                p.fn_depth = 0;
+                p.synchronize();
+                // Some productions (e.g. `return` outside a function)
+                // fail without consuming their own token, and
+                // `synchronize` treats that same token as an
+                // already-safe boundary it stops at without advancing
+                // either — so the two together can make zero progress.
+                // Force one token forward whenever that happens, or the
+                // next iteration would hit the exact same error forever.
+                if p.pos == pos_before {
+                    p.advance();
+                }
+            }
+        }
+    }
+    (stmts, errors)
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -58,6 +97,23 @@ impl Parser {
         match self.peek().clone() {
             TokenKind::Ident(n) => { self.advance(); Ok((n, l, c)) }
             _ => Err(self.err_found(format!("expected {what}"))),
+        }
+    }
+
+    /// Skip tokens until we're likely sitting at the start of a new
+    /// statement, so `parse_recovering` can resume instead of giving up
+    /// on the rest of the file after one error.
+    fn synchronize(&mut self) {
+        loop {
+            match self.peek() {
+                TokenKind::Eof => return,
+                // consuming the ';' or 'end' means the *next* token is
+                // the start of whatever comes after the broken statement
+                TokenKind::Semi | TokenKind::End => { self.advance(); return; }
+                TokenKind::Assign | TokenKind::Declare | TokenKind::Make | TokenKind::Return
+                | TokenKind::Check | TokenKind::Repeat | TokenKind::Loop | TokenKind::Begin => return,
+                _ => { self.advance(); }
+            }
         }
     }
 
@@ -334,7 +390,6 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
     use crate::lexer::lex;
 
     fn expr(src: &str) -> Expr {
@@ -444,5 +499,54 @@ mod tests {
     #[test]
     fn rejects_return_at_top_level() {
         assert!(parse(lex("return 1;").unwrap()).is_err());
+    }
+
+    #[test]
+    fn recovering_collects_every_error_across_semicolons() {
+        // three broken statements in a row, each missing its expression
+        let src = "assign a ; assign b ; assign c ;";
+        let (stmts, errors) = parse_recovering(lex(src).unwrap());
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn recovering_keeps_good_statements_around_a_bad_one() {
+        let src = "assign a 1; assign b ; assign c 3;";
+        let (stmts, errors) = parse_recovering(lex(src).unwrap());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(&stmts[0], Stmt::Assign { name, .. } if name == "a"));
+        assert!(matches!(&stmts[1], Stmt::Assign { name, .. } if name == "c"));
+    }
+
+    #[test]
+    fn recovering_resyncs_at_begin_after_a_broken_condition() {
+        // `check`'s condition is broken (missing entirely); `begin` is
+        // itself a safe restart point, so recovery re-parses the rest
+        // as a bare block, then keeps going to the statement after it
+        let src = "check begin print(1); end assign x 2;";
+        let (stmts, errors) = parse_recovering(lex(src).unwrap());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(matches!(stmts.last(), Some(Stmt::Assign { name, .. }) if name == "x"));
+    }
+
+    #[test]
+    fn recovering_resets_fn_depth_so_return_is_still_rejected_after_an_error() {
+        // error inside the (unclosed) `make` body must not leave fn_depth
+        // stuck incremented, or `return` at top level after it would
+        // wrongly be accepted
+        let src = "make broken(n) begin assign ; return 1;";
+        let (_, errors) = parse_recovering(lex(src).unwrap());
+        assert!(errors.iter().any(|e| e.msg.contains("return")), "{errors:?}");
+    }
+
+    #[test]
+    fn recovering_matches_parse_on_valid_input() {
+        let src = "make sum(a, b) begin return a add b; end print(sum(1, 2));";
+        let ok = parse(lex(src).unwrap()).unwrap();
+        let (recovering, errors) = parse_recovering(lex(src).unwrap());
+        assert!(errors.is_empty());
+        assert_eq!(ok, recovering);
     }
 }

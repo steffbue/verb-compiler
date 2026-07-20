@@ -1,0 +1,144 @@
+==================
+assign, declare, reassign
+==================
+
+assign x 10;
+declare y;
+y be x add 1;
+
+---
+
+(source_file
+  (assign_statement
+    (identifier)
+    (int))
+  (declare_statement
+    (identifier))
+  (reassign_statement
+    (identifier)
+    (binary_expression
+      (identifier)
+      (int))))
+
+==================
+check / orelse chain
+==================
+
+check x beats 10 begin
+  print("big");
+end orelse check x beats 3 begin
+  print("medium");
+end orelse begin
+  print("small");
+end
+
+---
+
+(source_file
+  (if_statement
+    (binary_expression
+      (identifier)
+      (int))
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (string)))))
+    (if_statement
+      (binary_expression
+        (identifier)
+        (int))
+      (block
+        (expression_statement
+          (call_expression
+            (identifier)
+            (arguments
+              (string)))))
+      (block
+        (expression_statement
+          (call_expression
+            (identifier)
+            (arguments
+              (string))))))))
+
+==================
+repeat loop
+==================
+
+repeat count trails 3 begin
+  count be count add 1;
+end
+
+---
+
+(source_file
+  (while_statement
+    (binary_expression
+      (identifier)
+      (int))
+    (block
+      (reassign_statement
+        (identifier)
+        (binary_expression
+          (identifier)
+          (int))))))
+
+==================
+loop (desugared for)
+==================
+
+loop assign i 1; i atmost 15; i be i add 1 begin
+  print(i);
+end
+
+---
+
+(source_file
+  (for_statement
+    (assign_statement
+      (identifier)
+      (int))
+    (binary_expression
+      (identifier)
+      (int))
+    (identifier)
+    (binary_expression
+      (identifier)
+      (int))
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier)))))))
+
+==================
+function definition and call
+==================
+
+make square(n) begin
+  return n times n;
+end
+print(square(7));
+
+---
+
+(source_file
+  (fn_statement
+    (identifier)
+    (parameters
+      (identifier))
+    (block
+      (return_statement
+        (binary_expression
+          (identifier)
+          (identifier)))))
+  (expression_statement
+    (call_expression
+      (identifier)
+      (arguments
+        (call_expression
+          (identifier)
+          (arguments
+            (int)))))))

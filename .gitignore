@@ -1,2 +1,7 @@
 /target
 /.codegraph/
+/.worktrees/
+/editors/tree-sitter-verb/node_modules/
+/editors/tree-sitter-verb/*.so
+/editors/tree-sitter-verb/*.dylib
+/editors/tree-sitter-verb/*.dll
