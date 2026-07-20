@@ -999,13 +999,6 @@ impl<'ctx> Codegen<'ctx> {
         Ok(out.try_as_basic_value().basic().unwrap().into_struct_value())
     }
 
-    /// A call to a name that isn't a local variable or a known Verb `fn`,
-    /// in a program that has at least one `import mod`. Declares (once
-    /// per name, lazily, on first sight) a raw external function of type
-    /// `VerbValue(VerbValue, VerbValue, ...)` — the same struct Verb's
-    /// own runtime helpers already pass by value — and calls it directly.
-    /// No unboxing: the extern C++ side receives Verb's tagged value
-    /// as-is and is responsible for interpreting it (see runtime/verb.h).
     /// A call to one of the `io` module's built-in functions (see
     /// runtime/verb_std_io.cpp), reachable only when `import std io;` is
     /// present. Arity is checked against the function's fixed, known
@@ -1043,6 +1036,13 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap().try_as_basic_value().basic().unwrap().into_struct_value())
     }
 
+    /// A call to a name that isn't a local variable or a known Verb `fn`,
+    /// in a program that has at least one `import mod`. Declares (once
+    /// per name, lazily, on first sight) a raw external function of type
+    /// `VerbValue(VerbValue, VerbValue, ...)` — the same struct Verb's
+    /// own runtime helpers already pass by value — and calls it directly.
+    /// No unboxing: the extern C++ side receives Verb's tagged value
+    /// as-is and is responsible for interpreting it (see runtime/verb.h).
     fn gen_extern_call(&mut self, name: &str, args: &[Expr], line: u32, col: u32)
         -> Result<StructValue<'ctx>, CompileError>
     {
