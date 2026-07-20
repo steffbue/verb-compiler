@@ -4,7 +4,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::types::{PointerType, StructType};
-use inkwell::values::{IntValue, PointerValue, StructValue};
+use inkwell::values::{FunctionValue, IntValue, PointerValue, StructValue};
 use inkwell::AddressSpace;
 
 use crate::ast::*;
@@ -19,6 +19,8 @@ pub struct Codegen<'ctx> {
     closure_ty: StructType<'ctx>,
     ptr_ty: PointerType<'ctx>,
     scopes: Vec<HashMap<String, PointerValue<'ctx>>>,
+    functions: HashMap<String, (FunctionValue<'ctx>, usize)>,
+    fn_depth: u32,
     fn_counter: u32,
 }
 
@@ -32,7 +34,7 @@ impl<'ctx> Codegen<'ctx> {
             ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into(), ptr_ty.into()], false);
         let cg = Self {
             ctx, module, builder, value_ty, closure_ty, ptr_ty,
-            scopes: Vec::new(), fn_counter: 0,
+            scopes: Vec::new(), functions: HashMap::new(), fn_depth: 0, fn_counter: 0,
         };
         cg.declare_libc();
         cg.build_print_fn();
@@ -42,6 +44,7 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_eq_fn();
         cg.build_concat_fn();
         cg.build_neg_fn();
+        cg.build_check_call_fn();
         cg
     }
 
@@ -494,6 +497,74 @@ impl<'ctx> Codegen<'ctx> {
         self.abort("operand must be a number");
     }
 
+    // ----- generated runtime helper: verb_check_call(value, argc) -> closure ptr -----
+
+    /// Aborts unless `v` is a closure whose arity equals `argc`; returns the closure struct ptr.
+    fn build_check_call_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i64t = self.ctx.i64_type();
+        let f = self.module.add_function(
+            "verb_check_call",
+            self.ptr_ty.fn_type(&[self.value_ty.into(), i64t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let v = f.get_nth_param(0).unwrap().into_struct_value();
+        let argc = f.get_nth_param(1).unwrap().into_int_value();
+
+        let arity_bb = self.ctx.append_basic_block(f, "arity");
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let notfn_bb = self.ctx.append_basic_block(f, "notfn");
+        let badarity_bb = self.ctx.append_basic_block(f, "badarity");
+
+        let tag = self.tag_of(v);
+        let is_clos = self.builder.build_int_compare(
+            EQ, tag, self.ctx.i8_type().const_int(TAG_CLOSURE, false), "isclos").unwrap();
+        self.builder.build_conditional_branch(is_clos, arity_bb, notfn_bb).unwrap();
+
+        self.builder.position_at_end(arity_bb);
+        let p = self.builder.build_int_to_ptr(self.payload_of(v), self.ptr_ty, "cp").unwrap();
+        let ap = self.builder.build_struct_gep(self.closure_ty, p, 1, "ap").unwrap();
+        let arity = self.builder.build_load(i64t, ap, "arity").unwrap().into_int_value();
+        let ok = self.builder.build_int_compare(EQ, arity, argc, "arityok").unwrap();
+        self.builder.build_conditional_branch(ok, ok_bb, badarity_bb).unwrap();
+
+        self.builder.position_at_end(ok_bb);
+        self.builder.build_return(Some(&p)).unwrap();
+
+        self.builder.position_at_end(notfn_bb);
+        self.abort("can only call functions");
+
+        self.builder.position_at_end(badarity_bb);
+        self.abort("wrong number of arguments");
+    }
+
+    /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.
+    fn make_closure(&self, fnv: FunctionValue<'ctx>, arity: usize) -> StructValue<'ctx> {
+        let p = self.malloc_bytes(24);
+        let fp = fnv.as_global_value().as_pointer_value();
+        self.builder.build_store(p, fp).unwrap();
+        let ap = self.builder.build_struct_gep(self.closure_ty, p, 1, "ap").unwrap();
+        self.builder.build_store(ap, self.ctx.i64_type().const_int(arity as u64, false)).unwrap();
+        let ep = self.builder.build_struct_gep(self.closure_ty, p, 2, "ep").unwrap();
+        self.builder.build_store(ep, self.ptr_ty.const_null()).unwrap();
+        let bits = self.builder.build_ptr_to_int(p, self.ctx.i64_type(), "cbits").unwrap();
+        self.make_val(TAG_CLOSURE, bits)
+    }
+
+    /// Alloca in the current function's entry block so loops don't grow the stack.
+    fn entry_alloca(&self, ty: inkwell::types::BasicTypeEnum<'ctx>, name: &str)
+        -> PointerValue<'ctx>
+    {
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let entry = f.get_first_basic_block().unwrap();
+        let tmp = self.ctx.create_builder();
+        match entry.get_first_instruction() {
+            Some(i) => tmp.position_before(&i),
+            None => tmp.position_at_end(entry),
+        }
+        tmp.build_alloca(ty, name).unwrap()
+    }
+
     // ----- program -----
 
     pub fn compile_program(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
@@ -600,8 +671,61 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(end_bb);
                 Ok(())
             }
-            other => Err(CompileError::new(
-                format!("codegen not yet implemented for {other:?}"), 0, 0)),
+            Stmt::Fn { name, params, body, .. } => {
+                self.fn_counter += 1;
+                let llname = format!("fn.{}.{}", name, self.fn_counter);
+                let fnty = self.value_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
+                let fnv = self.module.add_function(&llname, fnty, None);
+                // register before compiling the body so recursion resolves
+                self.functions.insert(name.clone(), (fnv, params.len()));
+                // bind the name as a first-class closure value in the current scope
+                let clos = self.make_closure(fnv, params.len());
+                let cell = self.malloc_bytes(16);
+                self.builder.build_store(cell, clos).unwrap();
+                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+
+                let saved_bb = self.builder.get_insert_block().unwrap();
+                let saved_scopes = std::mem::take(&mut self.scopes);
+                self.fn_depth += 1;
+
+                let entry = self.ctx.append_basic_block(fnv, "entry");
+                self.builder.position_at_end(entry);
+                let argv = fnv.get_nth_param(1).unwrap().into_pointer_value();
+                let mut scope = HashMap::new();
+                for (i, p) in params.iter().enumerate() {
+                    let ap = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            self.value_ty, argv,
+                            &[self.ctx.i64_type().const_int(i as u64, false)], p)
+                    }.unwrap();
+                    let v = self.builder.build_load(self.value_ty, ap, p).unwrap();
+                    let cell = self.malloc_bytes(16);
+                    self.builder.build_store(cell, v).unwrap();
+                    scope.insert(p.clone(), cell);
+                }
+                self.scopes.push(scope);
+                let r = self.gen_stmts(body);
+                if self.cur_block_open() {
+                    self.builder.build_return(Some(&self.nil_val())).unwrap();
+                }
+                self.scopes.pop();
+
+                self.fn_depth -= 1;
+                self.scopes = saved_scopes;
+                self.builder.position_at_end(saved_bb);
+                r
+            }
+            Stmt::Return { value } => {
+                if self.fn_depth == 0 {
+                    return Err(CompileError::new("'return' outside function", 0, 0));
+                }
+                let v = match value {
+                    Some(e) => self.gen_expr(e)?,
+                    None => self.nil_val(),
+                };
+                self.builder.build_return(Some(&v)).unwrap();
+                Ok(())
+            }
         }
     }
 
@@ -622,9 +746,16 @@ impl<'ctx> Codegen<'ctx> {
             Expr::Bool(b) => Ok(self.make_val(TAG_BOOL, self.ctx.i64_type().const_int(*b as u64, false))),
             Expr::Nil => Ok(self.nil_val()),
             Expr::Var(name, line, col) => {
-                let cell = self.lookup(name).ok_or_else(|| CompileError::new(
-                    format!("undefined variable '{name}'"), *line, *col))?;
-                Ok(self.builder.build_load(self.value_ty, cell, name).unwrap().into_struct_value())
+                if let Some(cell) = self.lookup(name) {
+                    return Ok(self.builder.build_load(self.value_ty, cell, name)
+                        .unwrap().into_struct_value());
+                }
+                // function names resolve even where their closure cell is out of scope
+                // (e.g. recursion — the defining function's locals are not captured)
+                if let Some((fnv, arity)) = self.functions.get(name).copied() {
+                    return Ok(self.make_closure(fnv, arity));
+                }
+                Err(CompileError::new(format!("undefined variable '{name}'"), *line, *col))
             }
             Expr::Binary { op, lhs, rhs } => self.gen_binary(*op, lhs, rhs),
             Expr::Unary { op, expr } => {
@@ -641,8 +772,6 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             Expr::Call { callee, args, line, col } => self.gen_call(callee, args, *line, *col),
-            other => Err(CompileError::new(
-                format!("codegen not yet implemented for {other:?}"), 0, 0)),
         }
     }
 
@@ -706,6 +835,31 @@ impl<'ctx> Codegen<'ctx> {
                 return Ok(self.nil_val());
             }
         }
-        Err(CompileError::new("codegen for user calls arrives in Task 8", line, col))
+        let cv = self.gen_expr(callee)?;
+        let argc = self.ctx.i64_type().const_int(args.len() as u64, false);
+        let clos_ptr = self.call_named("verb_check_call", &[cv.into(), argc.into()])
+            .unwrap().into_pointer_value();
+
+        let arr_ty = self.value_ty.array_type(args.len() as u32);
+        let argv = self.entry_alloca(arr_ty.into(), "argv");
+        for (i, a) in args.iter().enumerate() {
+            let v = self.gen_expr(a)?;
+            let ap = unsafe {
+                self.builder.build_in_bounds_gep(
+                    self.value_ty, argv,
+                    &[self.ctx.i64_type().const_int(i as u64, false)], "argp")
+            }.unwrap();
+            self.builder.build_store(ap, v).unwrap();
+        }
+
+        let fpp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 0, "fpp").unwrap();
+        let fp = self.builder.build_load(self.ptr_ty, fpp, "fp").unwrap().into_pointer_value();
+        let epp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 2, "epp").unwrap();
+        let env = self.builder.build_load(self.ptr_ty, epp, "env").unwrap();
+
+        let fnty = self.value_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
+        let out = self.builder.build_indirect_call(
+            fnty, fp, &[env.into(), argv.into()], "call").unwrap();
+        Ok(out.try_as_basic_value().basic().unwrap().into_struct_value())
     }
 }

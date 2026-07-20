@@ -1,0 +1,25 @@
+%% user-defined functions
+fn add(a, b) {
+  return a plus b;
+}
+print(add(1, 2));
+
+fn greet() {
+  print("hi");
+}
+greet();
+
+fn noret(a) {
+  a be a plus 1;
+}
+print(noret(5));
+
+fn fib(n) {
+  if (n lo 2) { return n; }
+  return fib(n minus 1) plus fib(n minus 2);
+}
+print(fib(10));
+
+assign f add;
+print(f(3, 4));
+print(add);

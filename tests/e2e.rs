@@ -51,6 +51,26 @@ fn vars() { run_ok("vars"); }
 fn control() { run_ok("control"); }
 
 #[test]
+fn functions() { run_ok("functions"); }
+
+#[test]
+fn call_non_function_aborts() { run_err("err_call_nonfn", "can only call functions"); }
+
+#[test]
+fn wrong_arity_aborts() { run_err("err_arity", "wrong number of arguments"); }
+
+#[test]
+fn top_level_return_is_compile_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/err_return_top.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("'return' outside function"), "stderr: {stderr}");
+}
+
+#[test]
 fn undefined_var_is_compile_error() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run", "tests/fixtures/err_undef.verb"])
