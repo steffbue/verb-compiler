@@ -61,6 +61,32 @@ Cross-compiled binaries aren't executed as part of the build (or by the test
 suite) — there's no host that can run all six target/arch combinations, so
 only "linked successfully" is verified.
 
+## Importing C++ libraries
+
+Verb programs can call `extern "C"` functions from a native library:
+
+    import mod mathlib;
+
+    assign r c_sqrt(2.0);
+    print(r);
+
+- `import mod <name>;` must appear before any other top-level statement,
+  is repeatable, and maps to a linker `-l<name>` flag.
+- Extern functions are declared with no signature — write the C++ side
+  against Verb's tagged value struct (`runtime/verb.h`, `VerbValue`), e.g.
+  `extern "C" VerbValue c_sqrt(VerbValue x) { ... }`.
+- `verb build`/`compile` link with `c++` instead of `cc` whenever imports
+  are present, pass `-l<name>` per import, and accept a repeatable
+  `-L<dir>` flag for extra linker search paths:
+
+      verb build examples/uses_mathlib.verb -o out -Lpath/to/libs
+
+- `verb run` (JIT) does not support imports — programs using `import mod`
+  must be built with `verb build`/`compile`, not run.
+
+See `docs/superpowers/specs/2026-07-20-cpp-import-design.md` for the full
+design.
+
 ## Language
 
 See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
