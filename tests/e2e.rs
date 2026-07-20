@@ -158,3 +158,45 @@ fn multi_file_error_reports_correct_filename() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("usage:"), "stderr: {stderr}");
 }
+
+fn run_ok_multi(names: &[&str], expected_name: &str) {
+    let files: Vec<String> = names
+        .iter()
+        .map(|n| format!("tests/fixtures/{n}.verb"))
+        .collect();
+    let mut args = vec!["run".to_string()];
+    args.extend(files);
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(&args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = std::fs::read_to_string(format!("tests/fixtures/{expected_name}.expected")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn multi_file_links_and_runs() {
+    run_ok_multi(&["multifile_a", "multifile_b"], "multifile");
+}
+
+#[test]
+fn multi_file_emits_single_merged_llvm_module() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "run",
+            "tests/fixtures/multifile_a.verb",
+            "tests/fixtures/multifile_b.verb",
+            "--emit-llvm",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("define i32 @main"), "no main in IR: {ir}");
+}
