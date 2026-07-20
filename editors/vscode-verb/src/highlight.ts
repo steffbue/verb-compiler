@@ -36,6 +36,7 @@ const KEYWORD_LITERALS = new Set([
   "loop",
   "begin",
   "end",
+  "import",
 ]);
 
 // Anonymous-node operator literals (spec §4 step 2).
@@ -129,6 +130,13 @@ function classifyNode(
   if (type === "line_comment" || type === "block_comment") {
     return "comment";
   }
+  // `mod`/`std` inside an import_statement are the import-kind keyword
+  // (`import mod x;` / `import std io;`), not the `mod` arithmetic
+  // operator — checked before the generic literal sets below, which would
+  // otherwise misclassify `mod` as an operator (or leave `std` unstyled).
+  if ((type === "mod" || type === "std") && parent?.type === "import_statement") {
+    return "keyword";
+  }
   if (KEYWORD_LITERALS.has(type)) {
     return "keyword";
   }
@@ -147,7 +155,8 @@ function classifyNode(
       return "parameter";
     }
     // Covers assign_statement.name, declare_statement.name,
-    // reassign_statement.name, and every other bare identifier.
+    // reassign_statement.name, import_statement.library/module, and
+    // every other bare identifier.
     return "variable";
   }
 
