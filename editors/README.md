@@ -90,6 +90,13 @@ Rebuild after editing the server: `cargo build --release` in this repo
 (the nvim config's `cmd` points at the `target/release/verb-lsp` path
 directly, so `:LspRestart` after a rebuild picks up the new binary).
 
+## vscode-verb
+
+`vscode-verb/` is a VSCode extension providing LSP client support (via
+`verb-lsp`, including format-on-save) and tree-sitter-based syntax
+highlighting for `.verb` files. See `vscode-verb/README.md` for
+installation, configuration (`verb.lspPath`), and development docs.
+
 ## tree-sitter-verb
 
 `tree-sitter-verb/` is a standalone [tree-sitter](https://tree-sitter.github.io/tree-sitter/)
@@ -105,11 +112,19 @@ build it — Node/the `tree-sitter` CLI are only needed if you're editing
 
 ```sh
 cd editors/tree-sitter-verb
-npm install         # pulls in tree-sitter-cli as a devDependency
-npx tree-sitter generate
+npm install          # pulls in tree-sitter-cli as a devDependency
+npm run generate     # tree-sitter generate --abi=14 (see below — do not run
+                      # `npx tree-sitter generate` bare)
 npx tree-sitter test        # corpus tests in test/corpus/
 npx tree-sitter parse ../../examples/demo.verb   # sanity check
 ```
+
+**Always regenerate via the `generate` (or `build:wasm`) npm script, never
+bare `npx tree-sitter generate`.** `tree-sitter.json`'s presence in this
+directory changes the CLI's *default* ABI to 15, but `src/parser.c` and the
+other committed generated files are ABI 14 — the npm scripts pin
+`--abi=14` explicitly; a bare `npx tree-sitter generate` does not, and will
+silently regenerate `src/parser.c` at the wrong ABI.
 
 The canonical query files live in `tree-sitter-verb/queries/`:
 

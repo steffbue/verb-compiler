@@ -1,0 +1,41 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "verb",
+      "camelcase": "Verb",
+      "title": "Verb",
+      "scope": "source.verb",
+      "file-types": [
+        "verb"
+      ],
+      "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm",
+      "injection-regex": "^verb$",
+      "class-name": "TreeSitterVerb"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Verb grammar for tree-sitter",
+    "authors": [
+      {
+        "name": "Steffen Büschking",
+        "email": "bigsteff987@aol.com"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/steffbue/verb-compiler"
+    }
+  },
+  "bindings": {
+    "c": false,
+    "go": false,
+    "node": false,
+    "python": false,
+    "rust": false,
+    "swift": false,
+    "zig": false
+  }
+}
