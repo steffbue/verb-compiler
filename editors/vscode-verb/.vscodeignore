@@ -1,0 +1,28 @@
+# Files excluded from the packaged .vsix. vsce's own defaults already drop
+# devDependencies from node_modules (it resolves the production dependency
+# graph via `dependencies` in package.json), but we're explicit here too so
+# the exclusion doesn't silently depend on that behavior alone.
+#
+# Do NOT exclude web-tree-sitter or vscode-languageclient — they're real
+# `dependencies` (not devDependencies) required at runtime, and their
+# node_modules/** contents must ship in the .vsix. Do NOT exclude
+# parsers/*.wasm — that's the build output the extension loads at runtime.
+
+.vscodeignore
+.gitignore
+tsconfig.json
+scripts/**
+src/**
+**/*.ts
+**/*.map
+
+# Dev-only tooling that ends up in node_modules but is never imported at
+# runtime (TypeScript itself, ambient type packages, and vsce, which
+# packages the extension but isn't needed inside it).
+node_modules/typescript/**
+node_modules/.bin/**
+node_modules/@types/**
+node_modules/@vscode/**
+
+# Misc repo/editor cruft that occasionally lands in node_modules trees.
+**/.DS_Store

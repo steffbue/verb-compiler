@@ -39,13 +39,17 @@
     }
   },
   "scripts": {
-    "build": "echo 'see Task 5 for full build pipeline' && tsc"
+    "build": "tsc && node scripts/copy-wasm.js",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^8.1.0",
+    "web-tree-sitter": "^0.25.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
     "@types/vscode": "^1.125.0",
-    "typescript": "^5.3.3",
-    "vscode-languageclient": "^8.1.0",
-    "web-tree-sitter": "^0.25.0"
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.3.3"
   }
 }

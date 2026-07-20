@@ -105,11 +105,19 @@ build it — Node/the `tree-sitter` CLI are only needed if you're editing
 
 ```sh
 cd editors/tree-sitter-verb
-npm install         # pulls in tree-sitter-cli as a devDependency
-npx tree-sitter generate
+npm install          # pulls in tree-sitter-cli as a devDependency
+npm run generate     # tree-sitter generate --abi=14 (see below — do not run
+                      # `npx tree-sitter generate` bare)
 npx tree-sitter test        # corpus tests in test/corpus/
 npx tree-sitter parse ../../examples/demo.verb   # sanity check
 ```
+
+**Always regenerate via the `generate` (or `build:wasm`) npm script, never
+bare `npx tree-sitter generate`.** `tree-sitter.json`'s presence in this
+directory changes the CLI's *default* ABI to 15, but `src/parser.c` and the
+other committed generated files are ABI 14 — the npm scripts pin
+`--abi=14` explicitly; a bare `npx tree-sitter generate` does not, and will
+silently regenerate `src/parser.c` at the wrong ABI.
 
 The canonical query files live in `tree-sitter-verb/queries/`:
 
