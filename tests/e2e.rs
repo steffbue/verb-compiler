@@ -160,3 +160,44 @@ fn aot_build_produces_working_binary() {
     let expected = std::fs::read_to_string("tests/fixtures/functions.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 }
+
+fn zig_available() -> bool {
+    Command::new("zig").arg("version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[test]
+fn aot_cross_build_produces_binary_for_each_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_aot_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    for label in ["linux-x86_64", "linux-arm64", "macos-x86_64", "macos-arm64", "windows-x86_64", "windows-arm64"] {
+        let bin = dir.join(format!("functions_{label}"));
+        let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+            .args(["build", "tests/fixtures/functions.verb", "-o", bin.to_str().unwrap(), "--target", label])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "target {label} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let expected_path = if label.starts_with("windows") {
+            dir.join(format!("functions_{label}.exe"))
+        } else {
+            bin
+        };
+        let meta = std::fs::metadata(&expected_path)
+            .unwrap_or_else(|e| panic!("missing output for {label} at {expected_path:?}: {e}"));
+        assert!(meta.len() > 0, "empty output for {label}");
+    }
+}
+
+#[test]
+fn aot_build_invalid_target_is_usage_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/functions.verb", "-o", "/tmp/whatever", "--target", "solaris-x86_64"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid --target"), "stderr: {stderr}");
+}
