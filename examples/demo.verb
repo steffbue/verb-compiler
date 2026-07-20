@@ -38,56 +38,56 @@ assign greeting "hello" c " " c "world";
 print(greeting);
 
 %% --- control flow ---
-if (x hi 10) {
+if x hi 10 begin
   print("big");
-} else if (x hi 3) {
+end else if x hi 3 begin
   print("medium");
-} else {
+end else begin
   print("small");
-}
+end
 
 assign count 0;
-while (count lo 3) {
+while count lo 3 begin
   print(count);
   count be count plus 1;
-}
+end
 
 %% --- fizzbuzz via for loop ---
-for (assign i 1; i loeq 15; i be i plus 1) {
-  if (i mod 15 eqeq 0) {
+for assign i 1; i loeq 15; i be i plus 1 begin
+  if i mod 15 eqeq 0 begin
     print("FizzBuzz");
-  } else if (i mod 3 eqeq 0) {
+  end else if i mod 3 eqeq 0 begin
     print("Fizz");
-  } else if (i mod 5 eqeq 0) {
+  end else if i mod 5 eqeq 0 begin
     print("Buzz");
-  } else {
+  end else begin
     print(i);
-  }
-}
+  end
+end
 
 %% --- functions ---
-fn square(n) {
+fn square(n) begin
   return n mul n;
-}
+end
 print(square(7));   %% 49
 
-fn fib(n) {
-  if (n lo 2) { return n; }
+fn fib(n) begin
+  if n lo 2 begin return n; end
   return fib(n minus 1) plus fib(n minus 2);
-}
+end
 print(fib(20));     %% 6765
 
-fn max(a, b) {
-  if (a hi b) { return a; }
+fn max(a, b) begin
+  if a hi b begin return a; end
   return b;
-}
+end
 
 %% functions are values
 assign pick max;
 print(pick(3, 11)); %% 11
 print(pick);        %% <fn>
 
-fn shout(word) {
+fn shout(word) begin
   print(word c "!");
-}
+end
 shout("done");

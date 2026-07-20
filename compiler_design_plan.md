@@ -45,30 +45,32 @@ x be x plus 1;
 
 ## Control flow
 
+Blocks are delimited by `begin` / `end`. Conditions and loop headers take no parentheses (parens remain valid as expression grouping).
+
 ```
-if (cond) {
+if cond begin
   ...
-} else if (other) {
+end else if other begin
   ...
-} else {
+end else begin
   ...
-}
+end
 
-while (cond) {
+while cond begin
   ...
-}
+end
 
-for (assign i 0; i lo 10; i be i plus 1) {
+for assign i 0; i lo 10; i be i plus 1 begin
   ...
-}
+end
 ```
 
 ## Functions
 
 ```
-fn add(a, b) {
+fn add(a, b) begin
   return a plus b;
-}
+end
 
 result be add(1, 2);
 ```

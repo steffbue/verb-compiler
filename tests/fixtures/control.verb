@@ -1,16 +1,16 @@
 assign n 3;
-if (n hi 5) {
+if n hi 5 begin
   print("big");
-} else if (n hi 2) {
+end else if n hi 2 begin
   print("mid");
-} else {
+end else begin
   print("small");
-}
+end
 assign i 0;
-while (i lo 3) {
+while i lo 3 begin
   print(i);
   i be i plus 1;
-}
-for (assign j 0; j lo 3; j be j plus 1) {
+end
+for assign j 0; j lo 3; j be j plus 1 begin
   print(j mul 10);
-}
+end

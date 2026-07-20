@@ -3,11 +3,11 @@ use crate::error::CompileError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
-    Assign, Be, Fn, Return, If, Else, While, For, True, False, Nil,
+    Assign, Be, Fn, Return, If, Else, While, For, True, False, Nil, Begin, End,
     Plus, Minus, Mul, Div, Mod,
     Eqeq, Neq, Lo, Hi, Loeq, Hieq,
     And, Or, Not, Concat,
-    LParen, RParen, LBrace, RBrace, Semi, Comma,
+    LParen, RParen, Semi, Comma,
     Eof,
 }
 
@@ -51,8 +51,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
             }
             '(' => { toks.push(Token { kind: TokenKind::LParen, line: tl, col: tc }); i += 1; col += 1; }
             ')' => { toks.push(Token { kind: TokenKind::RParen, line: tl, col: tc }); i += 1; col += 1; }
-            '{' => { toks.push(Token { kind: TokenKind::LBrace, line: tl, col: tc }); i += 1; col += 1; }
-            '}' => { toks.push(Token { kind: TokenKind::RBrace, line: tl, col: tc }); i += 1; col += 1; }
             ';' => { toks.push(Token { kind: TokenKind::Semi, line: tl, col: tc }); i += 1; col += 1; }
             ',' => { toks.push(Token { kind: TokenKind::Comma, line: tl, col: tc }); i += 1; col += 1; }
             '"' => {
@@ -108,6 +106,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                     "assign" => Assign, "be" => Be, "fn" => Fn, "return" => Return,
                     "if" => If, "else" => Else, "while" => While, "for" => For,
                     "true" => True, "false" => False, "nil" => Nil,
+                    "begin" => Begin, "end" => End,
                     "plus" => Plus, "minus" => Minus, "mul" => Mul, "div" => Div, "mod" => Mod,
                     "eqeq" => Eqeq, "neq" => Neq, "lo" => Lo, "hi" => Hi,
                     "loeq" => Loeq, "hieq" => Hieq,
@@ -167,5 +166,20 @@ mod tests {
     #[test]
     fn rejects_unknown_char() {
         assert!(lex("@").is_err());
+    }
+
+    #[test]
+    fn scans_begin_end_keywords() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("while x lo 1 begin end"),
+            vec![While, Ident("x".into()), Lo, Int(1), Begin, End, Eof]
+        );
+    }
+
+    #[test]
+    fn rejects_braces() {
+        assert!(lex("{").is_err());
+        assert!(lex("}").is_err());
     }
 }

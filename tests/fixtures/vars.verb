@@ -3,8 +3,8 @@ assign name "compiler";
 x be x plus 1;
 print(x);
 print(name);
-{
+begin
   assign x 99;
   print(x);
-}
+end
 print(x);

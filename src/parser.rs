@@ -58,7 +58,7 @@ impl Parser {
             TokenKind::If => self.if_stmt(),
             TokenKind::While => self.while_stmt(),
             TokenKind::For => self.for_stmt(),
-            TokenKind::LBrace => Ok(Stmt::Block(self.block()?)),
+            TokenKind::Begin => Ok(Stmt::Block(self.block()?)),
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true),
             _ => {
                 let e = self.expression()?;
@@ -115,9 +115,7 @@ impl Parser {
 
     fn if_stmt(&mut self) -> Result<Stmt, CompileError> {
         self.advance(); // if
-        self.expect(&TokenKind::LParen, "'('")?;
         let cond = self.expression()?;
-        self.expect(&TokenKind::RParen, "')'")?;
         let then_body = self.block()?;
         let else_body = if self.matches(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
@@ -133,16 +131,13 @@ impl Parser {
 
     fn while_stmt(&mut self) -> Result<Stmt, CompileError> {
         self.advance(); // while
-        self.expect(&TokenKind::LParen, "'('")?;
         let cond = self.expression()?;
-        self.expect(&TokenKind::RParen, "')'")?;
         let body = self.block()?;
         Ok(Stmt::While { cond, body })
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, CompileError> {
         self.advance(); // for
-        self.expect(&TokenKind::LParen, "'('")?;
         let init = match self.peek() {
             TokenKind::Assign => self.assign_stmt(true)?, // consumes ';'
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true)?,
@@ -154,19 +149,18 @@ impl Parser {
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(false)?,
             _ => Stmt::ExprStmt(self.expression()?),
         };
-        self.expect(&TokenKind::RParen, "')'")?;
         let mut body = self.block()?;
         body.push(incr);
         Ok(Stmt::Block(vec![init, Stmt::While { cond, body }]))
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, CompileError> {
-        self.expect(&TokenKind::LBrace, "'{'")?;
+        self.expect(&TokenKind::Begin, "'begin'")?;
         let mut stmts = Vec::new();
-        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+        while !self.check(&TokenKind::End) && !self.check(&TokenKind::Eof) {
             stmts.push(self.statement()?);
         }
-        self.expect(&TokenKind::RBrace, "'}'")?;
+        self.expect(&TokenKind::End, "'end'")?;
         Ok(stmts)
     }
 
@@ -375,7 +369,7 @@ mod tests {
 
     #[test]
     fn parses_if_else_chain() {
-        let s = parse(lex("if (true) { print(1); } else if (false) { print(2); } else { print(3); }").unwrap()).unwrap();
+        let s = parse(lex("if true begin print(1); end else if false begin print(2); end else begin print(3); end").unwrap()).unwrap();
         match &s[0] {
             Stmt::If { else_body: Some(eb), .. } => {
                 assert!(matches!(&eb[0], Stmt::If { else_body: Some(_), .. }));
@@ -386,7 +380,7 @@ mod tests {
 
     #[test]
     fn desugars_for_to_while() {
-        let s = parse(lex("for (assign i 0; i lo 10; i be i plus 1) { print(i); }").unwrap()).unwrap();
+        let s = parse(lex("for assign i 0; i lo 10; i be i plus 1 begin print(i); end").unwrap()).unwrap();
         match &s[0] {
             Stmt::Block(inner) => {
                 assert!(matches!(&inner[0], Stmt::Assign { name, .. } if name == "i"));
@@ -403,7 +397,7 @@ mod tests {
 
     #[test]
     fn parses_fn_and_return() {
-        let s = parse(lex("fn add(a, b) { return a plus b; }").unwrap()).unwrap();
+        let s = parse(lex("fn add(a, b) begin return a plus b; end").unwrap()).unwrap();
         match &s[0] {
             Stmt::Fn { name, params, body, .. } => {
                 assert_eq!(name, "add");

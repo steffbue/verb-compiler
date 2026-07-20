@@ -1,23 +1,23 @@
 %% user-defined functions
-fn add(a, b) {
+fn add(a, b) begin
   return a plus b;
-}
+end
 print(add(1, 2));
 
-fn greet() {
+fn greet() begin
   print("hi");
-}
+end
 greet();
 
-fn noret(a) {
+fn noret(a) begin
   a be a plus 1;
-}
+end
 print(noret(5));
 
-fn fib(n) {
-  if (n lo 2) { return n; }
+fn fib(n) begin
+  if n lo 2 begin return n; end
   return fib(n minus 1) plus fib(n minus 2);
-}
+end
 print(fib(10));
 
 assign f add;

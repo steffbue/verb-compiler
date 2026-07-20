@@ -1,2 +1,2 @@
-fn one(a) { return a; }
+fn one(a) begin return a; end
 one(1, 2);
