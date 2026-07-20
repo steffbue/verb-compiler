@@ -158,9 +158,11 @@ fn extern_call_compiles_to_a_direct_call_instruction() {
         ])
         .output()
         .unwrap();
-    // build_aot isn't implemented until Task 6, so this still exits non-zero —
-    // --emit-llvm prints IR to stdout before build_aot ever runs, so the IR
-    // shape is already checkable here.
+    // --emit-llvm prints IR to stdout before the link step runs, so the IR
+    // shape is already checkable here. This still exits non-zero because the
+    // link step fails: `-lmathlib` isn't an actual library built/linked in
+    // this test — only the emitted IR shape is under test, not a successful
+    // link.
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("@c_sqrt"), "no call to c_sqrt in IR:\n{ir}");
 }

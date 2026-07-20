@@ -101,7 +101,7 @@ fn build_aot(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs: &[S
             RelocMode::Default,
             CodeModel::Default,
         )
-        .expect("failed to create target machine");
+        .unwrap_or_else(|| { eprintln!("error: failed to create target machine"); exit(1); });
 
     cg.module().set_triple(&triple);
     cg.module().set_data_layout(&tm.get_target_data().get_data_layout());

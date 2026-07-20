@@ -1007,6 +1007,16 @@ impl<'ctx> Codegen<'ctx> {
                 fnv
             }
             None => {
+                // Footgun (accepted, v1): no symbol-existence checking here.
+                // Any unresolved call-by-name in an `import`-using program
+                // takes this path, including one that accidentally collides
+                // with an already-declared symbol (e.g. `printf`, `malloc`).
+                // LLVM silently auto-renames the duplicate declaration
+                // (e.g. `printf.1`) instead of erroring, so the mistake
+                // surfaces later as a confusing "undefined symbol" at link
+                // time rather than a clear compile-time error. Per the
+                // design spec this tradeoff is deliberate for v1, not an
+                // oversight.
                 let param_tys: Vec<_> = argvals.iter().map(|_| self.value_ty.into()).collect();
                 let fnty = self.value_ty.fn_type(&param_tys, false);
                 let fnv = self.module.add_function(name, fnty, None);
