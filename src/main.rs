@@ -139,7 +139,7 @@ fn main() {
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
-    cg.compile_program(&stmts, &stmt_files, &imports).unwrap_or_else(|e| die(e, &sources));
+    cg.compile_program(&stmts, &stmt_files, &imports, &[]).unwrap_or_else(|e| die(e, &sources));
 
     if parsed.emit_llvm {
         println!("{}", cg.module().print_to_string().to_string());
