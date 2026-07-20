@@ -4,7 +4,7 @@ use crate::error::CompileError;
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
     Assign, Be, Declare, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
-    Import, Mod,
+    Import, Mod, Std,
     Add, Sub, Neg, Times, Div,
     Equals, Differs, Trails, Beats, Atmost, Atleast,
     And, Or, Not, Join,
@@ -161,7 +161,7 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), Compil
                     "check" => Check, "orelse" => Orelse, "repeat" => Repeat, "loop" => Loop,
                     "true" => True, "false" => False, "nil" => Nil,
                     "begin" => Begin, "end" => End,
-                    "import" => Import, "mod" => Mod,
+                    "import" => Import, "mod" => Mod, "std" => Std,
                     "add" => Add, "sub" => Sub, "neg" => Neg,
                     "times" => Times, "div" => Div,
                     "equals" => Equals, "differs" => Differs, "trails" => Trails,
@@ -259,6 +259,15 @@ mod tests {
         assert_eq!(
             kinds("import mod mathlib;"),
             vec![Import, Mod, Ident("mathlib".into()), Semi, Eof]
+        );
+    }
+
+    #[test]
+    fn scans_std_import_keyword() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("import std io;"),
+            vec![Import, Std, Ident("io".into()), Semi, Eof]
         );
     }
 

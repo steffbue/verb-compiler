@@ -199,6 +199,7 @@ fn token_text(tok: &Token) -> String {
         End => "end".into(),
         Import => "import".into(),
         Mod => "mod".into(),
+        Std => "std".into(),
         Add => "add".into(),
         Sub => "sub".into(),
         Neg => "neg".into(),
