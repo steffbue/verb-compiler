@@ -1,0 +1,27 @@
+%% sockets.verb — blocking TCP via the built-in `import std io;` module
+!?!
+  No user-authored C++ shim needed — Verb ships and auto-links
+  runtime/verb_std_io.cpp itself. Build (imports need `verb build`, not
+  `verb run` — see README.md) and run:
+
+    verb build examples/sockets.verb -o sockets_demo
+    ./sockets_demo
+!?!
+
+import std io;
+
+assign fd tcp_connect("example.com", 80);
+
+check fd equals nil begin
+  print("connect failed");
+end orelse begin
+  assign request "GET / HTTP/1.0" join "\n" join "Host: example.com" join "\n";
+  send_line(fd, request);
+
+  assign line recv_line(fd);
+  repeat line differs nil begin
+    print(line);
+    line be recv_line(fd);
+  end
+  close_conn(fd);
+end

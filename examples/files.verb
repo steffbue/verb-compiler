@@ -1,0 +1,27 @@
+%% files.verb — whole-file read/write/append via `import std io;`
+!?!
+  Build (imports need `verb build`, not `verb run` — see README.md)
+  and run:
+
+    verb build examples/files.verb -o files_demo
+    ./files_demo
+!?!
+
+import std io;
+
+assign path "verb_files_demo.tmp";
+
+file_write(path, "first line");
+file_append(path, "\nsecond line");
+
+assign contents file_read(path);
+check contents equals nil begin
+  print("read failed");
+end orelse begin
+  print(contents);
+end
+
+assign missing file_read("does_not_exist.tmp");
+check missing equals nil begin
+  print("missing file correctly returned nil");
+end
