@@ -322,6 +322,8 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
         "loop" => "`loop init; cond; update begin ... end` — C-style for-loop (desugars to a `repeat`).",
         "begin" => "opens a block (Verb has no `{ }`).",
         "end" => "closes a block opened by `begin`.",
+        "import" => "`import mod <lib>;` / `import std <module>;` — must appear before any other top-level statement.",
+        "std" => "`import std io;` — built-in stdlib module (file/stdin/TCP I/O), no user-written C++ shim needed.",
         "true" => "boolean literal `true`.",
         "false" => "boolean literal `false`.",
         "nil" => "the null / not-yet-initialized value.",
@@ -330,7 +332,7 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
         "neg" => "`neg a` — unary negation (`-a`).",
         "times" => "`a times b` — multiplication (`*`).",
         "div" => "`a div b` — division (`/`).",
-        "mod" => "`a mod b` — modulo (`%`).",
+        "mod" => "`a mod b` — modulo (`%`). Also the `import mod <lib>;` keyword for a C++ extern library.",
         "equals" => "`a equals b` — equality (`==`).",
         "differs" => "`a differs b` — inequality (`!=`).",
         "trails" => "`a trails b` — less than (`<`).",
@@ -356,8 +358,8 @@ fn completion_items(src: &str) -> Value {
 
     for word in [
         "assign", "declare", "be", "make", "return", "check", "orelse", "repeat", "loop", "begin",
-        "end", "true", "false", "nil", "add", "sub", "neg", "times", "div", "mod", "equals",
-        "differs", "trails", "beats", "atmost", "atleast", "and", "or", "not", "join",
+        "end", "import", "std", "true", "false", "nil", "add", "sub", "neg", "times", "div", "mod",
+        "equals", "differs", "trails", "beats", "atmost", "atleast", "and", "or", "not", "join",
     ] {
         items.push(json!({
             "label": word,
