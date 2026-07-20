@@ -150,7 +150,7 @@ fn lambda_callable_fails_to_compile() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test verb_export_macro -- --test-threads=1`
-Expected: 5 of 7 tests FAIL — the four `exports_*` tests (compile error: `VERB_EXPORT` / `verb_detail` not declared, since the macro doesn't exist in `runtime/verb.h` yet) plus `arity_mismatch_fails_to_compile` and `unsupported_parameter_type_fails_to_compile` (their snippets do fail to compile already, but for the wrong reason — `VERB_EXPORT` undefined — so the `stderr.contains(...)` assertion on the specific `static_assert` message fails). `bare_overloaded_callable_fails_to_compile` and `lambda_callable_fails_to_compile` PASS already at this point — they only assert `!ok`, which is trivially true when the macro doesn't exist at all; that's expected and not a bug, both get real (non-vacuous) coverage once Step 3 lands the actual implementation and their snippets fail for the *documented* reason instead.
+Expected: 5 of 8 tests FAIL — the four `exports_*` tests (compile error: `VERB_EXPORT` / `verb_detail` not declared, since the macro doesn't exist in `runtime/verb.h` yet) plus `arity_mismatch_fails_to_compile` and `unsupported_parameter_type_fails_to_compile` (their snippets do fail to compile already, but for the wrong reason — `VERB_EXPORT` undefined — so the `stderr.contains(...)` assertion on the specific `static_assert` message fails). `bare_overloaded_callable_fails_to_compile` and `lambda_callable_fails_to_compile` PASS already at this point — they only assert `!ok`, which is trivially true when the macro doesn't exist at all; that's expected and not a bug, both get real (non-vacuous) coverage once Step 3 lands the actual implementation and their snippets fail for the *documented* reason instead.
 
 - [ ] **Step 3: Add the C++-only section to `runtime/verb.h`**
 
@@ -276,7 +276,7 @@ Note the final `#endif // VERB_H` moves down to after the new `#endif // __cplus
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --test verb_export_macro -- --test-threads=1`
-Expected: all 7 tests PASS.
+Expected: all 8 tests PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -322,7 +322,7 @@ print(c_add_int(2, 3));
 print(c_shout("hi"));
 c_hello();
 print(c_is_positive(5));
-print(c_is_positive(-5));
+print(c_is_positive(neg 5));
 ```
 
 Current `tests/fixtures/import_mathlib.expected`:
