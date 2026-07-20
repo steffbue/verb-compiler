@@ -25,6 +25,7 @@ fn die(e: CompileError, src: &str) -> ! {
 fn usage() -> ! {
     eprintln!("usage: verb run <file.verb> [--emit-llvm]");
     eprintln!("       verb build <file.verb> -o <out> [--emit-llvm]");
+    eprintln!("       verb compile <file.verb> -o <out> [--emit-llvm]  (alias for build)");
     exit(2)
 }
 
@@ -64,7 +65,7 @@ fn main() {
                 exit(main_fn.call());
             }
         }
-        "build" => {
+        "build" | "compile" => {
             let out = out.unwrap_or_else(|| usage());
             build_aot(&cg, &out); // implemented in Task 9; stub for now
         }
