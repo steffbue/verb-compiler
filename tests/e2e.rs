@@ -226,3 +226,52 @@ fn run_rejects_programs_with_imports() {
     assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
     assert!(stderr.contains("mathlib"), "stderr: {stderr}");
 }
+
+/// Compiles tests/fixtures/cpp/mathlib.cpp into a shared library once per
+/// test run and returns the directory it landed in (for `-L`).
+fn build_mathlib_fixture() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("verb_e2e_cpp_libs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib_path = dir.join("libmathlib.dylib");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17",
+            "-Iruntime",
+            "-dynamiclib",
+            "-o", lib_path.to_str().unwrap(),
+            "tests/fixtures/cpp/mathlib.cpp",
+        ])
+        .status()
+        .expect("failed to invoke c++ to build the mathlib test fixture");
+    assert!(status.success(), "failed to compile tests/fixtures/cpp/mathlib.cpp");
+    dir
+}
+
+fn build_and_run_ok(name: &str, lib_dir: &std::path::Path) {
+    let out_path = std::env::temp_dir().join(format!("verb_e2e_build_{name}"));
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            &format!("tests/fixtures/{name}.verb"),
+            "-o", out_path.to_str().unwrap(),
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path)
+        .env("DYLD_LIBRARY_PATH", lib_dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string(format!("tests/fixtures/{name}.expected")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn imports_cpp_library_and_calls_extern_functions() {
+    let lib_dir = build_mathlib_fixture();
+    build_and_run_ok("import_mathlib", &lib_dir);
+}
