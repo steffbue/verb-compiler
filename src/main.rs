@@ -3,6 +3,7 @@ mod codegen;
 mod error;
 mod lexer;
 mod parser;
+mod targets;
 mod value;
 
 use std::process::exit;
