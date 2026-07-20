@@ -195,6 +195,13 @@ fn main() {
     }
 }
 
+/// Absolute paths into this crate's bundled `runtime/` dir, embedded at
+/// compile time — `verb build` must find these regardless of the caller's
+/// current directory, unlike a relative `runtime/verb_std_io.cpp`, which
+/// only works when run from the repo root.
+const RUNTIME_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime");
+const STD_IO_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_io.cpp");
+
 /// Compiles the bundled `runtime/verb_std_io.cpp` into an object file with
 /// `compiler` (`"cc"`/`"c++"` for the host, `"zig"` for cross targets),
 /// prepending `extra_args` (e.g. `["c++", "-target", triple]` for zig).
@@ -203,13 +210,13 @@ fn compile_std_io_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, St
     let obj = std::env::temp_dir().join(format!("verb_std_io_{}.o", std::process::id()));
     let mut cmd = Command::new(compiler);
     cmd.args(extra_args);
-    cmd.args(["-std=c++17", "-Iruntime", "-c", "runtime/verb_std_io.cpp", "-o"]);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-c", STD_IO_CPP, "-o"]);
     cmd.arg(&obj);
     let status = cmd
         .status()
-        .map_err(|e| format!("failed to run '{compiler}' to compile runtime/verb_std_io.cpp: {e}"))?;
+        .map_err(|e| format!("failed to run '{compiler}' to compile {STD_IO_CPP}: {e}"))?;
     if !status.success() {
-        return Err("failed to compile runtime/verb_std_io.cpp".to_string());
+        return Err(format!("failed to compile {STD_IO_CPP}"));
     }
     Ok(obj)
 }
