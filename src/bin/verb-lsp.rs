@@ -229,13 +229,13 @@ fn compute_diagnostics(src: &str) -> Vec<Value> {
         Ok(t) => t,
         Err(e) => return vec![diagnostic_from(&e)],
     };
-    let (stmts, parse_errors) = parser::parse_recovering(toks);
+    let (program, parse_errors) = parser::parse_recovering(toks);
     if !parse_errors.is_empty() {
         return parse_errors.iter().map(diagnostic_from).collect();
     }
     let ctx = Context::create();
     let mut cg = Codegen::new(&ctx);
-    if let Err(e) = cg.compile_program(&stmts) {
+    if let Err(e) = cg.compile_program(&program) {
         return vec![diagnostic_from(&e)];
     }
     vec![]
@@ -416,8 +416,8 @@ fn collect_symbols(src: &str) -> Symbols {
     if let Ok(toks) = lexer::lex(src) {
         // best-effort: use whatever parsed even if part of the file has
         // a syntax error elsewhere, so hover/completion still work
-        let (stmts, _errors) = parser::parse_recovering(toks);
-        collect_from_stmts(&stmts, &mut symbols);
+        let (program, _errors) = parser::parse_recovering(toks);
+        collect_from_stmts(&program.body, &mut symbols);
     }
     symbols
 }

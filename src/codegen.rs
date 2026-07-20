@@ -20,6 +20,8 @@ pub struct Codegen<'ctx> {
     ptr_ty: PointerType<'ctx>,
     scopes: Vec<HashMap<String, PointerValue<'ctx>>>,
     functions: HashMap<String, (FunctionValue<'ctx>, usize)>,
+    externs: HashMap<String, FunctionValue<'ctx>>,
+    imports: Vec<String>,
     fn_depth: u32,
     fn_counter: u32,
 }
@@ -34,7 +36,8 @@ impl<'ctx> Codegen<'ctx> {
             ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into(), ptr_ty.into()], false);
         let cg = Self {
             ctx, module, builder, value_ty, closure_ty, ptr_ty,
-            scopes: Vec::new(), functions: HashMap::new(), fn_depth: 0, fn_counter: 0,
+            scopes: Vec::new(), functions: HashMap::new(), externs: HashMap::new(),
+            imports: Vec::new(), fn_depth: 0, fn_counter: 0,
         };
         cg.declare_libc();
         cg.build_type_name_fn();
@@ -630,13 +633,14 @@ impl<'ctx> Codegen<'ctx> {
 
     // ----- program -----
 
-    pub fn compile_program(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
+    pub fn compile_program(&mut self, program: &Program) -> Result<(), CompileError> {
+        self.imports = program.imports.clone();
         let main_ty = self.ctx.i32_type().fn_type(&[], false);
         let main = self.module.add_function("main", main_ty, None);
         let entry = self.ctx.append_basic_block(main, "entry");
         self.builder.position_at_end(entry);
         self.scopes.push(HashMap::new());
-        self.gen_stmts(stmts)?;
+        self.gen_stmts(&program.body)?;
         self.scopes.pop();
         if self.cur_block_open() {
             self.builder.build_return(Some(&self.ctx.i32_type().const_zero())).unwrap();
@@ -940,6 +944,12 @@ impl<'ctx> Codegen<'ctx> {
                 self.call_named("verb_print", &[v.into()]);
                 return Ok(self.nil_val());
             }
+            if !self.imports.is_empty()
+                && self.lookup(name).is_none()
+                && !self.functions.contains_key(name)
+            {
+                return self.gen_extern_call(name, args, line, col);
+            }
         }
         let cv = self.gen_expr(callee)?;
         let argc = self.ctx.i64_type().const_int(args.len() as u64, false);
@@ -969,6 +979,45 @@ impl<'ctx> Codegen<'ctx> {
         let out = self.builder.build_indirect_call(
             fnty, fp, &[env.into(), argv.into()], "call").unwrap();
         Ok(out.try_as_basic_value().basic().unwrap().into_struct_value())
+    }
+
+    /// A call to a name that isn't a local variable or a known Verb `fn`,
+    /// in a program that has at least one `import mod`. Declares (once
+    /// per name, lazily, on first sight) a raw external function of type
+    /// `VerbValue(VerbValue, VerbValue, ...)` — the same struct Verb's
+    /// own runtime helpers already pass by value — and calls it directly.
+    /// No unboxing: the extern C++ side receives Verb's tagged value
+    /// as-is and is responsible for interpreting it (see runtime/verb.h).
+    fn gen_extern_call(&mut self, name: &str, args: &[Expr], line: u32, col: u32)
+        -> Result<StructValue<'ctx>, CompileError>
+    {
+        let argvals: Vec<StructValue<'ctx>> =
+            args.iter().map(|a| self.gen_expr(a)).collect::<Result<_, _>>()?;
+        let fnv = match self.externs.get(name).copied() {
+            Some(fnv) => {
+                if fnv.count_params() as usize != argvals.len() {
+                    return Err(CompileError::new(
+                        format!(
+                            "extern fn '{name}' called with {} argument(s), previously called with {}",
+                            argvals.len(), fnv.count_params()
+                        ),
+                        line, col,
+                    ));
+                }
+                fnv
+            }
+            None => {
+                let param_tys: Vec<_> = argvals.iter().map(|_| self.value_ty.into()).collect();
+                let fnty = self.value_ty.fn_type(&param_tys, false);
+                let fnv = self.module.add_function(name, fnty, None);
+                self.externs.insert(name.to_string(), fnv);
+                fnv
+            }
+        };
+        let args_bv: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            argvals.iter().map(|v| (*v).into()).collect();
+        Ok(self.builder.build_call(fnv, &args_bv, "extern_call")
+            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value())
     }
 }
 
