@@ -18,6 +18,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+static VerbValue verb_string_from(const std::string& s) {
+    char* out = static_cast<char*>(std::malloc(s.size() + 1));
+    std::memcpy(out, s.data(), s.size());
+    out[s.size()] = '\0';
+    return verb_string(out);
+}
+
 extern "C" VerbValue read_line() {
     std::string line;
     int c = std::getchar();
@@ -26,10 +33,7 @@ extern "C" VerbValue read_line() {
         line.push_back(static_cast<char>(c));
         c = std::getchar();
     }
-    char* out = static_cast<char*>(std::malloc(line.size() + 1));
-    std::memcpy(out, line.data(), line.size());
-    out[line.size()] = '\0';
-    return verb_string(out);
+    return verb_string_from(line);
 }
 
 extern "C" VerbValue file_read(VerbValue path) {
@@ -65,6 +69,20 @@ extern "C" VerbValue file_append(VerbValue path, VerbValue contents) {
     return write_file(verb_as_string(path), "ab", contents);
 }
 
+// Tries each candidate address in turn, handing the caller a bound socket fd
+// to attempt (connect, or bind+listen); closes and moves on if the attempt
+// fails. Returns the first fd the callback accepts, or -1 if none work.
+template <typename Attempt>
+static int connect_first_working(addrinfo* res, Attempt attempt) {
+    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        int fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd == -1) continue;
+        if (attempt(fd, p)) return fd;
+        close(fd);
+    }
+    return -1;
+}
+
 extern "C" VerbValue tcp_connect(VerbValue host, VerbValue port) {
     std::string port_str = std::to_string(verb_as_int(port));
     addrinfo hints{};
@@ -74,14 +92,9 @@ extern "C" VerbValue tcp_connect(VerbValue host, VerbValue port) {
     if (getaddrinfo(verb_as_string(host), port_str.c_str(), &hints, &res) != 0) {
         return verb_nil();
     }
-    int fd = -1;
-    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd == -1) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
-    }
+    int fd = connect_first_working(res, [](int fd, addrinfo* p) {
+        return connect(fd, p->ai_addr, p->ai_addrlen) == 0;
+    });
     freeaddrinfo(res);
     if (fd == -1) return verb_nil();
     return verb_int(fd);
@@ -97,16 +110,11 @@ extern "C" VerbValue tcp_listen(VerbValue port) {
     if (getaddrinfo(nullptr, port_str.c_str(), &hints, &res) != 0) {
         return verb_nil();
     }
-    int fd = -1;
-    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd == -1) continue;
+    int fd = connect_first_working(res, [](int fd, addrinfo* p) {
         int yes = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-        if (bind(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
-    }
+        return bind(fd, p->ai_addr, p->ai_addrlen) == 0;
+    });
     freeaddrinfo(res);
     if (fd == -1) return verb_nil();
     if (listen(fd, 16) != 0) {
@@ -148,10 +156,7 @@ extern "C" VerbValue recv_line(VerbValue fd) {
         if (c == '\n') break;
         line.push_back(c);
     }
-    char* out = static_cast<char*>(std::malloc(line.size() + 1));
-    std::memcpy(out, line.data(), line.size());
-    out[line.size()] = '\0';
-    return verb_string(out);
+    return verb_string_from(line);
 }
 
 extern "C" VerbValue close_conn(VerbValue fd) {
