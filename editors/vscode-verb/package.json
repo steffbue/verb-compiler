@@ -32,7 +32,8 @@
           "verb.lspPath": {
             "type": "string",
             "default": "/Users/steffen/Desktop/Projekte/compiler/target/release/verb-lsp",
-            "description": "Path to the verb-lsp binary"
+            "description": "Path to the verb-lsp binary",
+            "scope": "machine"
           }
         }
       }

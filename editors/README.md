@@ -90,6 +90,13 @@ Rebuild after editing the server: `cargo build --release` in this repo
 (the nvim config's `cmd` points at the `target/release/verb-lsp` path
 directly, so `:LspRestart` after a rebuild picks up the new binary).
 
+## vscode-verb
+
+`vscode-verb/` is a VSCode extension providing LSP client support (via
+`verb-lsp`, including format-on-save) and tree-sitter-based syntax
+highlighting for `.verb` files. See `vscode-verb/README.md` for
+installation, configuration (`verb.lspPath`), and development docs.
+
 ## tree-sitter-verb
 
 `tree-sitter-verb/` is a standalone [tree-sitter](https://tree-sitter.github.io/tree-sitter/)

@@ -66,7 +66,14 @@ let parserPromise: Promise<Parser> | undefined;
 
 function getParser(context: vscode.ExtensionContext): Promise<Parser> {
   if (!parserPromise) {
-    parserPromise = initParser(context);
+    parserPromise = initParser(context).catch((err: unknown) => {
+      // Don't cache a rejected promise forever — if the failure was
+      // transient (e.g. parsers/*.wasm missing at the time), a later call
+      // should retry rather than replay this same rejection for the rest
+      // of the session.
+      parserPromise = undefined;
+      throw err;
+    });
   }
   return parserPromise;
 }

@@ -28,7 +28,9 @@ export function activate(context: vscode.ExtensionContext): void {
     clientOptions
   );
 
-  void client.start();
+  void client.start().catch((err: unknown) => {
+    console.error("verb: language client failed to start", err);
+  });
   context.subscriptions.push(client);
 
   const semanticTokensProvider = registerSemanticTokensProvider(context);
