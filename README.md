@@ -16,6 +16,8 @@ lexer → parser → AST → LLVM IR (inkwell) → JIT or native binary.
     cargo run -- run examples/hello.verb --emit-llvm
     cargo run -- build examples/hello.verb -o hello   # native binary for this host
 
+`compile` is an alias for `build` — `cargo run -- compile ...` behaves identically.
+
 ## Cross-compiling
 
     cargo run -- build examples/hello.verb -o hello --target linux-x86_64
@@ -43,19 +45,17 @@ See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
     %% comment
     assign x 41;
     x be x add 1;
-    make make_counter() begin
-      assign n 0;
-      make inc() begin n be n add 1; return n; end
-      return inc;
+    make add2(a, b) begin
+      return a add b;
     end
-    assign counter make_counter();
-    print(counter());   %% 1
+    print(add2(x, 1));   %% 43
 
 ## Known v1 limitations
 
 - No GC — heap allocations are never freed
 - No arrays/maps, no `break`/`continue`, no anonymous functions
-- Captured variables must be declared before the `make` statement
-  (no mutual recursion)
+- No closures — a nested `make` cannot reference any variable from its
+  enclosing function's scope (not even ones declared before it); it can
+  only see its own parameters/locals and top-level globals
 - Shadowing the builtin `print` has no effect — calls named `print`
   always hit the builtin
