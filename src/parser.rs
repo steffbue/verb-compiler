@@ -29,12 +29,8 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
     let mut errors = Vec::new();
     while p.check(&TokenKind::Import) {
         match p.import_stmt() {
-            Ok(ImportStmt::Mod(name)) => {
-                if !imports.contains(&name) { imports.push(name); }
-            }
-            Ok(ImportStmt::Std(name)) => {
-                if !std_imports.contains(&name) { std_imports.push(name); }
-            }
+            Ok(ImportStmt::Mod(name)) => dedup_push(&mut imports, name),
+            Ok(ImportStmt::Std(name)) => dedup_push(&mut std_imports, name),
             Err(e) => { errors.push(e); p.synchronize(); }
         }
     }
@@ -75,6 +71,10 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
 enum ImportStmt {
     Mod(String),
     Std(String),
+}
+
+fn dedup_push(v: &mut Vec<String>, name: String) {
+    if !v.contains(&name) { v.push(name); }
 }
 
 struct Parser {
@@ -132,8 +132,8 @@ impl Parser {
         let mut std_imports = Vec::new();
         while self.check(&TokenKind::Import) {
             match self.import_stmt()? {
-                ImportStmt::Mod(name) => { if !imports.contains(&name) { imports.push(name); } }
-                ImportStmt::Std(name) => { if !std_imports.contains(&name) { std_imports.push(name); } }
+                ImportStmt::Mod(name) => dedup_push(&mut imports, name),
+                ImportStmt::Std(name) => dedup_push(&mut std_imports, name),
             }
         }
         Ok((imports, std_imports))
@@ -148,6 +148,10 @@ impl Parser {
         }
         self.expect(&TokenKind::Std, "'mod' or 'std'")?;
         let (name, l, c) = self.expect_ident("module name after 'std'")?;
+        // Unlike `mod` library names (arbitrary, unverifiable until link
+        // time), `std` module names are first-party and fully known ahead
+        // of time, so an unrecognized one is rejected here rather than at
+        // link time.
         if name != "io" {
             return Err(CompileError::new(
                 format!("unknown std module '{name}' (known std modules: io)"),
