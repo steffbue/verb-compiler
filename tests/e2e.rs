@@ -146,6 +146,142 @@ fn emits_llvm_ir() {
     assert!(ir.contains("define i32 @main"), "no main in IR: {ir}");
 }
 
+// ----- C++ import / extern (from cpp-import) -----
+
+#[test]
+fn extern_call_compiles_to_a_direct_call_instruction() {
+    let tmp = std::env::temp_dir().join("verb_test_extern_ir_out");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/import_extern_call.verb",
+            "-o", tmp.to_str().unwrap(),
+            "--emit-llvm",
+        ])
+        .output()
+        .unwrap();
+    // --emit-llvm prints IR to stdout before the link step runs, so the IR
+    // shape is already checkable here. This still exits non-zero because the
+    // link step fails: `-lmathlib` isn't an actual library built/linked in
+    // this test — only the emitted IR shape is under test, not a successful
+    // link.
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("@c_sqrt"), "no call to c_sqrt in IR:\n{ir}");
+}
+
+#[test]
+fn extern_arity_mismatch_across_call_sites_is_a_compile_error() {
+    compile_err("err_extern_arity", &[
+        "extern fn 'c_sqrt' called with 2 argument(s), previously called with 1",
+    ]);
+}
+
+#[test]
+fn build_produces_a_runnable_binary_for_import_free_programs() {
+    let out_path = std::env::temp_dir().join("verb_test_build_literals");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/literals.verb", "-o", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success());
+    let expected = std::fs::read_to_string("tests/fixtures/literals.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_with_l_flag_forwards_it_without_breaking_the_build() {
+    let out_path = std::env::temp_dir().join("verb_test_build_with_lflag");
+    // Any real, existing directory is enough to prove -L<dir> is parsed and
+    // forwarded to the linker without breaking an otherwise-normal, import-free
+    // build. A stronger test that proves the linker actually *resolves* a
+    // symbol via -L would duplicate the full C++ library import e2e coverage
+    // Task 7 is already adding.
+    let lib_dir = std::env::temp_dir();
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/literals.verb",
+            "-o", out_path.to_str().unwrap(),
+            &format!("-L{}", lib_dir.to_str().unwrap()),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success());
+    let expected = std::fs::read_to_string("tests/fixtures/literals.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn run_rejects_programs_with_imports() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/import_extern_call.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("mathlib"), "stderr: {stderr}");
+}
+
+/// Compiles tests/fixtures/cpp/mathlib.cpp into a shared library once per
+/// test run and returns the directory it landed in (for `-L`).
+fn build_mathlib_fixture() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("verb_e2e_cpp_libs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib_path = dir.join("libmathlib.dylib");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17",
+            "-Iruntime",
+            "-dynamiclib",
+            "-o", lib_path.to_str().unwrap(),
+            "tests/fixtures/cpp/mathlib.cpp",
+        ])
+        .status()
+        .expect("failed to invoke c++ to build the mathlib test fixture");
+    assert!(status.success(), "failed to compile tests/fixtures/cpp/mathlib.cpp");
+    dir
+}
+
+fn build_and_run_ok(name: &str, lib_dir: &std::path::Path) {
+    let out_path = std::env::temp_dir().join(format!("verb_e2e_build_{name}"));
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            &format!("tests/fixtures/{name}.verb"),
+            "-o", out_path.to_str().unwrap(),
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path)
+        .env("DYLD_LIBRARY_PATH", lib_dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string(format!("tests/fixtures/{name}.expected")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn imports_cpp_library_and_calls_extern_functions() {
+    let lib_dir = build_mathlib_fixture();
+    build_and_run_ok("import_mathlib", &lib_dir);
+}
+
+// ----- AOT host / cross build + multi-file (from main) -----
+
 #[test]
 fn aot_build_produces_working_binary() {
     let dir = std::env::temp_dir().join("verb_aot_host_test");

@@ -29,3 +29,9 @@ pub enum Stmt {
     Return { value: Option<Expr> },
     Block(Vec<Stmt>),
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    pub imports: Vec<String>,
+    pub body: Vec<Stmt>,
+}

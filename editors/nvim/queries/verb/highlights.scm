@@ -1,0 +1,1 @@
+../../../tree-sitter-verb/queries/highlights.scm

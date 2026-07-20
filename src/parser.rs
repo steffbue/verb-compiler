@@ -2,13 +2,70 @@ use crate::ast::*;
 use crate::error::CompileError;
 use crate::lexer::{renamed_keyword, Token, TokenKind};
 
-pub fn parse(toks: Vec<Token>) -> Result<Vec<Stmt>, CompileError> {
+pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
-    let mut stmts = Vec::new();
+    let imports = p.imports()?;
+    let mut body = Vec::new();
     while !p.check(&TokenKind::Eof) {
-        stmts.push(p.statement()?);
+        if p.check(&TokenKind::Import) {
+            return Err(p.err("'import' must appear before any other statement"));
+        }
+        body.push(p.statement()?);
     }
-    Ok(stmts)
+    Ok(Program { imports, body })
+}
+
+/// Same grammar as `parse`, but doesn't stop at the first syntax error:
+/// after a bad statement it synchronizes to the next likely statement
+/// boundary and keeps going, collecting every statement it could parse
+/// and every error it hit along the way. Meant for editor tooling (an
+/// LSP wants every syntax mistake in a file at once); the compiler proper
+/// keeps using `parse`, which stops at the first error like a normal
+/// compiler.
+pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
+    let mut p = Parser { toks, pos: 0, fn_depth: 0 };
+    let mut imports = Vec::new();
+    let mut errors = Vec::new();
+    while p.check(&TokenKind::Import) {
+        match p.import_stmt() {
+            Ok(name) => {
+                if !imports.contains(&name) { imports.push(name); }
+            }
+            Err(e) => { errors.push(e); p.synchronize(); }
+        }
+    }
+    let mut body = Vec::new();
+    while !p.check(&TokenKind::Eof) {
+        if p.check(&TokenKind::Import) {
+            errors.push(p.err("'import' must appear before any other statement"));
+            p.advance();
+            continue;
+        }
+        let pos_before = p.pos;
+        match p.statement() {
+            Ok(s) => body.push(s),
+            Err(e) => {
+                errors.push(e);
+                // An error deep inside an unfinished `make` body leaves
+                // fn_depth incremented (the decrement after `block()?`
+                // never runs); recovery always resumes at top level, so
+                // depth tracking mid-error can't be trusted regardless.
+                p.fn_depth = 0;
+                p.synchronize();
+                // Some productions (e.g. `return` outside a function)
+                // fail without consuming their own token, and
+                // `synchronize` treats that same token as an
+                // already-safe boundary it stops at without advancing
+                // either — so the two together can make zero progress.
+                // Force one token forward whenever that happens, or the
+                // next iteration would hit the exact same error forever.
+                if p.pos == pos_before {
+                    p.advance();
+                }
+            }
+        }
+    }
+    (Program { imports, body }, errors)
 }
 
 struct Parser {
@@ -58,6 +115,40 @@ impl Parser {
         match self.peek().clone() {
             TokenKind::Ident(n) => { self.advance(); Ok((n, l, c)) }
             _ => Err(self.err_found(format!("expected {what}"))),
+        }
+    }
+
+    fn imports(&mut self) -> Result<Vec<String>, CompileError> {
+        let mut imports = Vec::new();
+        while self.check(&TokenKind::Import) {
+            let name = self.import_stmt()?;
+            if !imports.contains(&name) { imports.push(name); }
+        }
+        Ok(imports)
+    }
+
+    fn import_stmt(&mut self) -> Result<String, CompileError> {
+        self.advance(); // 'import'
+        self.expect(&TokenKind::Mod, "'mod'")?;
+        let (name, ..) = self.expect_ident("library name after 'mod'")?;
+        self.expect(&TokenKind::Semi, "';'")?;
+        Ok(name)
+    }
+
+    /// Skip tokens until we're likely sitting at the start of a new
+    /// statement, so `parse_recovering` can resume instead of giving up
+    /// on the rest of the file after one error.
+    fn synchronize(&mut self) {
+        loop {
+            match self.peek() {
+                TokenKind::Eof => return,
+                // consuming the ';' or 'end' means the *next* token is
+                // the start of whatever comes after the broken statement
+                TokenKind::Semi | TokenKind::End => { self.advance(); return; }
+                TokenKind::Assign | TokenKind::Declare | TokenKind::Make | TokenKind::Return
+                | TokenKind::Check | TokenKind::Repeat | TokenKind::Loop | TokenKind::Begin => return,
+                _ => { self.advance(); }
+            }
         }
     }
 
@@ -334,13 +425,12 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
     use crate::lexer::lex;
 
     fn expr(src: &str) -> Expr {
         // parse "src;" as a single expression statement
-        let stmts = parse(lex(&format!("{src};")).unwrap()).unwrap();
-        match stmts.into_iter().next().unwrap() {
+        let prog = parse(lex(&format!("{src};")).unwrap()).unwrap();
+        match prog.body.into_iter().next().unwrap() {
             Stmt::ExprStmt(e) => e,
             other => panic!("expected ExprStmt, got {other:?}"),
         }
@@ -381,29 +471,28 @@ mod tests {
 
     #[test]
     fn logic_precedence_or_lowest() {
-        // a or b and c  =>  a or (b and c)
         let e = expr("true or false and true");
         assert!(matches!(e, Expr::Binary { op: BinOp::Or, .. }));
     }
 
     #[test]
     fn parses_assign_and_reassign() {
-        let s = parse(lex("assign x 10; x be x add 1;").unwrap()).unwrap();
-        assert!(matches!(&s[0], Stmt::Assign { name, .. } if name == "x"));
-        assert!(matches!(&s[1], Stmt::Reassign { name, .. } if name == "x"));
+        let p = parse(lex("assign x 10; x be x add 1;").unwrap()).unwrap();
+        assert!(matches!(&p.body[0], Stmt::Assign { name, .. } if name == "x"));
+        assert!(matches!(&p.body[1], Stmt::Reassign { name, .. } if name == "x"));
     }
 
     #[test]
     fn parses_declare() {
-        let s = parse(lex("declare x; x be 1;").unwrap()).unwrap();
-        assert!(matches!(&s[0], Stmt::Declare { name } if name == "x"));
-        assert!(matches!(&s[1], Stmt::Reassign { name, .. } if name == "x"));
+        let p = parse(lex("declare x; x be 1;").unwrap()).unwrap();
+        assert!(matches!(&p.body[0], Stmt::Declare { name } if name == "x"));
+        assert!(matches!(&p.body[1], Stmt::Reassign { name, .. } if name == "x"));
     }
 
     #[test]
     fn parses_if_else_chain() {
-        let s = parse(lex("check true begin print(1); end orelse check false begin print(2); end orelse begin print(3); end").unwrap()).unwrap();
-        match &s[0] {
+        let p = parse(lex("check true begin print(1); end orelse check false begin print(2); end orelse begin print(3); end").unwrap()).unwrap();
+        match &p.body[0] {
             Stmt::If { else_body: Some(eb), .. } => {
                 assert!(matches!(&eb[0], Stmt::If { else_body: Some(_), .. }));
             }
@@ -413,8 +502,8 @@ mod tests {
 
     #[test]
     fn desugars_for_to_while() {
-        let s = parse(lex("loop assign i 0; i trails 10; i be i add 1 begin print(i); end").unwrap()).unwrap();
-        match &s[0] {
+        let p = parse(lex("loop assign i 0; i trails 10; i be i add 1 begin print(i); end").unwrap()).unwrap();
+        match &p.body[0] {
             Stmt::Block(inner) => {
                 assert!(matches!(&inner[0], Stmt::Assign { name, .. } if name == "i"));
                 match &inner[1] {
@@ -430,8 +519,8 @@ mod tests {
 
     #[test]
     fn parses_fn_and_return() {
-        let s = parse(lex("make sum(a, b) begin return a add b; end").unwrap()).unwrap();
-        match &s[0] {
+        let p = parse(lex("make sum(a, b) begin return a add b; end").unwrap()).unwrap();
+        match &p.body[0] {
             Stmt::Fn { name, params, body, .. } => {
                 assert_eq!(name, "sum");
                 assert_eq!(params, &vec!["a".to_string(), "b".to_string()]);
@@ -444,5 +533,95 @@ mod tests {
     #[test]
     fn rejects_return_at_top_level() {
         assert!(parse(lex("return 1;").unwrap()).is_err());
+    }
+
+    #[test]
+    fn parses_single_import() {
+        let p = parse(lex("import mod mathlib;").unwrap()).unwrap();
+        assert_eq!(p.imports, vec!["mathlib".to_string()]);
+        assert!(p.body.is_empty());
+    }
+
+    #[test]
+    fn parses_multiple_imports_and_dedups() {
+        let p = parse(lex("import mod mathlib; import mod strlib; import mod mathlib;").unwrap()).unwrap();
+        assert_eq!(p.imports, vec!["mathlib".to_string(), "strlib".to_string()]);
+    }
+
+    #[test]
+    fn import_before_body_is_fine() {
+        let p = parse(lex("import mod mathlib; print(1);").unwrap()).unwrap();
+        assert_eq!(p.imports, vec!["mathlib".to_string()]);
+        assert_eq!(p.body.len(), 1);
+    }
+
+    #[test]
+    fn import_after_a_statement_is_a_compile_error() {
+        let err = parse(lex("print(1); import mod mathlib;").unwrap()).unwrap_err();
+        assert!(err.msg.contains("must appear before"), "{}", err.msg);
+    }
+
+    #[test]
+    fn program_with_no_imports_has_empty_imports_vec() {
+        let p = parse(lex("print(1);").unwrap()).unwrap();
+        assert!(p.imports.is_empty());
+    }
+
+    #[test]
+    fn recovering_collects_imports_too() {
+        let src = "import mod mathlib; print(1);";
+        let (prog, errors) = parse_recovering(lex(src).unwrap());
+        assert!(errors.is_empty());
+        assert_eq!(prog.imports, vec!["mathlib".to_string()]);
+        assert_eq!(prog.body.len(), 1);
+    }
+
+    #[test]
+    fn recovering_collects_every_error_across_semicolons() {
+        // three broken statements in a row, each missing its expression
+        let src = "assign a ; assign b ; assign c ;";
+        let (prog, errors) = parse_recovering(lex(src).unwrap());
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(prog.body.is_empty());
+    }
+
+    #[test]
+    fn recovering_keeps_good_statements_around_a_bad_one() {
+        let src = "assign a 1; assign b ; assign c 3;";
+        let (prog, errors) = parse_recovering(lex(src).unwrap());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(prog.body.len(), 2);
+        assert!(matches!(&prog.body[0], Stmt::Assign { name, .. } if name == "a"));
+        assert!(matches!(&prog.body[1], Stmt::Assign { name, .. } if name == "c"));
+    }
+
+    #[test]
+    fn recovering_resyncs_at_begin_after_a_broken_condition() {
+        // `check`'s condition is broken (missing entirely); `begin` is
+        // itself a safe restart point, so recovery re-parses the rest
+        // as a bare block, then keeps going to the statement after it
+        let src = "check begin print(1); end assign x 2;";
+        let (prog, errors) = parse_recovering(lex(src).unwrap());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(matches!(prog.body.last(), Some(Stmt::Assign { name, .. }) if name == "x"));
+    }
+
+    #[test]
+    fn recovering_resets_fn_depth_so_return_is_still_rejected_after_an_error() {
+        // error inside the (unclosed) `make` body must not leave fn_depth
+        // stuck incremented, or `return` at top level after it would
+        // wrongly be accepted
+        let src = "make broken(n) begin assign ; return 1;";
+        let (_, errors) = parse_recovering(lex(src).unwrap());
+        assert!(errors.iter().any(|e| e.msg.contains("return")), "{errors:?}");
+    }
+
+    #[test]
+    fn recovering_matches_parse_on_valid_input() {
+        let src = "make sum(a, b) begin return a add b; end print(sum(1, 2));";
+        let ok = parse(lex(src).unwrap()).unwrap();
+        let (recovering, errors) = parse_recovering(lex(src).unwrap());
+        assert!(errors.is_empty());
+        assert_eq!(ok, recovering);
     }
 }

@@ -1,0 +1,6 @@
+# Build artifacts from `tree-sitter build --wasm` / `tree-sitter build`.
+# Not committed: derived from grammar.js + src/parser.c, which are
+# already in the repo, so shipping the binary would invite drift.
+*.wasm
+*.obj
+*.o

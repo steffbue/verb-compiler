@@ -1,0 +1,31 @@
+{
+  "name": "tree-sitter-verb",
+  "version": "0.1.0",
+  "description": "Verb grammar for tree-sitter",
+  "keywords": [
+    "parser",
+    "lexer",
+    "verb"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "^0.25.0",
+    "web-tree-sitter": "^0.25.0"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate --abi=14",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse",
+    "build:wasm": "tree-sitter generate --abi=14 && tree-sitter build --wasm",
+    "test:wasm": "node test/wasm-smoke.mjs"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.verb",
+      "file-types": [
+        "verb"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

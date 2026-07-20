@@ -1,0 +1,114 @@
+==================
+arithmetic precedence
+==================
+
+x be 1 add 2 times 3;
+
+---
+
+(source_file
+  (reassign_statement
+    (identifier)
+    (binary_expression
+      (int)
+      (binary_expression
+        (int)
+        (int)))))
+
+==================
+comparison and logic precedence
+==================
+
+x be a trails 10 and b beats 0 or not c;
+
+---
+
+(source_file
+  (reassign_statement
+    (identifier)
+    (binary_expression
+      (binary_expression
+        (binary_expression
+          (identifier)
+          (int))
+        (binary_expression
+          (identifier)
+          (int)))
+      (unary_expression
+        (identifier)))))
+
+==================
+unary neg and grouping
+==================
+
+x be neg (1 add 2);
+
+---
+
+(source_file
+  (reassign_statement
+    (identifier)
+    (unary_expression
+      (parenthesized_expression
+        (binary_expression
+          (int)
+          (int))))))
+
+==================
+string join
+==================
+
+x be "hello" join " " join "world";
+
+---
+
+(source_file
+  (reassign_statement
+    (identifier)
+    (binary_expression
+      (binary_expression
+        (string)
+        (string))
+      (string))))
+
+==================
+chained call
+==================
+
+x be pick(3, 11);
+
+---
+
+(source_file
+  (reassign_statement
+    (identifier)
+    (call_expression
+      (identifier)
+      (arguments
+        (int)
+        (int)))))
+
+==================
+literals
+==================
+
+x be 3.24;
+y be true;
+z be false;
+w be nil;
+
+---
+
+(source_file
+  (reassign_statement
+    (identifier)
+    (float))
+  (reassign_statement
+    (identifier)
+    (true))
+  (reassign_statement
+    (identifier)
+    (false))
+  (reassign_statement
+    (identifier)
+    (nil)))

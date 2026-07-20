@@ -1,0 +1,5 @@
+import mod mathlib;
+
+print(c_sqrt(9.0));
+print(c_add_int(2, 3));
+print(c_shout("hi"));

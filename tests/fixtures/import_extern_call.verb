@@ -1,0 +1,3 @@
+import mod mathlib;
+
+print(c_sqrt(4.0));

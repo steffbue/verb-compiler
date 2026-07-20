@@ -1,14 +1,10 @@
-mod ast;
-mod codegen;
-mod error;
-mod lexer;
-mod parser;
-mod targets;
-mod value;
+use std::process::{exit, Command};
 
-use std::process::exit;
-
-use error::CompileError;
+use verb::codegen;
+use verb::error::CompileError;
+use verb::lexer;
+use verb::parser;
+use verb::targets;
 
 fn check_zig_available() {
     let ok = std::process::Command::new("zig")
@@ -30,6 +26,7 @@ struct ParsedArgs {
     out: Option<String>,
     emit_llvm: bool,
     target: Option<String>,
+    lib_dirs: Vec<String>,
 }
 
 fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
@@ -41,6 +38,7 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     let mut out = None;
     let mut emit_llvm = false;
     let mut target = None;
+    let mut lib_dirs = Vec::new();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -64,6 +62,10 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
                 target = Some(args[i].clone());
                 i += 1;
             }
+            a if a.starts_with("-L") && a.len() > 2 => {
+                lib_dirs.push(a.to_string());
+                i += 1;
+            }
             f => {
                 files.push(f.to_string());
                 i += 1;
@@ -73,7 +75,7 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     if files.is_empty() {
         return None;
     }
-    Some(ParsedArgs { cmd, files, out, emit_llvm, target })
+    Some(ParsedArgs { cmd, files, out, emit_llvm, target, lib_dirs })
 }
 
 fn die(e: CompileError, sources: &[(String, String)]) -> ! {
@@ -98,8 +100,8 @@ fn die(e: CompileError, sources: &[(String, String)]) -> ! {
 
 fn usage() -> ! {
     eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
-    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [--emit-llvm]");
-    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [--emit-llvm]  (alias for build)");
+    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]");
+    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]  (alias for build)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
     exit(2)
 }
@@ -111,6 +113,7 @@ fn main() {
     let mut sources: Vec<(String, String)> = Vec::new();
     let mut stmts = Vec::new();
     let mut stmt_files = Vec::new();
+    let mut imports: Vec<String> = Vec::new();
 
     for file in &parsed.files {
         let src = match std::fs::read_to_string(file) {
@@ -125,17 +128,18 @@ fn main() {
         let toks = lexer::lex(&src)
             .map_err(|e| e.with_file(file.clone()))
             .unwrap_or_else(|e| die(e, &sources));
-        let file_stmts = parser::parse(toks)
+        let prog = parser::parse(toks)
             .map_err(|e| e.with_file(file.clone()))
             .unwrap_or_else(|e| die(e, &sources));
 
-        stmt_files.extend(std::iter::repeat(file.clone()).take(file_stmts.len()));
-        stmts.extend(file_stmts);
+        stmt_files.extend(std::iter::repeat(file.clone()).take(prog.body.len()));
+        stmts.extend(prog.body);
+        imports.extend(prog.imports);
     }
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
-    cg.compile_program(&stmts, &stmt_files).unwrap_or_else(|e| die(e, &sources));
+    cg.compile_program(&stmts, &stmt_files, &imports).unwrap_or_else(|e| die(e, &sources));
 
     if parsed.emit_llvm {
         println!("{}", cg.module().print_to_string().to_string());
@@ -143,6 +147,13 @@ fn main() {
 
     match parsed.cmd.as_str() {
         "run" => {
+            if !imports.is_empty() {
+                eprintln!(
+                    "error: 'verb run' does not support imports ({}); use 'verb build' instead",
+                    imports.join(", ")
+                );
+                exit(1);
+            }
             let ee = cg
                 .module()
                 .create_jit_execution_engine(inkwell::OptimizationLevel::None)
@@ -160,15 +171,15 @@ fn main() {
         "build" | "compile" => {
             let out = parsed.out.unwrap_or_else(|| usage());
             match parsed.target.as_deref() {
-                None => build_aot_host(&cg, &out),
-                Some("all") => build_aot_all(&cg, &out),
+                None => build_aot_host(&cg, &out, &imports, &parsed.lib_dirs),
+                Some("all") => build_aot_all(&cg, &out, &imports, &parsed.lib_dirs),
                 Some(t) => {
                     let target = targets::Target::parse(t).unwrap_or_else(|e| {
                         eprintln!("error: {e}");
                         exit(2);
                     });
                     check_zig_available();
-                    if let Err(e) = build_aot_cross(&cg, &out, &target) {
+                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &parsed.lib_dirs) {
                         eprintln!("error: {e}");
                         exit(1);
                     }
@@ -179,7 +190,7 @@ fn main() {
     }
 }
 
-fn build_aot_host(cg: &codegen::Codegen, out: &str) {
+fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs: &[String]) {
     use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
     Target::initialize_native(&InitializationConfig::default())
@@ -198,10 +209,23 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str) {
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
-    let status = std::process::Command::new("cc")
-        .args([obj.as_str(), "-o", out])
-        .status()
-        .unwrap_or_else(|e| { eprintln!("cc failed to start: {e}"); exit(1); });
+    let linker = if imports.is_empty() { "cc" } else { "c++" };
+    let mut cmd = Command::new(linker);
+    cmd.arg(&obj).arg("-o").arg(out);
+    for dir in lib_dirs {
+        cmd.arg(dir);
+    }
+    for lib in imports {
+        cmd.arg(format!("-l{lib}"));
+    }
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = std::fs::remove_file(&obj);
+            eprintln!("error: failed to run linker '{linker}': {e}");
+            exit(1);
+        }
+    };
     let _ = std::fs::remove_file(&obj);
     if !status.success() {
         eprintln!("link failed");
@@ -209,7 +233,13 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str) {
     }
 }
 
-fn build_aot_cross(cg: &codegen::Codegen, out: &str, target: &targets::Target) -> Result<(), String> {
+fn build_aot_cross(
+    cg: &codegen::Codegen,
+    out: &str,
+    target: &targets::Target,
+    imports: &[String],
+    lib_dirs: &[String],
+) -> Result<(), String> {
     use inkwell::targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target as LlvmTarget, TargetTriple,
     };
@@ -231,10 +261,18 @@ fn build_aot_cross(cg: &codegen::Codegen, out: &str, target: &targets::Target) -
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
         .map_err(|e| format!("object emit error: {e}"))?;
 
-    let status = std::process::Command::new("zig")
-        .args(["cc", "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()])
-        .status()
-        .map_err(|e| format!("zig failed to start: {e}"))?;
+    // Imports/lib_dirs are forwarded to zig cc so cross-linking works when the imported
+    // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
+    // fixtures won't link for a foreign target — that requires target-built libraries.
+    let mut cmd = Command::new("zig");
+    cmd.args(["cc", "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()]);
+    for dir in lib_dirs {
+        cmd.arg(dir);
+    }
+    for lib in imports {
+        cmd.arg(format!("-l{lib}"));
+    }
+    let status = cmd.status().map_err(|e| format!("zig failed to start: {e}"))?;
     let _ = std::fs::remove_file(&obj);
     if !status.success() {
         return Err("link failed".to_string());
@@ -242,13 +280,13 @@ fn build_aot_cross(cg: &codegen::Codegen, out: &str, target: &targets::Target) -
     Ok(())
 }
 
-fn build_aot_all(cg: &codegen::Codegen, out: &str) {
+fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs: &[String]) {
     check_zig_available();
     let mut failures = 0;
     let mut results: Vec<(String, Result<(), String>)> = Vec::new();
     for target in targets::ALL {
         let labeled_out = format!("{out}-{}", target.label());
-        let res = build_aot_cross(cg, &labeled_out, &target);
+        let res = build_aot_cross(cg, &labeled_out, &target, imports, lib_dirs);
         if res.is_err() {
             failures += 1;
         }
@@ -292,6 +330,15 @@ mod tests {
         assert_eq!(p.files, vec!["a.verb".to_string(), "b.verb".to_string()]);
         assert_eq!(p.out, Some("out".to_string()));
         assert!(p.emit_llvm);
+    }
+
+    #[test]
+    fn parses_lib_dirs() {
+        let p = parse_cli(&args(&[
+            "verb", "build", "a.verb", "-o", "out", "-L/opt/lib", "-L./libs",
+        ])).unwrap();
+        assert_eq!(p.files, vec!["a.verb".to_string()]);
+        assert_eq!(p.lib_dirs, vec!["-L/opt/lib".to_string(), "-L./libs".to_string()]);
     }
 
     #[test]
