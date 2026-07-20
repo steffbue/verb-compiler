@@ -70,7 +70,7 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --lib error::tests -- --nocapture` (or `cargo test with_file_sets_file`)
+Run: `cargo test --bin verb error::tests` (or `cargo test with_file_sets_file`)
 Expected: FAIL to compile — `file` field / `with_file` method don't exist yet.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -106,7 +106,7 @@ impl CompileError {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test --lib error::tests`
+Run: `cargo test --bin verb error::tests`
 Expected: PASS (2 tests)
 
 - [ ] **Step 5: Run full existing test suite to confirm no regressions**
