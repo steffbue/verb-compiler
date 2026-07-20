@@ -22,6 +22,7 @@ pub struct Codegen<'ctx> {
     functions: HashMap<String, (FunctionValue<'ctx>, usize)>,
     fn_depth: u32,
     fn_counter: u32,
+    cur_file: String,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -35,6 +36,7 @@ impl<'ctx> Codegen<'ctx> {
         let cg = Self {
             ctx, module, builder, value_ty, closure_ty, ptr_ty,
             scopes: Vec::new(), functions: HashMap::new(), fn_depth: 0, fn_counter: 0,
+            cur_file: String::new(),
         };
         cg.declare_libc();
         cg.build_type_name_fn();
@@ -630,13 +632,24 @@ impl<'ctx> Codegen<'ctx> {
 
     // ----- program -----
 
-    pub fn compile_program(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
+    pub fn compile_program(&mut self, stmts: &[Stmt], stmt_files: &[String]) -> Result<(), CompileError> {
         let main_ty = self.ctx.i32_type().fn_type(&[], false);
         let main = self.module.add_function("main", main_ty, None);
         let entry = self.ctx.append_basic_block(main, "entry");
         self.builder.position_at_end(entry);
         self.scopes.push(HashMap::new());
-        self.gen_stmts(stmts)?;
+        for (i, s) in stmts.iter().enumerate() {
+            self.cur_file = stmt_files[i].clone();
+            if let Err(mut e) = self.gen_stmt(s) {
+                if e.file.is_none() {
+                    e.file = Some(self.cur_file.clone());
+                }
+                return Err(e);
+            }
+            if !self.cur_block_open() {
+                break; // dead code after return/abort
+            }
+        }
         self.scopes.pop();
         if self.cur_block_open() {
             self.builder.build_return(Some(&self.ctx.i32_type().const_zero())).unwrap();
@@ -984,4 +997,36 @@ fn levenshtein(a: &str, b: &str) -> usize {
         prev = cur;
     }
     prev[b.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inkwell::context::Context;
+
+    #[test]
+    fn stamps_error_with_originating_file() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![
+            Stmt::Assign { name: "x".to_string(), value: Expr::Int(1) },
+            Stmt::ExprStmt(Expr::Var("undefined_name".to_string(), 3, 5)),
+        ];
+        let stmt_files = vec!["a.verb".to_string(), "b.verb".to_string()];
+
+        let err = cg.compile_program(&stmts, &stmt_files).unwrap_err();
+
+        assert_eq!(err.file, Some("b.verb".to_string()));
+        assert_eq!(err.line, 3);
+    }
+
+    #[test]
+    fn no_error_when_program_is_valid() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::Assign { name: "x".to_string(), value: Expr::Int(1) }];
+        let stmt_files = vec!["a.verb".to_string()];
+
+        assert!(cg.compile_program(&stmts, &stmt_files).is_ok());
+    }
 }
