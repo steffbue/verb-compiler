@@ -175,20 +175,23 @@ fn main() {
             }
         }
         "build" | "compile" => {
-            if !std_imports.is_empty() && cfg!(target_os = "windows") {
-                eprintln!("error: std imports on Windows require cross-compilation setup");
-                eprintln!("use 'verb build --target <linux-*|macos-*>' or a Windows cross-compiler");
-                exit(1);
-            }
             let out = parsed.out.unwrap_or_else(|| usage());
             match parsed.target.as_deref() {
-                None => build_aot_host(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
+                None => {
+                    if !std_imports.is_empty() && cfg!(target_os = "windows") {
+                        reject_std_io_on_windows();
+                    }
+                    build_aot_host(&cg, &out, &imports, &std_imports, &parsed.lib_dirs)
+                }
                 Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
                 Some(t) => {
                     let target = targets::Target::parse(t).unwrap_or_else(|e| {
                         eprintln!("error: {e}");
                         exit(2);
                     });
+                    if !std_imports.is_empty() && target.is_windows() {
+                        reject_std_io_on_windows();
+                    }
                     check_zig_available();
                     if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &parsed.lib_dirs) {
                         eprintln!("error: {e}");
@@ -199,6 +202,32 @@ fn main() {
         }
         _ => usage(),
     }
+}
+
+/// `runtime/verb_std_io.cpp` is implemented against POSIX sockets, not
+/// Winsock, so it can't be compiled for a Windows target in v1 — reject
+/// with a clear message before invoking a C++ compiler that would only
+/// fail later with a confusing header error.
+fn reject_std_io_on_windows() -> ! {
+    eprintln!("error: 'import std io' is not supported when targeting Windows in v1");
+    eprintln!("reason: runtime/verb_std_io.cpp uses POSIX sockets, not Winsock");
+    exit(1);
+}
+
+/// Compiles `runtime/verb_std_io.cpp` into an object file at `obj_path`.
+/// `compiler` is `"c++"` for host builds or `"zig"` for cross builds, with
+/// `extra_args` supplying whatever leading args that compiler needs (e.g.
+/// `["cc", "-target", triple]` for zig).
+fn compile_std_io_obj(compiler: &str, extra_args: &[&str], obj_path: &str) -> Result<(), String> {
+    let status = Command::new(compiler)
+        .args(extra_args)
+        .args(["-std=c++17", "-Iruntime", "-c", "runtime/verb_std_io.cpp", "-o", obj_path])
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile runtime/verb_std_io.cpp: {e}"))?;
+    if !status.success() {
+        return Err("failed to compile runtime/verb_std_io.cpp".to_string());
+    }
+    Ok(())
 }
 
 fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
@@ -220,30 +249,19 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
-    // Compile verb_std_io.cpp if needed
+    let uses_std_io = !std_imports.is_empty();
+    let std_io_obj = format!("{out}.std_io.o");
     let mut obj_files = vec![obj.clone()];
-    if !std_imports.is_empty() {
-        let std_io_obj = std::env::temp_dir().join("verb_std_io.o");
-        let status = Command::new("c++")
-            .args(&["-std=c++17", "-Iruntime", "-c"])
-            .arg("runtime/verb_std_io.cpp")
-            .arg("-o")
-            .arg(&std_io_obj)
-            .status()
-            .unwrap_or_else(|e| {
-                let _ = std::fs::remove_file(&obj);
-                eprintln!("error: failed to compile verb_std_io.cpp: {e}");
-                exit(1);
-            });
-        if !status.success() {
+    if uses_std_io {
+        if let Err(e) = compile_std_io_obj("c++", &[], &std_io_obj) {
             let _ = std::fs::remove_file(&obj);
-            eprintln!("error: failed to compile runtime/verb_std_io.cpp");
+            eprintln!("error: {e}");
             exit(1);
         }
-        obj_files.push(std_io_obj.to_string_lossy().to_string());
+        obj_files.push(std_io_obj.clone());
     }
 
-    let linker = if imports.is_empty() && std_imports.is_empty() { "cc" } else { "c++" };
+    let linker = if imports.is_empty() && !uses_std_io { "cc" } else { "c++" };
     let mut cmd = Command::new(linker);
     for obj_file in &obj_files {
         cmd.arg(obj_file);
@@ -259,11 +277,13 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         Ok(status) => status,
         Err(e) => {
             let _ = std::fs::remove_file(&obj);
+            if uses_std_io { let _ = std::fs::remove_file(&std_io_obj); }
             eprintln!("error: failed to run linker '{linker}': {e}");
             exit(1);
         }
     };
     let _ = std::fs::remove_file(&obj);
+    if uses_std_io { let _ = std::fs::remove_file(&std_io_obj); }
     if !status.success() {
         eprintln!("link failed");
         exit(1);
@@ -299,21 +319,15 @@ fn build_aot_cross(
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
         .map_err(|e| format!("object emit error: {e}"))?;
 
-    // Compile verb_std_io.cpp if needed
+    let uses_std_io = !std_imports.is_empty();
+    let std_io_obj = format!("{out}.std_io.o");
     let mut obj_files = vec![obj.clone()];
-    if !std_imports.is_empty() {
-        let std_io_obj = std::env::temp_dir().join("verb_std_io.o");
-        let status = Command::new("c++")
-            .args(&["-std=c++17", "-Iruntime", "-c"])
-            .arg("runtime/verb_std_io.cpp")
-            .arg("-o")
-            .arg(&std_io_obj)
-            .status()
-            .map_err(|e| format!("failed to compile verb_std_io.cpp: {e}"))?;
-        if !status.success() {
-            return Err("failed to compile runtime/verb_std_io.cpp".to_string());
+    if uses_std_io {
+        if let Err(e) = compile_std_io_obj("zig", &["cc", "-target", target.zig_triple()], &std_io_obj) {
+            let _ = std::fs::remove_file(&obj);
+            return Err(e);
         }
-        obj_files.push(std_io_obj.to_string_lossy().to_string());
+        obj_files.push(std_io_obj.clone());
     }
 
     // Imports/lib_dirs are forwarded to zig cc so cross-linking works when the imported
@@ -332,6 +346,7 @@ fn build_aot_cross(
     }
     let status = cmd.status().map_err(|e| format!("zig failed to start: {e}"))?;
     let _ = std::fs::remove_file(&obj);
+    if uses_std_io { let _ = std::fs::remove_file(&std_io_obj); }
     if !status.success() {
         return Err("link failed".to_string());
     }
@@ -340,22 +355,29 @@ fn build_aot_cross(
 
 fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
     check_zig_available();
+    let uses_std_io = !std_imports.is_empty();
     let mut failures = 0;
-    let mut results: Vec<(String, Result<(), String>)> = Vec::new();
+    let mut results: Vec<(String, String)> = Vec::new();
     for target in targets::ALL {
-        let labeled_out = format!("{out}-{}", target.label());
-        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, lib_dirs);
-        if res.is_err() {
-            failures += 1;
+        if uses_std_io && target.is_windows() {
+            results.push((
+                target.label(),
+                "skipped — 'import std io' not supported on Windows in v1".to_string(),
+            ));
+            continue;
         }
-        results.push((target.label(), res));
+        let labeled_out = format!("{out}-{}", target.label());
+        match build_aot_cross(cg, &labeled_out, &target, imports, std_imports, lib_dirs) {
+            Ok(()) => results.push((target.label(), "ok".to_string())),
+            Err(e) => {
+                failures += 1;
+                results.push((target.label(), format!("FAILED — {e}")));
+            }
+        }
     }
     println!("build --target all summary:");
-    for (label, res) in &results {
-        match res {
-            Ok(()) => println!("  {label}: ok"),
-            Err(e) => println!("  {label}: FAILED — {e}"),
-        }
+    for (label, msg) in &results {
+        println!("  {label}: {msg}");
     }
     if failures > 0 {
         exit(1);

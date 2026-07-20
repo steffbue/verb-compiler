@@ -479,3 +479,29 @@ fn multi_file_build_path_accepts_multiple_files() {
     let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 }
+
+#[test]
+fn verb_run_rejects_std_imports() {
+    compile_err("std_io_run_rejected", &["std imports require 'verb build'"]);
+}
+
+#[test]
+fn verb_build_windows_target_rejects_std_imports() {
+    let dir = std::env::temp_dir().join("verb_std_io_windows_reject_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("out");
+    let result = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/std_io_run_rejected.verb",
+            "-o",
+            out.to_str().unwrap(),
+            "--target",
+            "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("Windows"), "stderr: {stderr}");
+}
