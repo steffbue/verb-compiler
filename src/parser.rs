@@ -64,6 +64,7 @@ impl Parser {
     fn statement(&mut self) -> Result<Stmt, CompileError> {
         match self.peek() {
             TokenKind::Assign => self.assign_stmt(true),
+            TokenKind::Declare => self.declare_stmt(),
             TokenKind::Make => self.fn_stmt(),
             TokenKind::Return => self.return_stmt(),
             TokenKind::Check => self.if_stmt(),
@@ -93,6 +94,13 @@ impl Parser {
         let value = self.expression()?;
         if semi { self.expect(&TokenKind::Semi, "';'")?; }
         Ok(Stmt::Assign { name, value })
+    }
+
+    fn declare_stmt(&mut self) -> Result<Stmt, CompileError> {
+        self.advance(); // declare
+        let (name, _, _) = self.expect_ident("variable name after 'declare'")?;
+        self.expect(&TokenKind::Semi, "';'")?;
+        Ok(Stmt::Declare { name })
     }
 
     fn reassign_stmt(&mut self, semi: bool) -> Result<Stmt, CompileError> {
@@ -382,6 +390,13 @@ mod tests {
     fn parses_assign_and_reassign() {
         let s = parse(lex("assign x 10; x be x add 1;").unwrap()).unwrap();
         assert!(matches!(&s[0], Stmt::Assign { name, .. } if name == "x"));
+        assert!(matches!(&s[1], Stmt::Reassign { name, .. } if name == "x"));
+    }
+
+    #[test]
+    fn parses_declare() {
+        let s = parse(lex("declare x; x be 1;").unwrap()).unwrap();
+        assert!(matches!(&s[0], Stmt::Declare { name } if name == "x"));
         assert!(matches!(&s[1], Stmt::Reassign { name, .. } if name == "x"));
     }
 

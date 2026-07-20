@@ -71,6 +71,9 @@ fn neg_type_error_aborts() { run_err("err_neg", "'neg' needs a number, got strin
 fn vars() { run_ok("vars"); }
 
 #[test]
+fn declare_vars() { run_ok("declare"); }
+
+#[test]
 fn control() { run_ok("control"); }
 
 #[test]

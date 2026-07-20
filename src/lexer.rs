@@ -3,7 +3,7 @@ use crate::error::CompileError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
-    Assign, Be, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
+    Assign, Be, Declare, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
     Add, Sub, Neg, Times, Div, Mod,
     Equals, Differs, Trails, Beats, Atmost, Atleast,
     And, Or, Not, Join,
@@ -133,7 +133,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
                 let word: String = chars[start..i].iter().collect();
                 use TokenKind::*;
                 let kind = match word.as_str() {
-                    "assign" => Assign, "be" => Be, "make" => Make, "return" => Return,
+                    "assign" => Assign, "be" => Be, "declare" => Declare, "make" => Make, "return" => Return,
                     "check" => Check, "orelse" => Orelse, "repeat" => Repeat, "loop" => Loop,
                     "true" => True, "false" => False, "nil" => Nil,
                     "begin" => Begin, "end" => End,
@@ -177,8 +177,8 @@ mod tests {
     fn scans_verb_keywords() {
         use TokenKind::*;
         assert_eq!(
-            kinds("make check orelse repeat loop sub neg times join equals differs trails beats atmost atleast"),
-            vec![Make, Check, Orelse, Repeat, Loop, Sub, Neg, Times, Join,
+            kinds("declare make check orelse repeat loop sub neg times join equals differs trails beats atmost atleast"),
+            vec![Declare, Make, Check, Orelse, Repeat, Loop, Sub, Neg, Times, Join,
                  Equals, Differs, Trails, Beats, Atmost, Atleast, Eof]
         );
     }

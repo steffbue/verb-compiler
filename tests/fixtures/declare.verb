@@ -1,0 +1,9 @@
+declare x;
+print(x);
+x be 5;
+print(x);
+declare y;
+check x equals 5 begin
+    y be x add 1;
+end
+print(y);

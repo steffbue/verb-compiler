@@ -10,6 +10,8 @@ assign version 0.1;
 assign answer 42;
 assign ready true;
 assign nothing nil;
+declare later;        %% no value yet — starts as nil
+later be "filled in";
 
 print("language" join ": " join lang);
 print(version);

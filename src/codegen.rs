@@ -691,10 +691,16 @@ impl<'ctx> Codegen<'ctx> {
                 self.scopes.last_mut().unwrap().insert(name.clone(), cell);
                 Ok(())
             }
+            Stmt::Declare { name } => {
+                let cell = self.malloc_bytes(16);
+                self.builder.build_store(cell, self.nil_val()).unwrap();
+                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                Ok(())
+            }
             Stmt::Reassign { name, value, line, col } => {
                 let cell = self.lookup(name).ok_or_else(|| {
                     self.undefined_var(name, *line, *col)
-                        .with_hint("declare new variables with 'assign'".to_string())
+                        .with_hint("declare new variables with 'assign' or 'declare'".to_string())
                 })?;
                 let v = self.gen_expr(value)?;
                 self.builder.build_store(cell, v).unwrap();
