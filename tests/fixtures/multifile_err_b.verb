@@ -1,0 +1,3 @@
+%% second file: line 2 references an undefined variable
+assign y 2;
+print(zz);

@@ -650,9 +650,31 @@ git commit -m "test: add multi-file happy-path e2e coverage"
 **Files:**
 - Create: `tests/fixtures/multifile_err_a.verb`
 - Create: `tests/fixtures/multifile_err_b.verb`
+- Create: `tests/fixtures/multifile_a.verb`, `tests/fixtures/multifile_b.verb` (identical copies of Task 5's fixtures — this task's build-path test needs them, and if Task 5/6 run in separate isolated worktrees in parallel, Task 6 cannot assume Task 5's files are present yet; git merges an identical file added independently on both branches without conflict, so this is safe to duplicate)
 - Modify: `tests/e2e.rs`
 
 - [ ] **Step 1: Write the failing test**
+
+Create `tests/fixtures/multifile_a.verb` (identical to Task 5's):
+
+```
+%% library file: helper function only, no top-level executable code
+make double(x) begin
+  return x times 2;
+end
+```
+
+Create `tests/fixtures/multifile_b.verb` (identical to Task 5's):
+
+```
+%% entry file: uses the function defined in multifile_a.verb
+print(double(21));
+assign total 0;
+loop assign i 1; i atmost 3; i be i add 1 begin
+  total be total add i;
+end
+print(total);
+```
 
 Create `tests/fixtures/multifile_err_a.verb`:
 

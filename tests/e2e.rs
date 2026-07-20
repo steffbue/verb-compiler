@@ -200,3 +200,46 @@ fn multi_file_emits_single_merged_llvm_module() {
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("define i32 @main"), "no main in IR: {ir}");
 }
+
+#[test]
+fn multi_file_error_names_the_correct_file() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "run",
+            "tests/fixtures/multifile_err_a.verb",
+            "tests/fixtures/multifile_err_b.verb",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("multifile_err_b.verb"),
+        "expected error attributed to multifile_err_b.verb, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("multifile_err_a.verb"),
+        "error should not be attributed to multifile_err_a.verb, got: {stderr}"
+    );
+    assert!(stderr.contains("undefined variable 'zz'"), "stderr: {stderr}");
+}
+
+#[test]
+fn multi_file_build_path_accepts_multiple_files() {
+    // build_aot is still a stub (unimplemented), so this only verifies that
+    // multiple files flow through CLI parsing + lex + parse + codegen + the
+    // "build" dispatch arm without error before hitting the stub.
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/multifile_a.verb",
+            "tests/fixtures/multifile_b.verb",
+            "-o",
+            "/tmp/verb_multifile_build_test_out",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("build: not implemented yet"), "stderr: {stderr}");
+}
