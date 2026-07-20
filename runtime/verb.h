@@ -119,12 +119,16 @@ VerbValue invoke(As... as) {
     using traits = function_traits<decltype(Fn)>;
     static_assert(traits::arity == sizeof...(As),
         "VERB_EXPORT arity does not match callable's parameter count");
-    static_assert(all_args_supported<traits>(std::make_index_sequence<traits::arity>{}),
-        "VERB_EXPORT: unsupported parameter type");
-    static_assert(is_supported_return<typename traits::return_type>::value,
-        "VERB_EXPORT: unsupported return type");
-    std::tuple<As...> args(as...);
-    return invoke_call<Fn, traits>(args, std::make_index_sequence<sizeof...(As)>{});
+    if constexpr (traits::arity == sizeof...(As)) {
+        static_assert(all_args_supported<traits>(std::make_index_sequence<traits::arity>{}),
+            "VERB_EXPORT: unsupported parameter type");
+        static_assert(is_supported_return<typename traits::return_type>::value,
+            "VERB_EXPORT: unsupported return type");
+        std::tuple<As...> args(as...);
+        return invoke_call<Fn, traits>(args, std::make_index_sequence<sizeof...(As)>{});
+    } else {
+        return VerbValue{};
+    }
 }
 
 } // namespace verb_detail
