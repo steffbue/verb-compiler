@@ -114,6 +114,7 @@ fn main() {
     let mut stmts = Vec::new();
     let mut stmt_files = Vec::new();
     let mut imports: Vec<String> = Vec::new();
+    let mut std_imports: Vec<String> = Vec::new();
 
     for file in &parsed.files {
         let src = match std::fs::read_to_string(file) {
@@ -135,11 +136,12 @@ fn main() {
         stmt_files.extend(std::iter::repeat(file.clone()).take(prog.body.len()));
         stmts.extend(prog.body);
         imports.extend(prog.imports);
+        std_imports.extend(prog.std_imports);
     }
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
-    cg.compile_program(&stmts, &stmt_files, &imports, &[]).unwrap_or_else(|e| die(e, &sources));
+    cg.compile_program(&stmts, &stmt_files, &imports, &std_imports).unwrap_or_else(|e| die(e, &sources));
 
     if parsed.emit_llvm {
         println!("{}", cg.module().print_to_string().to_string());
@@ -152,6 +154,10 @@ fn main() {
                     "error: 'verb run' does not support imports ({}); use 'verb build' instead",
                     imports.join(", ")
                 );
+                exit(1);
+            }
+            if !std_imports.is_empty() {
+                eprintln!("error: std imports require 'verb build' — JIT does not support std io calls in v1");
                 exit(1);
             }
             let ee = cg
@@ -169,17 +175,22 @@ fn main() {
             }
         }
         "build" | "compile" => {
+            if !std_imports.is_empty() && cfg!(target_os = "windows") {
+                eprintln!("error: std imports on Windows require cross-compilation setup");
+                eprintln!("use 'verb build --target <linux-*|macos-*>' or a Windows cross-compiler");
+                exit(1);
+            }
             let out = parsed.out.unwrap_or_else(|| usage());
             match parsed.target.as_deref() {
-                None => build_aot_host(&cg, &out, &imports, &parsed.lib_dirs),
-                Some("all") => build_aot_all(&cg, &out, &imports, &parsed.lib_dirs),
+                None => build_aot_host(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
+                Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
                 Some(t) => {
                     let target = targets::Target::parse(t).unwrap_or_else(|e| {
                         eprintln!("error: {e}");
                         exit(2);
                     });
                     check_zig_available();
-                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &parsed.lib_dirs) {
+                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &parsed.lib_dirs) {
                         eprintln!("error: {e}");
                         exit(1);
                     }
@@ -190,7 +201,7 @@ fn main() {
     }
 }
 
-fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs: &[String]) {
+fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
     use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
     Target::initialize_native(&InitializationConfig::default())
@@ -209,9 +220,35 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
-    let linker = if imports.is_empty() { "cc" } else { "c++" };
+    // Compile verb_std_io.cpp if needed
+    let mut obj_files = vec![obj.clone()];
+    if !std_imports.is_empty() {
+        let std_io_obj = std::env::temp_dir().join("verb_std_io.o");
+        let status = Command::new("c++")
+            .args(&["-std=c++17", "-Iruntime", "-c"])
+            .arg("runtime/verb_std_io.cpp")
+            .arg("-o")
+            .arg(&std_io_obj)
+            .status()
+            .unwrap_or_else(|e| {
+                let _ = std::fs::remove_file(&obj);
+                eprintln!("error: failed to compile verb_std_io.cpp: {e}");
+                exit(1);
+            });
+        if !status.success() {
+            let _ = std::fs::remove_file(&obj);
+            eprintln!("error: failed to compile runtime/verb_std_io.cpp");
+            exit(1);
+        }
+        obj_files.push(std_io_obj.to_string_lossy().to_string());
+    }
+
+    let linker = if imports.is_empty() && std_imports.is_empty() { "cc" } else { "c++" };
     let mut cmd = Command::new(linker);
-    cmd.arg(&obj).arg("-o").arg(out);
+    for obj_file in &obj_files {
+        cmd.arg(obj_file);
+    }
+    cmd.arg("-o").arg(out);
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -238,6 +275,7 @@ fn build_aot_cross(
     out: &str,
     target: &targets::Target,
     imports: &[String],
+    std_imports: &[String],
     lib_dirs: &[String],
 ) -> Result<(), String> {
     use inkwell::targets::{
@@ -261,11 +299,31 @@ fn build_aot_cross(
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
         .map_err(|e| format!("object emit error: {e}"))?;
 
+    // Compile verb_std_io.cpp if needed
+    let mut obj_files = vec![obj.clone()];
+    if !std_imports.is_empty() {
+        let std_io_obj = std::env::temp_dir().join("verb_std_io.o");
+        let status = Command::new("c++")
+            .args(&["-std=c++17", "-Iruntime", "-c"])
+            .arg("runtime/verb_std_io.cpp")
+            .arg("-o")
+            .arg(&std_io_obj)
+            .status()
+            .map_err(|e| format!("failed to compile verb_std_io.cpp: {e}"))?;
+        if !status.success() {
+            return Err("failed to compile runtime/verb_std_io.cpp".to_string());
+        }
+        obj_files.push(std_io_obj.to_string_lossy().to_string());
+    }
+
     // Imports/lib_dirs are forwarded to zig cc so cross-linking works when the imported
     // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
     // fixtures won't link for a foreign target — that requires target-built libraries.
     let mut cmd = Command::new("zig");
-    cmd.args(["cc", "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()]);
+    cmd.args(&["cc", "-target", target.zig_triple(), "-o", out.as_str()]);
+    for obj_file in &obj_files {
+        cmd.arg(obj_file);
+    }
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -280,13 +338,13 @@ fn build_aot_cross(
     Ok(())
 }
 
-fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs: &[String]) {
+fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
     check_zig_available();
     let mut failures = 0;
     let mut results: Vec<(String, Result<(), String>)> = Vec::new();
     for target in targets::ALL {
         let labeled_out = format!("{out}-{}", target.label());
-        let res = build_aot_cross(cg, &labeled_out, &target, imports, lib_dirs);
+        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, lib_dirs);
         if res.is_err() {
             failures += 1;
         }
