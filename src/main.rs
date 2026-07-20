@@ -318,11 +318,12 @@ fn build_aot_cross(
         None
     };
 
-    // Imports/lib_dirs are forwarded to zig cc so cross-linking works when the imported
+    // Imports/lib_dirs are forwarded to zig cc/c++ so cross-linking works when the imported
     // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
     // fixtures won't link for a foreign target — that requires target-built libraries.
+    let linker_subcmd = if imports.is_empty() && !wants_std_io { "cc" } else { "c++" };
     let mut cmd = Command::new("zig");
-    cmd.args(["cc", "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()]);
+    cmd.args([linker_subcmd, "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()]);
     if let Some(p) = &std_io_obj {
         cmd.arg(p);
     }

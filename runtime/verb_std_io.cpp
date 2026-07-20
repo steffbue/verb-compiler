@@ -20,6 +20,7 @@
 
 static VerbValue verb_string_from(const std::string& s) {
     char* out = static_cast<char*>(std::malloc(s.size() + 1));
+    if (!out) return verb_nil();
     std::memcpy(out, s.data(), s.size());
     out[s.size()] = '\0';
     return verb_string(out);
@@ -44,6 +45,7 @@ extern "C" VerbValue file_read(VerbValue path) {
     if (size < 0) { std::fclose(f); return verb_nil(); }
     std::fseek(f, 0, SEEK_SET);
     char* buf = static_cast<char*>(std::malloc(static_cast<size_t>(size) + 1));
+    if (!buf) { std::fclose(f); return verb_nil(); }
     size_t got = std::fread(buf, 1, static_cast<size_t>(size), f);
     std::fclose(f);
     buf[got] = '\0';

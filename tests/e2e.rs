@@ -517,6 +517,36 @@ fn build_links_and_runs_a_program_using_std_io_files() {
 }
 
 #[test]
+fn cross_build_links_a_program_using_std_io_for_a_non_host_non_windows_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    // Non-Windows, non-host target: this exercises build_aot_cross's
+    // std-io object compile + link path (zig c++, not zig cc) without
+    // relying on the guard that rejects Windows targets. Not executed —
+    // it's cross-compiled for a foreign arch/OS, only checked for a
+    // successful, non-empty link, same scope as
+    // aot_cross_build_produces_binary_for_each_target.
+    let label = if cfg!(target_arch = "x86_64") { "linux-arm64" } else { "linux-x86_64" };
+    let dir = std::env::temp_dir().join("verb_std_io_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join(format!("std_io_roundtrip_{label}"));
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_io_file_roundtrip.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", label,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "target {label} failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for {label}");
+}
+
+#[test]
 fn build_links_and_runs_a_program_using_std_io_tcp_loopback() {
     let out_path = std::env::temp_dir().join("verb_e2e_std_io_tcp_bin");
     let build = Command::new(env!("CARGO_BIN_EXE_verb"))
