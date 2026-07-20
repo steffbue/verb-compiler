@@ -15,6 +15,19 @@ fn run_ok(name: &str) {
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
+/// Compile-time error: exit != 0, all `msgs` appear on stderr.
+fn compile_err(name: &str, msgs: &[&str]) {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", &format!("tests/fixtures/{name}.verb")])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for msg in msgs {
+        assert!(stderr.contains(msg), "missing {msg:?} in stderr:\n{stderr}");
+    }
+}
+
 #[allow(dead_code)]
 fn run_err(name: &str, msg: &str) {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
@@ -39,10 +52,20 @@ fn arith() { run_ok("arith"); }
 fn strings() { run_ok("strings"); }
 
 #[test]
-fn type_error_aborts() { run_err("err_types", "operands must be numbers"); }
+fn type_error_aborts() {
+    run_err("err_types", "runtime error [1:9]: 'add' needs numbers, got int and string");
+}
 
 #[test]
-fn div_zero_aborts() { run_err("err_divzero", "division by zero"); }
+fn div_zero_aborts() { run_err("err_divzero", "runtime error [1:9]: division by zero"); }
+
+#[test]
+fn join_type_error_aborts() {
+    run_err("err_join", "'join' needs strings, got string and nil");
+}
+
+#[test]
+fn neg_type_error_aborts() { run_err("err_neg", "'neg' needs a number, got string"); }
 
 #[test]
 fn vars() { run_ok("vars"); }
@@ -54,10 +77,39 @@ fn control() { run_ok("control"); }
 fn functions() { run_ok("functions"); }
 
 #[test]
-fn call_non_function_aborts() { run_err("err_call_nonfn", "can only call functions"); }
+fn call_non_function_aborts() { run_err("err_call_nonfn", "can only call functions, got int"); }
 
 #[test]
-fn wrong_arity_aborts() { run_err("err_arity", "wrong number of arguments"); }
+fn wrong_arity_aborts() {
+    run_err("err_arity", "wrong number of arguments: expected 1, got 2");
+}
+
+#[test]
+fn syntax_error_shows_found_token_and_caret() {
+    compile_err("err_syntax", &[
+        "expected ')', found ';'",
+        "print(x;",   // source line echoed
+        "^",          // caret marker
+    ]);
+}
+
+#[test]
+fn undefined_var_suggests_closest_name() {
+    compile_err("err_typo", &[
+        "undefined variable 'contuer'",
+        "did you mean 'counter'?",
+    ]);
+}
+
+#[test]
+fn old_operator_keyword_gets_rename_hint() {
+    compile_err("err_oldkw", &["'plus' was renamed to 'add'"]);
+}
+
+#[test]
+fn old_statement_keyword_gets_rename_hint() {
+    compile_err("err_oldstmt", &["'if' was renamed to 'check'"]);
+}
 
 #[test]
 fn top_level_return_is_compile_error() {

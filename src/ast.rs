@@ -12,8 +12,8 @@ pub enum Expr {
     Bool(bool),
     Nil,
     Var(String, u32, u32), // name, line, col (for undefined-variable errors)
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Unary { op: UnOp, expr: Box<Expr> },
+    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, line: u32, col: u32 },
+    Unary { op: UnOp, expr: Box<Expr>, line: u32, col: u32 },
     Call { callee: Box<Expr>, args: Vec<Expr>, line: u32, col: u32 },
 }
 

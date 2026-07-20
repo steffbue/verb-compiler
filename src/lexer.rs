@@ -18,6 +18,36 @@ pub struct Token {
     pub col: u32,
 }
 
+impl TokenKind {
+    /// Human-readable form for error messages.
+    pub fn describe(&self) -> String {
+        use TokenKind::*;
+        match self {
+            Int(_) => "integer literal".into(),
+            Float(_) => "number literal".into(),
+            Str(_) => "string literal".into(),
+            Ident(n) => format!("identifier '{n}'"),
+            Eof => "end of file".into(),
+            LParen => "'('".into(), RParen => "')'".into(),
+            Semi => "';'".into(), Comma => "','".into(),
+            kw => format!("'{}'", format!("{kw:?}").to_lowercase()),
+        }
+    }
+}
+
+/// Pre-verb-sweep keyword -> current keyword, for migration hints.
+pub fn renamed_keyword(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "fn" => "make", "if" => "check", "else" => "orelse",
+        "while" => "repeat", "for" => "loop",
+        "plus" => "add", "minus" => "sub (or prefix 'neg')", "mul" => "times",
+        "c" => "join",
+        "eqeq" => "equals", "neq" => "differs",
+        "lo" => "trails", "hi" => "beats", "loeq" => "atmost", "hieq" => "atleast",
+        _ => return None,
+    })
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, CompileError> {
     let chars: Vec<char> = src.chars().collect();
     let mut toks = Vec::new();

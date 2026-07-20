@@ -1,0 +1,2 @@
+assign counter 1;
+print(contuer);

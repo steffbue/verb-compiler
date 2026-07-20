@@ -37,6 +37,7 @@ impl<'ctx> Codegen<'ctx> {
             scopes: Vec::new(), functions: HashMap::new(), fn_depth: 0, fn_counter: 0,
         };
         cg.declare_libc();
+        cg.build_type_name_fn();
         cg.build_print_fn();
         cg.build_truthy_fn();
         cg.build_arith_fns();
@@ -95,11 +96,47 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_call(f, args, "").unwrap().try_as_basic_value().basic()
     }
 
-    fn abort(&self, msg: &str) {
-        let s = self.cstr(&format!("runtime error: {msg}\n"));
-        self.call_named("printf", &[s.into()]);
+    /// Abort with source location and optional printf extras (e.g. %s type names).
+    fn abort_at(&self, line: IntValue<'ctx>, col: IntValue<'ctx>, fmt_tail: &str,
+                extras: &[inkwell::values::BasicMetadataValueEnum<'ctx>])
+    {
+        let s = self.cstr(&format!("runtime error [%d:%d]: {fmt_tail}\n"));
+        let mut args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            vec![s.into(), line.into(), col.into()];
+        args.extend_from_slice(extras);
+        self.call_named("printf", &args);
         self.call_named("exit", &[self.ctx.i32_type().const_int(1, false).into()]);
         self.builder.build_unreachable().unwrap();
+    }
+
+    /// Runtime type name of a tag, as a printf %s argument.
+    fn type_name(&self, tag: IntValue<'ctx>) -> inkwell::values::BasicMetadataValueEnum<'ctx> {
+        self.call_named("verb_type_name", &[tag.into()]).unwrap().into()
+    }
+
+    /// verb_type_name(i8 tag) -> ptr to static name string.
+    fn build_type_name_fn(&self) {
+        let f = self.module.add_function(
+            "verb_type_name", self.ptr_ty.fn_type(&[self.ctx.i8_type().into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let tag = f.get_nth_param(0).unwrap().into_int_value();
+        let i8t = self.ctx.i8_type();
+        let default_bb = self.ctx.append_basic_block(f, "default");
+        let mut cases = Vec::new();
+        for (t, name) in [(TAG_NIL, "nil"), (TAG_BOOL, "bool"), (TAG_INT, "int"),
+                          (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn")] {
+            let bb = self.ctx.append_basic_block(f, name);
+            self.builder.position_at_end(bb);
+            let s = self.cstr(name);
+            self.builder.build_return(Some(&s)).unwrap();
+            cases.push((i8t.const_int(t, false), bb));
+        }
+        self.builder.position_at_end(default_bb);
+        let s = self.cstr("value");
+        self.builder.build_return(Some(&s)).unwrap();
+        self.builder.position_at_end(entry);
+        self.builder.build_switch(tag, default_bb, &cases).unwrap();
     }
 
     fn malloc_bytes(&self, n: u64) -> PointerValue<'ctx> {
@@ -221,16 +258,19 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn build_arith_fns(&self) {
-        for (name, op) in [("verb_add", BinOp::Add), ("verb_sub", BinOp::Sub),
-                           ("verb_mul", BinOp::Mul), ("verb_div", BinOp::Div),
-                           ("verb_mod", BinOp::Mod)] {
-            self.build_arith_fn(name, op);
+        for (name, kw, op) in [("verb_add", "add", BinOp::Add), ("verb_sub", "sub", BinOp::Sub),
+                               ("verb_mul", "times", BinOp::Mul), ("verb_div", "div", BinOp::Div),
+                               ("verb_mod", "mod", BinOp::Mod)] {
+            self.build_arith_fn(name, kw, op);
         }
     }
 
-    fn build_arith_fn(&self, name: &str, op: BinOp) {
+    /// Helper signature: (value, value, i32 line, i32 col) -> value
+    fn build_arith_fn(&self, name: &str, kw: &str, op: BinOp) {
         use inkwell::IntPredicate::*;
-        let fnty = self.value_ty.fn_type(&[self.value_ty.into(), self.value_ty.into()], false);
+        let i32t = self.ctx.i32_type();
+        let fnty = self.value_ty.fn_type(
+            &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false);
         let f = self.module.add_function(name, fnty, None);
         let entry = self.ctx.append_basic_block(f, "entry");
         let int_bb = self.ctx.append_basic_block(f, "int");
@@ -241,6 +281,8 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(entry);
         let a = f.get_nth_param(0).unwrap().into_struct_value();
         let b = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
         let (ta, pa) = (self.tag_of(a), self.payload_of(a));
         let (tb, pb) = (self.tag_of(b), self.payload_of(b));
         let i8t = self.ctx.i8_type();
@@ -258,7 +300,7 @@ impl<'ctx> Codegen<'ctx> {
                 NE, pb, self.ctx.i64_type().const_zero(), "nz").unwrap();
             self.builder.build_conditional_branch(nz, go_bb, zero_bb).unwrap();
             self.builder.position_at_end(zero_bb);
-            self.abort("division by zero");
+            self.abort_at(line, col, "division by zero", &[]);
             self.builder.position_at_end(go_bb);
         }
         let ir = match op {
@@ -290,7 +332,7 @@ impl<'ctx> Codegen<'ctx> {
                 inkwell::FloatPredicate::ONE, fb, self.ctx.f64_type().const_zero(), "fnz").unwrap();
             self.builder.build_conditional_branch(nz, go_bb, zero_bb).unwrap();
             self.builder.position_at_end(zero_bb);
-            self.abort("division by zero");
+            self.abort_at(line, col, "division by zero", &[]);
             self.builder.position_at_end(go_bb);
         }
         let fr = match op {
@@ -305,16 +347,19 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_return(Some(&rv)).unwrap();
 
         self.builder.position_at_end(err_bb);
-        self.abort("operands must be numbers");
+        self.abort_at(line, col, &format!("'{kw}' needs numbers, got %s and %s"),
+                      &[self.type_name(ta), self.type_name(tb)]);
     }
 
     fn build_cmp_fns(&self) {
         use inkwell::{FloatPredicate as FP, IntPredicate as IP};
-        for (name, ip, fp) in [
-            ("verb_lt", IP::SLT, FP::OLT), ("verb_gt", IP::SGT, FP::OGT),
-            ("verb_le", IP::SLE, FP::OLE), ("verb_ge", IP::SGE, FP::OGE),
+        for (name, kw, ip, fp) in [
+            ("verb_lt", "trails", IP::SLT, FP::OLT), ("verb_gt", "beats", IP::SGT, FP::OGT),
+            ("verb_le", "atmost", IP::SLE, FP::OLE), ("verb_ge", "atleast", IP::SGE, FP::OGE),
         ] {
-            let fnty = self.value_ty.fn_type(&[self.value_ty.into(), self.value_ty.into()], false);
+            let i32t = self.ctx.i32_type();
+            let fnty = self.value_ty.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false);
             let f = self.module.add_function(name, fnty, None);
             let entry = self.ctx.append_basic_block(f, "entry");
             let int_bb = self.ctx.append_basic_block(f, "int");
@@ -325,6 +370,8 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(entry);
             let a = f.get_nth_param(0).unwrap().into_struct_value();
             let b = f.get_nth_param(1).unwrap().into_struct_value();
+            let line = f.get_nth_param(2).unwrap().into_int_value();
+            let col = f.get_nth_param(3).unwrap().into_int_value();
             let (ta, pa) = (self.tag_of(a), self.payload_of(a));
             let (tb, pb) = (self.tag_of(b), self.payload_of(b));
             let i8t = self.ctx.i8_type();
@@ -352,7 +399,8 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.build_return(Some(&rv)).unwrap();
 
             self.builder.position_at_end(err_bb);
-            self.abort("operands must be numbers");
+            self.abort_at(line, col, &format!("'{kw}' needs numbers, got %s and %s"),
+                          &[self.type_name(ta), self.type_name(tb)]);
         }
     }
 
@@ -426,7 +474,9 @@ impl<'ctx> Codegen<'ctx> {
 
     fn build_concat_fn(&self) {
         use inkwell::IntPredicate::*;
-        let fnty = self.value_ty.fn_type(&[self.value_ty.into(), self.value_ty.into()], false);
+        let i32t = self.ctx.i32_type();
+        let fnty = self.value_ty.fn_type(
+            &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false);
         let f = self.module.add_function("verb_concat", fnty, None);
         let entry = self.ctx.append_basic_block(f, "entry");
         let ok_bb = self.ctx.append_basic_block(f, "ok");
@@ -435,6 +485,8 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(entry);
         let a = f.get_nth_param(0).unwrap().into_struct_value();
         let b = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
         let (ta, pa) = (self.tag_of(a), self.payload_of(a));
         let (tb, pb) = (self.tag_of(b), self.payload_of(b));
         let i8t = self.ctx.i8_type();
@@ -458,12 +510,15 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_return(Some(&rv)).unwrap();
 
         self.builder.position_at_end(err_bb);
-        self.abort("operands of 'c' must be strings");
+        self.abort_at(line, col, "'join' needs strings, got %s and %s",
+                      &[self.type_name(ta), self.type_name(tb)]);
     }
 
     fn build_neg_fn(&self) {
         use inkwell::IntPredicate::*;
-        let fnty = self.value_ty.fn_type(&[self.value_ty.into()], false);
+        let i32t = self.ctx.i32_type();
+        let fnty = self.value_ty.fn_type(
+            &[self.value_ty.into(), i32t.into(), i32t.into()], false);
         let f = self.module.add_function("verb_neg", fnty, None);
         let entry = self.ctx.append_basic_block(f, "entry");
         let int_bb = self.ctx.append_basic_block(f, "int");
@@ -473,6 +528,8 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(entry);
         let v = f.get_nth_param(0).unwrap().into_struct_value();
+        let line = f.get_nth_param(1).unwrap().into_int_value();
+        let col = f.get_nth_param(2).unwrap().into_int_value();
         let (t, p) = (self.tag_of(v), self.payload_of(v));
         let i8t = self.ctx.i8_type();
         let isi = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_INT, false), "isi").unwrap();
@@ -494,7 +551,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_return(Some(&rv)).unwrap();
 
         self.builder.position_at_end(err_bb);
-        self.abort("operand must be a number");
+        self.abort_at(line, col, "'neg' needs a number, got %s", &[self.type_name(t)]);
     }
 
     // ----- generated runtime helper: verb_check_call(value, argc) -> closure ptr -----
@@ -503,13 +560,17 @@ impl<'ctx> Codegen<'ctx> {
     fn build_check_call_fn(&self) {
         use inkwell::IntPredicate::EQ;
         let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
         let f = self.module.add_function(
             "verb_check_call",
-            self.ptr_ty.fn_type(&[self.value_ty.into(), i64t.into()], false), None);
+            self.ptr_ty.fn_type(
+                &[self.value_ty.into(), i64t.into(), i32t.into(), i32t.into()], false), None);
         let entry = self.ctx.append_basic_block(f, "entry");
         self.builder.position_at_end(entry);
         let v = f.get_nth_param(0).unwrap().into_struct_value();
         let argc = f.get_nth_param(1).unwrap().into_int_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
 
         let arity_bb = self.ctx.append_basic_block(f, "arity");
         let ok_bb = self.ctx.append_basic_block(f, "ok");
@@ -532,10 +593,12 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_return(Some(&p)).unwrap();
 
         self.builder.position_at_end(notfn_bb);
-        self.abort("can only call functions");
+        let tag = self.tag_of(v);
+        self.abort_at(line, col, "can only call functions, got %s", &[self.type_name(tag)]);
 
         self.builder.position_at_end(badarity_bb);
-        self.abort("wrong number of arguments");
+        self.abort_at(line, col, "wrong number of arguments: expected %lld, got %lld",
+                      &[arity.into(), argc.into()]);
     }
 
     /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.
@@ -597,6 +660,27 @@ impl<'ctx> Codegen<'ctx> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
     }
 
+    /// Hint for an unresolved name: keyword rename, else closest known name.
+    fn name_hint(&self, name: &str) -> Option<String> {
+        if let Some(new) = crate::lexer::renamed_keyword(name) {
+            return Some(format!("'{name}' was renamed to '{new}'"));
+        }
+        let best = self.scopes.iter().flat_map(|s| s.keys())
+            .chain(self.functions.keys())
+            .map(|cand| (levenshtein(name, cand), cand))
+            .min()?;
+        (best.0 <= 2 && best.0 < name.len())
+            .then(|| format!("did you mean '{}'?", best.1))
+    }
+
+    fn undefined_var(&self, name: &str, line: u32, col: u32) -> CompileError {
+        let e = CompileError::new(format!("undefined variable '{name}'"), line, col);
+        match self.name_hint(name) {
+            Some(h) => e.with_hint(h),
+            None => e,
+        }
+    }
+
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
             Stmt::ExprStmt(e) => { self.gen_expr(e)?; Ok(()) }
@@ -608,8 +692,10 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
             Stmt::Reassign { name, value, line, col } => {
-                let cell = self.lookup(name).ok_or_else(|| CompileError::new(
-                    format!("undefined variable '{name}' (declare with 'assign')"), *line, *col))?;
+                let cell = self.lookup(name).ok_or_else(|| {
+                    self.undefined_var(name, *line, *col)
+                        .with_hint("declare new variables with 'assign'".to_string())
+                })?;
                 let v = self.gen_expr(value)?;
                 self.builder.build_store(cell, v).unwrap();
                 Ok(())
@@ -755,14 +841,17 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some((fnv, arity)) = self.functions.get(name).copied() {
                     return Ok(self.make_closure(fnv, arity));
                 }
-                Err(CompileError::new(format!("undefined variable '{name}'"), *line, *col))
+                Err(self.undefined_var(name, *line, *col))
             }
-            Expr::Binary { op, lhs, rhs } => self.gen_binary(*op, lhs, rhs),
-            Expr::Unary { op, expr } => {
+            Expr::Binary { op, lhs, rhs, line, col } => self.gen_binary(*op, lhs, rhs, *line, *col),
+            Expr::Unary { op, expr, line, col } => {
                 let v = self.gen_expr(expr)?;
                 match op {
-                    UnOp::Neg => Ok(self.call_named("verb_neg", &[v.into()])
-                        .unwrap().into_struct_value()),
+                    UnOp::Neg => {
+                        let (lc, cc) = self.loc_consts(*line, *col);
+                        Ok(self.call_named("verb_neg", &[v.into(), lc.into(), cc.into()])
+                            .unwrap().into_struct_value())
+                    }
                     UnOp::Not => {
                         let t = self.call_named("verb_truthy", &[v.into()])
                             .unwrap().into_int_value();
@@ -775,7 +864,12 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn gen_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr)
+    fn loc_consts(&self, line: u32, col: u32) -> (IntValue<'ctx>, IntValue<'ctx>) {
+        let i32t = self.ctx.i32_type();
+        (i32t.const_int(line as u64, false), i32t.const_int(col as u64, false))
+    }
+
+    fn gen_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, line: u32, col: u32)
         -> Result<StructValue<'ctx>, CompileError>
     {
         // short-circuit: 'and'/'or' return operand values (Lox semantics)
@@ -802,16 +896,22 @@ impl<'ctx> Codegen<'ctx> {
 
         let l = self.gen_expr(lhs)?;
         let r = self.gen_expr(rhs)?;
-        let helper = match op {
-            BinOp::Add => "verb_add", BinOp::Sub => "verb_sub", BinOp::Mul => "verb_mul",
-            BinOp::Div => "verb_div", BinOp::Mod => "verb_mod",
-            BinOp::Lt => "verb_lt", BinOp::Gt => "verb_gt",
-            BinOp::Le => "verb_le", BinOp::Ge => "verb_ge",
-            BinOp::Eq | BinOp::Ne => "verb_eq",
-            BinOp::Concat => "verb_concat",
-            BinOp::And | BinOp::Or => unreachable!(),
+        let out = if matches!(op, BinOp::Eq | BinOp::Ne) {
+            // eq never aborts, so it takes no location
+            self.call_named("verb_eq", &[l.into(), r.into()]).unwrap().into_struct_value()
+        } else {
+            let helper = match op {
+                BinOp::Add => "verb_add", BinOp::Sub => "verb_sub", BinOp::Mul => "verb_mul",
+                BinOp::Div => "verb_div", BinOp::Mod => "verb_mod",
+                BinOp::Lt => "verb_lt", BinOp::Gt => "verb_gt",
+                BinOp::Le => "verb_le", BinOp::Ge => "verb_ge",
+                BinOp::Concat => "verb_concat",
+                BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or => unreachable!(),
+            };
+            let (lc, cc) = self.loc_consts(line, col);
+            self.call_named(helper, &[l.into(), r.into(), lc.into(), cc.into()])
+                .unwrap().into_struct_value()
         };
-        let out = self.call_named(helper, &[l.into(), r.into()]).unwrap().into_struct_value();
         if matches!(op, BinOp::Ne) {
             let p = self.payload_of(out);
             let flipped = self.builder.build_xor(
@@ -837,7 +937,9 @@ impl<'ctx> Codegen<'ctx> {
         }
         let cv = self.gen_expr(callee)?;
         let argc = self.ctx.i64_type().const_int(args.len() as u64, false);
-        let clos_ptr = self.call_named("verb_check_call", &[cv.into(), argc.into()])
+        let (lc, cc) = self.loc_consts(line, col);
+        let clos_ptr = self.call_named(
+            "verb_check_call", &[cv.into(), argc.into(), lc.into(), cc.into()])
             .unwrap().into_pointer_value();
 
         let arr_ty = self.value_ty.array_type(args.len() as u32);
@@ -862,4 +964,18 @@ impl<'ctx> Codegen<'ctx> {
             fnty, fp, &[env.into(), argv.into()], "call").unwrap();
         Ok(out.try_as_basic_value().basic().unwrap().into_struct_value())
     }
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }

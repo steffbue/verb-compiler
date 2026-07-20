@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::error::CompileError;
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{renamed_keyword, Token, TokenKind};
 
 pub fn parse(toks: Vec<Token>) -> Result<Vec<Stmt>, CompileError> {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
@@ -36,17 +36,28 @@ impl Parser {
         if self.check(k) { self.advance(); true } else { false }
     }
     fn expect(&mut self, k: &TokenKind, what: &str) -> Result<Token, CompileError> {
-        if self.check(k) { Ok(self.advance()) } else { Err(self.err(format!("expected {what}"))) }
+        if self.check(k) { Ok(self.advance()) } else { Err(self.err_found(format!("expected {what}"))) }
     }
     fn err(&self, msg: impl Into<String>) -> CompileError {
         let (l, c) = self.here();
         CompileError::new(msg, l, c)
     }
+    /// Error that names the token actually found; hints when it is a pre-sweep keyword.
+    fn err_found(&self, msg: impl Into<String>) -> CompileError {
+        let found = self.peek();
+        let e = self.err(format!("{}, found {}", msg.into(), found.describe()));
+        if let TokenKind::Ident(n) = found {
+            if let Some(new) = renamed_keyword(n) {
+                return e.with_hint(format!("'{n}' was renamed to '{new}'"));
+            }
+        }
+        e
+    }
     fn expect_ident(&mut self, what: &str) -> Result<(String, u32, u32), CompileError> {
         let (l, c) = self.here();
         match self.peek().clone() {
             TokenKind::Ident(n) => { self.advance(); Ok((n, l, c)) }
-            _ => Err(self.err(format!("expected {what}"))),
+            _ => Err(self.err_found(format!("expected {what}"))),
         }
     }
 
@@ -59,6 +70,14 @@ impl Parser {
             TokenKind::Repeat => self.while_stmt(),
             TokenKind::Loop => self.for_stmt(),
             TokenKind::Begin => Ok(Stmt::Block(self.block()?)),
+            // old statement keywords lex as identifiers now — catch them for a rename hint
+            TokenKind::Ident(n) if *self.peek2() != TokenKind::Be
+                && matches!(n.as_str(), "if" | "else" | "while" | "for" | "fn") =>
+            {
+                let new = renamed_keyword(n).unwrap();
+                Err(self.err(format!("unknown statement keyword '{n}'"))
+                    .with_hint(format!("'{n}' was renamed to '{new}'")))
+            }
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true),
             _ => {
                 let e = self.expression()?;
@@ -169,17 +188,21 @@ impl Parser {
 
     fn or_expr(&mut self) -> Result<Expr, CompileError> {
         let mut e = self.and_expr()?;
-        while self.matches(&TokenKind::Or) {
+        loop {
+            let (line, col) = self.here();
+            if !self.matches(&TokenKind::Or) { break; }
             let r = self.and_expr()?;
-            e = Expr::Binary { op: BinOp::Or, lhs: Box::new(e), rhs: Box::new(r) };
+            e = Expr::Binary { op: BinOp::Or, lhs: Box::new(e), rhs: Box::new(r), line, col };
         }
         Ok(e)
     }
     fn and_expr(&mut self) -> Result<Expr, CompileError> {
         let mut e = self.equality()?;
-        while self.matches(&TokenKind::And) {
+        loop {
+            let (line, col) = self.here();
+            if !self.matches(&TokenKind::And) { break; }
             let r = self.equality()?;
-            e = Expr::Binary { op: BinOp::And, lhs: Box::new(e), rhs: Box::new(r) };
+            e = Expr::Binary { op: BinOp::And, lhs: Box::new(e), rhs: Box::new(r), line, col };
         }
         Ok(e)
     }
@@ -191,9 +214,10 @@ impl Parser {
                 TokenKind::Differs => BinOp::Ne,
                 _ => break,
             };
+            let (line, col) = self.here();
             self.advance();
             let r = self.comparison()?;
-            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r) };
+            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r), line, col };
         }
         Ok(e)
     }
@@ -207,9 +231,10 @@ impl Parser {
                 TokenKind::Atleast => BinOp::Ge,
                 _ => break,
             };
+            let (line, col) = self.here();
             self.advance();
             let r = self.term()?;
-            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r) };
+            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r), line, col };
         }
         Ok(e)
     }
@@ -222,9 +247,10 @@ impl Parser {
                 TokenKind::Join => BinOp::Concat,
                 _ => break,
             };
+            let (line, col) = self.here();
             self.advance();
             let r = self.factor()?;
-            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r) };
+            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r), line, col };
         }
         Ok(e)
     }
@@ -237,9 +263,10 @@ impl Parser {
                 TokenKind::Mod => BinOp::Mod,
                 _ => break,
             };
+            let (line, col) = self.here();
             self.advance();
             let r = self.unary()?;
-            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r) };
+            e = Expr::Binary { op, lhs: Box::new(e), rhs: Box::new(r), line, col };
         }
         Ok(e)
     }
@@ -250,9 +277,10 @@ impl Parser {
             _ => None,
         };
         if let Some(op) = op {
+            let (line, col) = self.here();
             self.advance();
             let e = self.unary()?;
-            return Ok(Expr::Unary { op, expr: Box::new(e) });
+            return Ok(Expr::Unary { op, expr: Box::new(e), line, col });
         }
         self.call()
     }
@@ -289,7 +317,7 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "')'")?;
                 e
             }
-            _ => return Err(self.err("expected expression")),
+            _ => return Err(self.err_found("expected expression")),
         };
         Ok(e)
     }
@@ -312,33 +340,23 @@ mod tests {
 
     #[test]
     fn precedence_mul_over_plus() {
-        assert_eq!(
-            expr("1 add 2 times 3"),
-            Expr::Binary {
-                op: BinOp::Add,
-                lhs: Box::new(Expr::Int(1)),
-                rhs: Box::new(Expr::Binary {
-                    op: BinOp::Mul,
-                    lhs: Box::new(Expr::Int(2)),
-                    rhs: Box::new(Expr::Int(3)),
-                }),
+        match expr("1 add 2 times 3") {
+            Expr::Binary { op: BinOp::Add, lhs, rhs, .. } => {
+                assert_eq!(*lhs, Expr::Int(1));
+                assert!(matches!(*rhs, Expr::Binary { op: BinOp::Mul, .. }));
             }
-        );
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn unary_and_grouping() {
-        assert_eq!(
-            expr("neg (1 add 2)"),
-            Expr::Unary {
-                op: UnOp::Neg,
-                expr: Box::new(Expr::Binary {
-                    op: BinOp::Add,
-                    lhs: Box::new(Expr::Int(1)),
-                    rhs: Box::new(Expr::Int(2)),
-                }),
+        match expr("neg (1 add 2)") {
+            Expr::Unary { op: UnOp::Neg, expr: inner, .. } => {
+                assert!(matches!(*inner, Expr::Binary { op: BinOp::Add, .. }));
             }
-        );
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

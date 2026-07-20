@@ -1,0 +1,4 @@
+assign x 1;
+if x begin
+  print(x);
+end

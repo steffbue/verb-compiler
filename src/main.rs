@@ -9,8 +9,20 @@ use std::process::exit;
 
 use error::CompileError;
 
-fn die(e: CompileError) -> ! {
+fn die(e: CompileError, src: &str) -> ! {
     eprintln!("error [{}:{}]: {}", e.line, e.col, e.msg);
+    if e.line > 0 {
+        if let Some(text) = src.lines().nth(e.line as usize - 1) {
+            let num = e.line.to_string();
+            eprintln!(" {num} | {text}");
+            let pad = " ".repeat(num.len());
+            let offset = " ".repeat(e.col.saturating_sub(1) as usize);
+            eprintln!(" {pad} | {offset}^");
+        }
+    }
+    if let Some(hint) = &e.hint {
+        eprintln!("   hint: {hint}");
+    }
     exit(1)
 }
 
@@ -34,12 +46,12 @@ fn main() {
         Ok(s) => s,
         Err(e) => { eprintln!("error: cannot read {file}: {e}"); exit(1); }
     };
-    let toks = lexer::lex(&src).unwrap_or_else(|e| die(e));
-    let prog = parser::parse(toks).unwrap_or_else(|e| die(e));
+    let toks = lexer::lex(&src).unwrap_or_else(|e| die(e, &src));
+    let prog = parser::parse(toks).unwrap_or_else(|e| die(e, &src));
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
-    cg.compile_program(&prog).unwrap_or_else(|e| die(e));
+    cg.compile_program(&prog).unwrap_or_else(|e| die(e, &src));
 
     if emit_llvm {
         println!("{}", cg.module().print_to_string().to_string());
