@@ -147,6 +147,92 @@ fn emits_llvm_ir() {
 }
 
 #[test]
+fn aot_build_produces_working_binary() {
+    let dir = std::env::temp_dir().join("verb_aot_host_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("functions_bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/functions.verb", "-o", bin.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = Command::new(&bin).output().unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/functions.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
+
+fn zig_available() -> bool {
+    Command::new("zig").arg("version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[test]
+fn aot_cross_build_produces_binary_for_each_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_aot_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    for label in ["linux-x86_64", "linux-arm64", "macos-x86_64", "macos-arm64", "windows-x86_64", "windows-arm64"] {
+        let bin = dir.join(format!("functions_{label}"));
+        let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+            .args(["build", "tests/fixtures/functions.verb", "-o", bin.to_str().unwrap(), "--target", label])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "target {label} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let expected_path = if label.starts_with("windows") {
+            dir.join(format!("functions_{label}.exe"))
+        } else {
+            bin
+        };
+        let meta = std::fs::metadata(&expected_path)
+            .unwrap_or_else(|e| panic!("missing output for {label} at {expected_path:?}: {e}"));
+        assert!(meta.len() > 0, "empty output for {label}");
+    }
+}
+
+#[test]
+fn aot_build_invalid_target_is_usage_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/functions.verb", "-o", "/tmp/whatever", "--target", "solaris-x86_64"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid --target"), "stderr: {stderr}");
+}
+
+#[test]
+fn aot_build_target_all_produces_six_binaries_with_summary() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_aot_all_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = dir.join("functions_all");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/functions.verb", "-o", base.to_str().unwrap(), "--target", "all"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build --target all failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("linux-x86_64: ok"), "summary missing linux-x86_64: {stdout}");
+    assert!(stdout.contains("windows-arm64: ok"), "summary missing windows-arm64: {stdout}");
+
+    for suffix in [
+        "linux-x86_64", "linux-arm64", "macos-x86_64", "macos-arm64",
+    ] {
+        let path = dir.join(format!("functions_all-{suffix}"));
+        assert!(path.exists(), "missing {path:?}");
+    }
+    for suffix in ["windows-x86_64", "windows-arm64"] {
+        let path = dir.join(format!("functions_all-{suffix}.exe"));
+        assert!(path.exists(), "missing {path:?}");
+    }
+}
+
+#[test]
 fn no_files_given_shows_usage() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run"])
@@ -224,20 +310,21 @@ fn multi_file_error_names_the_correct_file() {
 
 #[test]
 fn multi_file_build_path_accepts_multiple_files() {
-    // build_aot is still a stub (unimplemented), so this only verifies that
-    // multiple files flow through CLI parsing + lex + parse + codegen + the
-    // "build" dispatch arm without error before hitting the stub.
+    let dir = std::env::temp_dir().join("verb_multifile_build_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("multifile_bin");
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args([
             "build",
             "tests/fixtures/multifile_a.verb",
             "tests/fixtures/multifile_b.verb",
             "-o",
-            "/tmp/verb_multifile_build_test_out",
+            bin.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("build: not implemented yet"), "stderr: {stderr}");
+    assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let run = Command::new(&bin).output().unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 }
