@@ -123,6 +123,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str) {
             inkwell::OptimizationLevel::Default, RelocMode::PIC, CodeModel::Default)
         .unwrap_or_else(|| { eprintln!("cannot create target machine"); exit(1); });
     cg.module().set_triple(&triple);
+    cg.module().set_data_layout(&tm.get_target_data().get_data_layout());
 
     let obj = format!("{out}.o");
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
@@ -154,6 +155,7 @@ fn build_aot_cross(cg: &codegen::Codegen, out: &str, target: &targets::Target) -
         )
         .ok_or_else(|| "cannot create target machine".to_string())?;
     cg.module().set_triple(&triple);
+    cg.module().set_data_layout(&tm.get_target_data().get_data_layout());
 
     let out = target.adjust_output(out);
     let obj = format!("{out}.o");
