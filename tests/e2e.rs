@@ -189,6 +189,33 @@ fn build_produces_a_runnable_binary_for_import_free_programs() {
 }
 
 #[test]
+fn build_with_l_flag_forwards_it_without_breaking_the_build() {
+    let out_path = std::env::temp_dir().join("verb_test_build_with_lflag");
+    // Any real, existing directory is enough to prove -L<dir> is parsed and
+    // forwarded to the linker without breaking an otherwise-normal, import-free
+    // build. A stronger test that proves the linker actually *resolves* a
+    // symbol via -L would duplicate the full C++ library import e2e coverage
+    // Task 7 is already adding.
+    let lib_dir = std::env::temp_dir();
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/literals.verb",
+            "-o", out_path.to_str().unwrap(),
+            &format!("-L{}", lib_dir.to_str().unwrap()),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success());
+    let expected = std::fs::read_to_string("tests/fixtures/literals.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
 fn run_rejects_programs_with_imports() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run", "tests/fixtures/import_extern_call.verb"])

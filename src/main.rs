@@ -119,10 +119,14 @@ fn build_aot(cg: &codegen::Codegen, out: &str, imports: &[String], lib_dirs: &[S
     for lib in imports {
         cmd.arg(format!("-l{lib}"));
     }
-    let status = cmd.status().unwrap_or_else(|e| {
-        eprintln!("error: failed to run linker '{linker}': {e}");
-        exit(1);
-    });
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = std::fs::remove_file(&obj_path);
+            eprintln!("error: failed to run linker '{linker}': {e}");
+            exit(1);
+        }
+    };
     let _ = std::fs::remove_file(&obj_path);
     if !status.success() {
         eprintln!("error: link failed");
