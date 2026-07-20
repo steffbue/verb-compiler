@@ -517,6 +517,26 @@ fn build_links_and_runs_a_program_using_std_io_files() {
 }
 
 #[test]
+fn build_links_and_runs_a_program_using_std_io_tcp_loopback() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_io_tcp_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_io_tcp_loopback.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_io_tcp_loopback.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
 fn windows_cross_target_rejects_std_io_import() {
     if !zig_available() {
         eprintln!("skipping: zig not on PATH");
