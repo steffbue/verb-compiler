@@ -16,8 +16,10 @@ extern "C" VerbValue c_sqrt(VerbValue x) {
 This spec adds `VERB_EXPORT`, a macro (shipped in `runtime/verb.h`, header-only, C++ side only) that generates this wrapper for you, so a plain existing C++ function — your own, or a third-party one like `std::sqrt` — can be exposed to Verb with one line and no restated type list:
 
 ```cpp
-VERB_EXPORT(c_sqrt, 1, std::sqrt)
+VERB_EXPORT(c_sqrt, 1, static_cast<double(*)(double)>(std::sqrt))
 ```
+
+Note the cast is required here, not optional flourish: `std::sqrt` is overloaded (`float`/`double`/`long double` plus integral-promoting templates in `<cmath>`), and `auto Fn` non-type template parameters cannot bind to a bare overloaded name — verified empirically during spec review, see the "overload set" row in Error handling. Most real standard-library math functions are overloaded, so this cast is the common case in practice, not the exception — still a one-line win over hand-writing the full wrapper.
 
 This is purely additive. The existing hand-written `extern "C" VerbValue` style keeps working unchanged, side by side, for any case the macro doesn't cover (arity > 6, types outside the supported 4, overloaded callables — see Non-goals). No change to `src/` (parser/codegen/CLI), no change to the `.verb` language, no change to `verb run`'s existing "imports require verb build" restriction.
 
@@ -29,7 +31,7 @@ VERB_EXPORT(exported_name, arity, callable)
 
 - `exported_name` — bare identifier. Becomes the `extern "C"` symbol name, i.e. the name called from `.verb` source after `import mod`.
 - `arity` — literal integer `0`–`6`, the callable's real parameter count. Required because an `extern "C"` function's parameter list is literal C++ syntax — it cannot be deduced from a template at the point the macro expands. Encodes no type information, only a count.
-- `callable` — a function name, function pointer, or any expression usable as a C++17 `auto` non-type template parameter that resolves to one concrete (non-overloaded) function. Examples: `std::sqrt` (if it resolves unambiguously for the given arity), a plain function `my_add`, or an explicit cast to disambiguate an overload set: `static_cast<double(*)(double)>(&std::sqrt)`.
+- `callable` — a function name, function pointer, or any expression usable as a C++17 `auto` non-type template parameter that resolves to one concrete (non-overloaded) function. A non-overloaded plain function (`my_add`) can be passed bare. An overloaded name (most `<cmath>` functions, including `std::sqrt`) must be disambiguated with an explicit cast to a concrete function pointer type: `static_cast<double(*)(double)>(std::sqrt)`.
 
 Expansion for `arity == 1`:
 
@@ -164,13 +166,13 @@ All errors are C++ compile-time, and should point at the `VERB_EXPORT(...)` call
 | `arity` doesn't match `Fn`'s real parameter count | `static_assert` failure: "VERB_EXPORT arity does not match callable's parameter count" |
 | A parameter or return type isn't one of the 4 supported types | `static_assert` failure naming/identifying the unsupported type |
 | `arity` > 6 or not a literal integer | Preprocessor error: no `VERB_EXPORT_IMPL_<arity>` macro exists — hand-write the `extern "C"` wrapper instead |
-| `callable` is an ambiguous overload set | Ordinary C++ "ambiguous template argument for `auto` non-type template parameter" error; fix by casting to the concrete function pointer type |
+| `callable` is a bare overloaded name (e.g. `std::sqrt` without a cast) | Compile error at the `auto Fn` template parameter — Clang: "non-type template parameter 'Fn' with type 'auto' has incompatible initializer of type '\<overloaded function type\>'"; GCC gives an equivalent "no matches converting function ... to non-type template" error. Fix by casting to the concrete function pointer type, e.g. `static_cast<double(*)(double)>(std::sqrt)` |
 | `callable` is a lambda / function object | Compile error inside `function_traits<decltype(Fn)>` (no matching specialization) — not supported, see Non-goals |
 
 ## Testing plan
 
 - Rewrite all three functions in `tests/fixtures/cpp/mathlib.cpp` to use `VERB_EXPORT` instead of hand-written wrappers:
-  - `c_sqrt` → `VERB_EXPORT(c_sqrt, 1, std::sqrt)` (may need the explicit-cast form if `std::sqrt`'s overload set is ambiguous for `double(double)` — implementer should verify and use whichever form compiles).
+  - `c_sqrt` → `VERB_EXPORT(c_sqrt, 1, static_cast<double(*)(double)>(std::sqrt))` (the cast is required, not optional — see Macro API above).
   - `c_add_int` → write a plain `int64_t add_int(int64_t, int64_t)` function, `VERB_EXPORT(c_add_int, 2, add_int)`.
   - `c_shout` → keep as a plain function (its logic doesn't change), `VERB_EXPORT(c_shout, 1, shout_impl)` (renaming the existing body to `shout_impl` or equivalent).
   - The existing `tests/fixtures/import_mathlib.verb` / `.expected` pair must still pass unchanged — this is the equivalence proof that the macro produces behaviorally identical wrappers.
