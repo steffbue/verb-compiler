@@ -6,6 +6,11 @@
   "engines": {
     "vscode": "1.127.x"
   },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
   "main": "./out/extension.js",
   "activationEvents": [
     "onLanguage:verb"

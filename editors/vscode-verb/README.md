@@ -86,6 +86,13 @@ single-user local tool). After installing, verify by hand:
 
 ## Troubleshooting
 
+- **Everything shows as "Plain Text", no colors, no LSP:** check the status
+  bar for a "Restricted Mode" banner. VSCode disables extensions by default
+  in untrusted workspaces/loose files; `package.json`'s
+  `capabilities.untrustedWorkspaces.supported: true` opts this extension out
+  of that restriction (it's a read/format-only tool, nothing unsafe), but an
+  older installed version without that field will still be fully disabled.
+  Reinstall the `.vsix` if you hit this.
 - **Extension fails to start / "client failed to start" notification:**
   `verb.lspPath` doesn't resolve to a runnable binary — check the setting
   and that `cargo build --release` has been run. Highlighting still works
