@@ -33,5 +33,6 @@ pub enum Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub imports: Vec<String>,
+    pub std_imports: Vec<String>,
     pub body: Vec<Stmt>,
 }

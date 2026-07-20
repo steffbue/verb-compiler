@@ -22,6 +22,7 @@ pub struct Codegen<'ctx> {
     functions: HashMap<String, (FunctionValue<'ctx>, usize)>,
     externs: HashMap<String, FunctionValue<'ctx>>,
     imports: Vec<String>,
+    std_imports: Vec<String>,
     fn_depth: u32,
     fn_counter: u32,
     cur_file: String,
@@ -38,7 +39,7 @@ impl<'ctx> Codegen<'ctx> {
         let cg = Self {
             ctx, module, builder, value_ty, closure_ty, ptr_ty,
             scopes: Vec::new(), functions: HashMap::new(), externs: HashMap::new(),
-            imports: Vec::new(), fn_depth: 0, fn_counter: 0,
+            imports: Vec::new(), std_imports: Vec::new(), fn_depth: 0, fn_counter: 0,
             cur_file: String::new(),
         };
         cg.declare_libc();
@@ -635,8 +636,9 @@ impl<'ctx> Codegen<'ctx> {
 
     // ----- program -----
 
-    pub fn compile_program(&mut self, stmts: &[Stmt], stmt_files: &[String], imports: &[String]) -> Result<(), CompileError> {
+    pub fn compile_program(&mut self, stmts: &[Stmt], stmt_files: &[String], imports: &[String], std_imports: &[String]) -> Result<(), CompileError> {
         self.imports = imports.to_vec();
+        self.std_imports = std_imports.to_vec();
         let main_ty = self.ctx.i32_type().fn_type(&[], false);
         let main = self.module.add_function("main", main_ty, None);
         let entry = self.ctx.append_basic_block(main, "entry");
@@ -957,10 +959,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.call_named("verb_print", &[v.into()]);
                 return Ok(self.nil_val());
             }
-            if !self.imports.is_empty()
-                && self.lookup(name).is_none()
-                && !self.functions.contains_key(name)
-            {
+            let is_bound = self.lookup(name).is_some() || self.functions.contains_key(name);
+            if !is_bound && self.std_imports.iter().any(|m| m == "io") {
+                if let Some(arity) = io_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, line, col);
+                }
+            }
+            if !is_bound && !self.imports.is_empty() {
                 return self.gen_extern_call(name, args, line, col);
             }
         }
@@ -992,6 +997,43 @@ impl<'ctx> Codegen<'ctx> {
         let out = self.builder.build_indirect_call(
             fnty, fp, &[env.into(), argv.into()], "call").unwrap();
         Ok(out.try_as_basic_value().basic().unwrap().into_struct_value())
+    }
+
+    /// A call to one of the `io` module's built-in functions (see
+    /// runtime/verb_std_io.cpp), reachable only when `import std io;` is
+    /// present. Arity is checked against the function's fixed, known
+    /// signature (`IO_FUNCS`) on every call site — including the first —
+    /// unlike `gen_extern_call`, whose arity is only checked against a
+    /// prior call site of the same name, because generic `import mod`
+    /// externs have no statically known signature to check against.
+    fn gen_std_io_call(&mut self, name: &str, expected_arity: usize, args: &[Expr], line: u32, col: u32)
+        -> Result<StructValue<'ctx>, CompileError>
+    {
+        if args.len() != expected_arity {
+            return Err(CompileError::new(
+                format!(
+                    "std io fn '{name}' takes {expected_arity} argument(s), got {}",
+                    args.len()
+                ),
+                line, col,
+            ));
+        }
+        let argvals: Vec<StructValue<'ctx>> =
+            args.iter().map(|a| self.gen_expr(a)).collect::<Result<_, _>>()?;
+        let fnv = match self.externs.get(name).copied() {
+            Some(fnv) => fnv,
+            None => {
+                let param_tys: Vec<_> = (0..expected_arity).map(|_| self.value_ty.into()).collect();
+                let fnty = self.value_ty.fn_type(&param_tys, false);
+                let fnv = self.module.add_function(name, fnty, None);
+                self.externs.insert(name.to_string(), fnv);
+                fnv
+            }
+        };
+        let args_bv: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            argvals.iter().map(|v| (*v).into()).collect();
+        Ok(self.builder.build_call(fnv, &args_bv, "std_io_call")
+            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value())
     }
 
     /// A call to a name that isn't a local variable or a known Verb `fn`,
@@ -1044,6 +1086,28 @@ impl<'ctx> Codegen<'ctx> {
     }
 }
 
+/// Fixed name -> arity table for the `io` module's built-in functions
+/// (see runtime/verb_std_io.cpp and the design spec). Unlike generic
+/// `import mod` externs, these signatures are first-party and known
+/// ahead of time, so arity is checked on every call site, not just
+/// against a previous one.
+const IO_FUNCS: &[(&str, usize)] = &[
+    ("read_line", 0),
+    ("file_read", 1),
+    ("file_write", 2),
+    ("file_append", 2),
+    ("tcp_connect", 2),
+    ("tcp_listen", 1),
+    ("tcp_accept", 1),
+    ("send_line", 2),
+    ("recv_line", 1),
+    ("close_conn", 1),
+];
+
+fn io_func_arity(name: &str) -> Option<usize> {
+    IO_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
 fn levenshtein(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -1073,7 +1137,7 @@ mod tests {
         ];
         let stmt_files = vec!["a.verb".to_string(), "b.verb".to_string()];
 
-        let err = cg.compile_program(&stmts, &stmt_files, &[]).unwrap_err();
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
 
         assert_eq!(err.file, Some("b.verb".to_string()));
         assert_eq!(err.line, 3);
@@ -1086,6 +1150,55 @@ mod tests {
         let stmts = vec![Stmt::Assign { name: "x".to_string(), value: Expr::Int(1) }];
         let stmt_files = vec!["a.verb".to_string()];
 
-        assert!(cg.compile_program(&stmts, &stmt_files, &[]).is_ok());
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn std_io_call_with_correct_arity_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::Assign {
+            name: "line".to_string(),
+            value: Expr::Call {
+                callee: Box::new(Expr::Var("read_line".to_string(), 1, 1)),
+                args: vec![],
+                line: 1, col: 1,
+            },
+        }];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["io".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_io_arity_mismatch_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("read_line".to_string(), 1, 1)),
+            args: vec![Expr::Int(1)],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["io".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("read_line"), "{}", err.msg);
+        assert!(err.msg.contains("takes 0 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_io_name_ignored_without_import_std_io() {
+        // 'read_line' with no `import std io;` present falls through to the
+        // ordinary undefined-variable path, same as any unknown name.
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("read_line".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("undefined variable"), "{}", err.msg);
     }
 }

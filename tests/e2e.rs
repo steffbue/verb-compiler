@@ -280,6 +280,21 @@ fn imports_cpp_library_and_calls_extern_functions() {
     build_and_run_ok("import_mathlib", &lib_dir);
 }
 
+#[test]
+fn verb_std_io_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_std_io_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_std_io.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_std_io.cpp");
+    assert!(status.success(), "runtime/verb_std_io.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
 // ----- AOT host / cross build + multi-file (from main) -----
 
 #[test]
@@ -463,4 +478,113 @@ fn multi_file_build_path_accepts_multiple_files() {
     let run = Command::new(&bin).output().unwrap();
     let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
+
+// ----- std io -----
+
+#[test]
+fn run_rejects_programs_with_std_io_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_io_file_roundtrip.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std io"), "stderr: {stderr}");
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_io_files() {
+    let _ = std::fs::remove_file("verb_e2e_std_io_roundtrip.tmp");
+    let out_path = std::env::temp_dir().join("verb_e2e_std_io_file_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_io_file_roundtrip.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_io_file_roundtrip.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file("verb_e2e_std_io_roundtrip.tmp");
+}
+
+#[test]
+fn cross_build_links_a_program_using_std_io_for_a_non_host_non_windows_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    // Non-Windows, non-host target: this exercises build_aot_cross's
+    // std-io object compile + link path (zig c++, not zig cc) without
+    // relying on the guard that rejects Windows targets. Not executed —
+    // it's cross-compiled for a foreign arch/OS, only checked for a
+    // successful, non-empty link, same scope as
+    // aot_cross_build_produces_binary_for_each_target.
+    let label = if cfg!(target_arch = "x86_64") { "linux-arm64" } else { "linux-x86_64" };
+    let dir = std::env::temp_dir().join("verb_std_io_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join(format!("std_io_roundtrip_{label}"));
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_io_file_roundtrip.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", label,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "target {label} failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for {label}");
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_io_tcp_loopback() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_io_tcp_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_io_tcp_loopback.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_io_tcp_loopback.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn windows_cross_target_rejects_std_io_import() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let out_path = std::env::temp_dir().join("verb_e2e_std_io_windows_reject");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_io_file_roundtrip.verb",
+            "-o", out_path.to_str().unwrap(),
+            "--target", "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("not supported when cross-compiling to a Windows target"),
+        "stderr: {stderr}"
+    );
 }
