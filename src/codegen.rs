@@ -1177,13 +1177,13 @@ impl<'ctx> Codegen<'ctx> {
 
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
-            Stmt::ExprStmt(e) => { self.gen_expr(e)?; Ok(()) }
-            Stmt::Assign { name, value } => {
+            Stmt::ExprStmt(e, ..) => { self.gen_expr(e)?; Ok(()) }
+            Stmt::Assign { name, value, .. } => {
                 let v = self.gen_expr(value)?;
                 self.bind(name, v);
                 Ok(())
             }
-            Stmt::Declare { name } => {
+            Stmt::Declare { name, .. } => {
                 let nil = self.nil_val();
                 self.bind(name, nil);
                 Ok(())
@@ -1197,13 +1197,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(cell, v).unwrap();
                 Ok(())
             }
-            Stmt::Block(stmts) => {
+            Stmt::Block(stmts, ..) => {
                 self.scopes.push(HashMap::new());
                 let r = self.gen_stmts(stmts);
                 self.scopes.pop();
                 r
             }
-            Stmt::If { cond, then_body, else_body } => {
+            Stmt::If { cond, then_body, else_body, .. } => {
                 let cv = self.gen_expr(cond)?;
                 let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
                 let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -1232,7 +1232,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(merge);
                 Ok(())
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, .. } => {
                 let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let cond_bb = self.ctx.append_basic_block(f, "while.cond");
                 let body_bb = self.ctx.append_basic_block(f, "while.body");
@@ -1714,8 +1714,8 @@ mod tests {
         let ctx = Context::create();
         let mut cg = Codegen::new(&ctx);
         let stmts = vec![
-            Stmt::Assign { name: "x".to_string(), value: Expr::Int(1) },
-            Stmt::ExprStmt(Expr::Var("undefined_name".to_string(), 3, 5)),
+            Stmt::Assign { name: "x".to_string(), value: Expr::Int(1), line: 1, col: 1 },
+            Stmt::ExprStmt(Expr::Var("undefined_name".to_string(), 3, 5), 3, 5),
         ];
         let stmt_files = vec!["a.verb".to_string(), "b.verb".to_string()];
 
@@ -1729,7 +1729,7 @@ mod tests {
     fn no_error_when_program_is_valid() {
         let ctx = Context::create();
         let mut cg = Codegen::new(&ctx);
-        let stmts = vec![Stmt::Assign { name: "x".to_string(), value: Expr::Int(1) }];
+        let stmts = vec![Stmt::Assign { name: "x".to_string(), value: Expr::Int(1), line: 1, col: 1 }];
         let stmt_files = vec!["a.verb".to_string()];
 
         assert!(cg.compile_program(&stmts, &stmt_files, &[], &[]).is_ok());
@@ -1746,6 +1746,7 @@ mod tests {
                 args: vec![],
                 line: 1, col: 1,
             },
+            line: 1, col: 1,
         }];
         let stmt_files = vec!["a.verb".to_string()];
         assert!(cg.compile_program(&stmts, &stmt_files, &[], &["io".to_string()]).is_ok());
@@ -1759,7 +1760,7 @@ mod tests {
             callee: Box::new(Expr::Var("read_line".to_string(), 1, 1)),
             args: vec![Expr::Int(1)],
             line: 1, col: 1,
-        })];
+        }, 1, 1)];
         let stmt_files = vec!["a.verb".to_string()];
         let err = cg
             .compile_program(&stmts, &stmt_files, &[], &["io".to_string()])
@@ -1778,7 +1779,7 @@ mod tests {
             callee: Box::new(Expr::Var("read_line".to_string(), 1, 1)),
             args: vec![],
             line: 1, col: 1,
-        })];
+        }, 1, 1)];
         let stmt_files = vec!["a.verb".to_string()];
         let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
         assert!(err.msg.contains("undefined variable"), "{}", err.msg);
@@ -1792,7 +1793,7 @@ mod tests {
             callee: Box::new(Expr::Var("map_new".to_string(), 1, 1)),
             args: vec![],
             line: 1, col: 1,
-        })];
+        }, 1, 1)];
         let stmt_files = vec!["a.verb".to_string()];
         assert!(cg.compile_program(&stmts, &stmt_files, &[], &["map".to_string()]).is_ok());
     }
@@ -1805,7 +1806,7 @@ mod tests {
             callee: Box::new(Expr::Var("map_get".to_string(), 1, 1)),
             args: vec![Expr::Int(1)],
             line: 1, col: 1,
-        })];
+        }, 1, 1)];
         let stmt_files = vec!["a.verb".to_string()];
         let err = cg
             .compile_program(&stmts, &stmt_files, &[], &["map".to_string()])
@@ -1822,7 +1823,7 @@ mod tests {
             callee: Box::new(Expr::Var("map_new".to_string(), 1, 1)),
             args: vec![],
             line: 1, col: 1,
-        })];
+        }, 1, 1)];
         let stmt_files = vec!["a.verb".to_string()];
         let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
         assert!(err.msg.contains("undefined variable"), "{}", err.msg);
