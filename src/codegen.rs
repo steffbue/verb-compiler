@@ -131,7 +131,8 @@ impl<'ctx> Codegen<'ctx> {
         let default_bb = self.ctx.append_basic_block(f, "default");
         let mut cases = Vec::new();
         for (t, name) in [(TAG_NIL, "nil"), (TAG_BOOL, "bool"), (TAG_INT, "int"),
-                          (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn")] {
+                          (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn"),
+                          (TAG_MAP, "map")] {
             let bb = self.ctx.append_basic_block(f, name);
             self.builder.position_at_end(bb);
             let s = self.cstr(name);
@@ -167,6 +168,7 @@ impl<'ctx> Codegen<'ctx> {
         let float_bb = self.ctx.append_basic_block(f, "float");
         let str_bb = self.ctx.append_basic_block(f, "string");
         let clos_bb = self.ctx.append_basic_block(f, "closure");
+        let map_bb = self.ctx.append_basic_block(f, "map");
         let done = self.ctx.append_basic_block(f, "done");
 
         let i8t = self.ctx.i8_type();
@@ -177,6 +179,7 @@ impl<'ctx> Codegen<'ctx> {
             (i8t.const_int(TAG_FLOAT, false), float_bb),
             (i8t.const_int(TAG_STR, false), str_bb),
             (i8t.const_int(TAG_CLOSURE, false), clos_bb),
+            (i8t.const_int(TAG_MAP, false), map_bb),
         ]).unwrap();
 
         self.builder.position_at_end(nil_bb);
@@ -208,6 +211,10 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(clos_bb);
         self.call_named("printf", &[self.cstr("<fn>\n").into()]);
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        self.builder.position_at_end(map_bb);
+        self.call_named("printf", &[self.cstr("<map>\n").into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(done);
@@ -1004,6 +1011,11 @@ impl<'ctx> Codegen<'ctx> {
                     return self.gen_std_io_call(name, arity, args, line, col);
                 }
             }
+            if !is_bound && self.std_imports.iter().any(|m| m == "map") {
+                if let Some(arity) = map_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, line, col);
+                }
+            }
             if !is_bound && !self.imports.is_empty() {
                 return self.gen_extern_call(name, args, line, col);
             }
@@ -1038,13 +1050,15 @@ impl<'ctx> Codegen<'ctx> {
         Ok(out.try_as_basic_value().basic().unwrap().into_struct_value())
     }
 
-    /// A call to one of the `io` module's built-in functions (see
-    /// runtime/verb_std_io.cpp), reachable only when `import std io;` is
-    /// present. Arity is checked against the function's fixed, known
-    /// signature (`IO_FUNCS`) on every call site — including the first —
-    /// unlike `gen_extern_call`, whose arity is only checked against a
-    /// prior call site of the same name, because generic `import mod`
-    /// externs have no statically known signature to check against.
+    /// A call to one of a first-party `std` module's built-in functions
+    /// (`io`'s, see runtime/verb_std_io.cpp, or `map`'s, see
+    /// runtime/verb_map.cpp), reachable only when the corresponding
+    /// `import std <module>;` is present. Arity is checked against the
+    /// function's fixed, known signature (`IO_FUNCS`/`MAP_FUNCS`) on every
+    /// call site — including the first — unlike `gen_extern_call`, whose
+    /// arity is only checked against a prior call site of the same name,
+    /// because generic `import mod` externs have no statically known
+    /// signature to check against.
     fn gen_std_io_call(&mut self, name: &str, expected_arity: usize, args: &[Expr], line: u32, col: u32)
         -> Result<StructValue<'ctx>, CompileError>
     {
@@ -1147,6 +1161,21 @@ fn io_func_arity(name: &str) -> Option<usize> {
     IO_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
+/// Fixed name -> arity table for the `map` module's built-in functions
+/// (see runtime/verb_map.cpp and the design spec). See `IO_FUNCS`.
+const MAP_FUNCS: &[(&str, usize)] = &[
+    ("map_new", 0),
+    ("map_set", 3),
+    ("map_get", 2),
+    ("map_has", 2),
+    ("map_remove", 2),
+    ("map_len", 1),
+];
+
+fn map_func_arity(name: &str) -> Option<usize> {
+    MAP_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
 fn levenshtein(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -1233,6 +1262,50 @@ mod tests {
         let mut cg = Codegen::new(&ctx);
         let stmts = vec![Stmt::ExprStmt(Expr::Call {
             callee: Box::new(Expr::Var("read_line".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("undefined variable"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_map_call_with_correct_arity_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("map_new".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["map".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_map_arity_mismatch_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("map_get".to_string(), 1, 1)),
+            args: vec![Expr::Int(1)],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["map".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("map_get"), "{}", err.msg);
+        assert!(err.msg.contains("takes 2 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_map_name_ignored_without_import_std_map() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("map_new".to_string(), 1, 1)),
             args: vec![],
             line: 1, col: 1,
         })];
