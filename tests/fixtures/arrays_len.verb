@@ -1,0 +1,3 @@
+assign a list 1, 2, 3;
+print(len(a));
+print(len(list 9));

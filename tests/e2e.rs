@@ -49,6 +49,14 @@ fn literals() { run_ok("literals"); }
 fn array_literal_prints() { run_ok("arrays_literal"); }
 
 #[test]
+fn array_len() { run_ok("arrays_len"); }
+
+#[test]
+fn array_len_type_error_aborts() {
+    run_err("err_array_len_type", "'len' needs an array, got int");
+}
+
+#[test]
 fn arith() { run_ok("arith"); }
 
 #[test]

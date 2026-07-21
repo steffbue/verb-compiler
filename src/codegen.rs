@@ -56,6 +56,7 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_concat_fn();
         cg.build_neg_fn();
         cg.build_check_call_fn();
+        cg.build_array_len_fn();
         cg
     }
 
@@ -678,6 +679,38 @@ impl<'ctx> Codegen<'ctx> {
                       &[arity.into(), argc.into()]);
     }
 
+    // ----- generated runtime helper: verb_array_len(value, i32, i32) -> value -----
+
+    fn build_array_len_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_array_len",
+            self.value_ty.fn_type(&[self.value_ty.into(), i32t.into(), i32t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let arr = f.get_nth_param(0).unwrap().into_struct_value();
+        let line = f.get_nth_param(1).unwrap().into_int_value();
+        let col = f.get_nth_param(2).unwrap().into_int_value();
+
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let bad_bb = self.ctx.append_basic_block(f, "badtype");
+        let tag = self.tag_of(arr);
+        let is_arr = self.builder.build_int_compare(
+            EQ, tag, self.ctx.i8_type().const_int(TAG_ARRAY, false), "isarr").unwrap();
+        self.builder.build_conditional_branch(is_arr, ok_bb, bad_bb).unwrap();
+
+        self.builder.position_at_end(bad_bb);
+        self.abort_at(line, col, "'len' needs an array, got %s", &[self.type_name(tag)]);
+
+        self.builder.position_at_end(ok_bb);
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(arr), self.ptr_ty, "hdr").unwrap();
+        let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+        let len = self.builder.build_load(self.ctx.i64_type(), lenp, "len").unwrap().into_int_value();
+        let rv = self.make_val(TAG_INT, len);
+        self.builder.build_return(Some(&rv)).unwrap();
+    }
+
     /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.
     fn make_closure(&self, fnv: FunctionValue<'ctx>, arity: usize) -> StructValue<'ctx> {
         let p = self.malloc_bytes(24);
@@ -1055,6 +1088,16 @@ impl<'ctx> Codegen<'ctx> {
                 let v = self.gen_expr(&args[0])?;
                 self.call_named("verb_print", &[v.into()]);
                 return Ok(self.nil_val());
+            }
+            if name == "len" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("len takes exactly 1 argument", line, col));
+                }
+                let v = self.gen_expr(&args[0])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_array_len", &[v.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                return Ok(rv);
             }
             let is_bound = self.lookup(name).is_some() || self.functions.contains_key(name);
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {
