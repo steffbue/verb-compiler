@@ -137,7 +137,7 @@ position. Phase 8 is the only phase with open work.
   2. Developer can cross-compile that same program for all supported targets via `verb build --target all` and get a clear pass/fail summary
   3. Developer reading the Arrays design spec sees `TAG_ARRAY = 7`, matching the shipped code, with no unresolved tag-collision note
 
-**Plans**: 2/3 plans executed
+**Plans**: 3/3 plans executed
 **Wave 1**
 
 - [x] 08-01-PLAN.md — Correct stale TAG_ARRAY=6→7 in the Arrays design spec + plan (HOUSEKEEP-01)
@@ -145,7 +145,7 @@ position. Phase 8 is the only phase with open work.
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 08-03-PLAN.md — Cross-compile build-only test across all 6 targets with per-target libmathlib (INTEG-02)
+- [x] 08-03-PLAN.md — Cross-compile build-only test across all 6 targets with per-target libmathlib (INTEG-02)
 
 ## Progress
 
@@ -161,4 +161,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 5. Cross-Platform Build & Distribution | Pre-GSD | Complete | 2026-07-20 |
 | 6. Reference-Counting Memory Management (GC v2) | Pre-GSD | Complete | 2026-07-21 |
 | 7. Developer Tooling (Formatter & VSCode Extension) | Pre-GSD | Complete | 2026-07-20 |
-| 8. Integration Validation & Release Readiness | 2/3 | In Progress|  |
+| 8. Integration Validation & Release Readiness | 3/3 | In Progress|  |
