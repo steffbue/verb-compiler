@@ -1974,6 +1974,9 @@ impl<'ctx> Codegen<'ctx> {
                     return self.gen_std_io_call(name, arity, args, line, col);
                 }
             }
+            if !is_bound && name == "thread_spawn" && self.std_imports.iter().any(|m| m == "thread") {
+                return self.gen_thread_spawn(args, line, col);
+            }
             if !is_bound && self.std_imports.iter().any(|m| m == "thread") {
                 if let Some(arity) = thread_func_arity(name) {
                     return self.gen_std_io_call(name, arity, args, line, col);
@@ -2055,6 +2058,53 @@ impl<'ctx> Codegen<'ctx> {
             self.call_named("verb_release_value", &[(*v).into()]);
         }
         Ok(result)
+    }
+
+    /// `thread_spawn(closure)` -- the one `std thread` function that can't
+    /// go through `gen_std_io_call`'s generic VerbValue-in/out path,
+    /// because a closure's VerbValue can't cross the C++ boundary
+    /// (verb.h: "Tag 5 (closure) never crosses this boundary"). Instead:
+    /// arity-check the closure via the same `verb_check_call` runtime
+    /// helper `gen_call`'s own closure-invocation fallback tail uses
+    /// (line ~1540), pull `fn_ptr`/`env` straight out of the closure
+    /// struct (same GEP indices `make_closure` writes), and hand those
+    /// two raw pointers to `thread_spawn_raw` (runtime/verb_std_thread.cpp)
+    /// -- which sidesteps the boundary rule entirely since it never
+    /// receives a VerbValue closure, only plain pointers.
+    fn gen_thread_spawn(&mut self, args: &[Expr], line: u32, col: u32)
+        -> Result<StructValue<'ctx>, CompileError>
+    {
+        if args.len() != 1 {
+            return Err(CompileError::new(
+                format!("std thread fn 'thread_spawn' takes 1 argument(s), got {}", args.len()),
+                line, col,
+            ));
+        }
+        let cv = self.gen_expr(&args[0])?;
+        let argc = self.ctx.i64_type().const_zero();
+        let (lc, cc) = self.loc_consts(line, col);
+        let clos_ptr = self.call_named(
+            "verb_check_call", &[cv.into(), argc.into(), lc.into(), cc.into()])
+            .unwrap().into_pointer_value();
+
+        let fpp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 0, "fpp").unwrap();
+        let fp = self.builder.build_load(self.ptr_ty, fpp, "fp").unwrap();
+        let epp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 2, "epp").unwrap();
+        let env = self.builder.build_load(self.ptr_ty, epp, "env").unwrap();
+
+        let fnv = match self.externs.get("thread_spawn_raw").copied() {
+            Some(fnv) => fnv,
+            None => {
+                let fnty = self.ptr_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
+                let fnv = self.module.add_function("thread_spawn_raw", fnty, None);
+                self.externs.insert("thread_spawn_raw".to_string(), fnv);
+                fnv
+            }
+        };
+        let handle_ptr = self.builder.build_call(fnv, &[fp.into(), env.into()], "spawned")
+            .unwrap().try_as_basic_value().basic().unwrap().into_pointer_value();
+        let handle_int = self.builder.build_ptr_to_int(handle_ptr, self.ctx.i64_type(), "handlei").unwrap();
+        Ok(self.make_val(TAG_INT, handle_int))
     }
 
     /// A call to a name that isn't a local variable or a known Verb `fn`,
@@ -2379,5 +2429,62 @@ mod tests {
         ];
         let stmt_files = vec!["a.verb".to_string(); stmts.len()];
         assert!(cg.compile_program(&stmts, &stmt_files, &[], &["thread".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_thread_spawn_with_0_arity_closure_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![
+            Stmt::Fn {
+                name: "work".to_string(),
+                params: vec![],
+                body: vec![],
+                line: 1, col: 1,
+            },
+            Stmt::ExprStmt(Expr::Call {
+                callee: Box::new(Expr::Var("thread_spawn".to_string(), 2, 1)),
+                args: vec![Expr::Var("work".to_string(), 2, 13)],
+                line: 2, col: 1,
+            }),
+        ];
+        let stmt_files = vec!["a.verb".to_string(); stmts.len()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["thread".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_thread_spawn_arity_mismatch_is_a_compile_error() {
+        // thread_spawn itself always takes exactly 1 argument (the
+        // closure) -- passing 0 or 2+ args is the same "wrong argument
+        // count" error every other std fn gives, independent of the
+        // closure's own arity (checked separately, at the
+        // verb_check_call/runtime-abort level, not here).
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("thread_spawn".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["thread".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("thread_spawn"), "{}", err.msg);
+        assert!(err.msg.contains("takes 1 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_thread_spawn_name_ignored_without_import_std_thread() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("thread_spawn".to_string(), 1, 1)),
+            args: vec![Expr::Int(1)],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("undefined variable"), "{}", err.msg);
     }
 }
