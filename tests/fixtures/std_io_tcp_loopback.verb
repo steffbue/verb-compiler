@@ -1,0 +1,12 @@
+import std io;
+
+assign listener tcp_listen(58712);
+assign client tcp_connect("127.0.0.1", 58712);
+assign server tcp_accept(listener);
+send_line(client, "ping");
+print(recv_line(server));
+send_line(server, "pong");
+print(recv_line(client));
+close_conn(client);
+close_conn(server);
+close_conn(listener);

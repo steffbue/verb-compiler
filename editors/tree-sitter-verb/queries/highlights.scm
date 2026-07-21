@@ -29,12 +29,20 @@
 "loop" @keyword.repeat
 "begin" @keyword
 "end" @keyword
+"import" @keyword.import
 
 ; ----- expression operators -----
 
 ["add" "sub" "times" "div" "mod"] @operator
 ["equals" "differs" "trails" "beats" "atmost" "atleast"] @operator
 ["and" "or" "not" "neg" "join"] @operator
+
+; `mod`/`std` are also import_statement keywords (distinct from the `mod`
+; arithmetic operator above) — listed after it so this more specific
+; pattern wins the overlapping capture.
+(import_statement ["mod" "std"] @keyword.import)
+(import_statement library: (identifier) @module)
+(import_statement module: (identifier) @module)
 
 ; ----- functions -----
 

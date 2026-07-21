@@ -1,0 +1,6 @@
+import std io;
+
+assign path "verb_e2e_std_io_roundtrip.tmp";
+file_write(path, "hello");
+file_append(path, " world");
+print(file_read(path));

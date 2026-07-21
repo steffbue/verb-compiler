@@ -7,7 +7,8 @@
  *   - line comments:  %% ... \n
  *   - block comments: !?! ... !?!
  *   - statements: assign / declare / reassign (`x be expr;`) / make / return /
- *     check ... orelse / repeat / loop / begin...end / bare expression
+ *     check ... orelse / repeat / loop / begin...end / import (`mod`/`std`) /
+ *     bare expression
  *   - expression precedence (low -> high): or, and, equals/differs,
  *     trails/beats/atmost/atleast, add/sub/join, times/div/mod, unary
  *     (not/neg), call
@@ -40,6 +41,7 @@ module.exports = grammar({
 
     _statement: ($) =>
       choice(
+        $.import_statement,
         $.assign_statement,
         $.declare_statement,
         $.fn_statement,
@@ -50,6 +52,21 @@ module.exports = grammar({
         $.block,
         $.reassign_statement,
         $.expression_statement,
+      ),
+
+    // `import mod <library>;` (generic C++ extern library) or
+    // `import std <module>;` (built-in stdlib module, e.g. `io`) — see
+    // README.md's "Importing C++ libraries" / "Standard library I/O"
+    // sections. Both must appear before any other top-level statement;
+    // that ordering rule is enforced by src/parser.rs, not the grammar.
+    import_statement: ($) =>
+      seq(
+        "import",
+        choice(
+          seq("mod", field("library", $.identifier)),
+          seq("std", field("module", $.identifier)),
+        ),
+        ";",
       ),
 
     assign_statement: ($) =>

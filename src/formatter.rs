@@ -199,6 +199,7 @@ fn token_text(tok: &Token) -> String {
         End => "end".into(),
         Import => "import".into(),
         Mod => "mod".into(),
+        Std => "std".into(),
         Add => "add".into(),
         Sub => "sub".into(),
         Neg => "neg".into(),
@@ -248,6 +249,14 @@ mod tests {
     fn formats_assign_and_declare() {
         assert_eq!(fmt("assign   x    10 ;"), "assign x 10;\n");
         assert_eq!(fmt("declare y;"), "declare y;\n");
+    }
+
+    #[test]
+    fn formats_import_statements() {
+        assert_eq!(
+            fmt("import   mod    mathlib ;   import std   io ;\nprint(1);"),
+            "import mod mathlib;\nimport std io;\nprint(1);\n"
+        );
     }
 
     #[test]

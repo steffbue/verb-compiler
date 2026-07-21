@@ -325,6 +325,10 @@
           "named": true
         },
         {
+          "type": "import_statement",
+          "named": true
+        },
+        {
           "type": "reassign_statement",
           "named": true
         },
@@ -787,6 +791,32 @@
     }
   },
   {
+    "type": "import_statement",
+    "named": true,
+    "fields": {
+      "library": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "module": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "parameters",
     "named": true,
     "fields": {},
@@ -1013,6 +1043,10 @@
         },
         {
           "type": "if_statement",
+          "named": true
+        },
+        {
+          "type": "import_statement",
           "named": true
         },
         {
@@ -1279,6 +1313,10 @@
     "named": true
   },
   {
+    "type": "import",
+    "named": false
+  },
+  {
     "type": "int",
     "named": true
   },
@@ -1329,6 +1367,10 @@
   },
   {
     "type": "return",
+    "named": false
+  },
+  {
+    "type": "std",
     "named": false
   },
   {

@@ -87,6 +87,37 @@ Verb programs can call `extern "C"` functions from a native library:
 See `docs/superpowers/specs/2026-07-20-cpp-import-design.md` for the full
 design.
 
+## Standard library I/O (`import std io`)
+
+Unlike `import mod`, which requires writing your own `extern "C"`
+wrapper, `import std io;` gives Verb programs a small set of built-in
+functions for stdin, whole-file read/write, and blocking TCP sockets —
+Verb compiles and links the C++ implementation itself.
+
+    import std io;
+
+    assign contents file_read("notes.txt");
+    print(contents);
+
+Available functions: `read_line()`, `file_read(path)`,
+`file_write(path, contents)`, `file_append(path, contents)`,
+`tcp_connect(host, port)`, `tcp_listen(port)`, `tcp_accept(fd)`,
+`send_line(fd, s)`, `recv_line(fd)`, `close_conn(fd)`. Every function
+returns `nil` on failure — check with `check x eq nil`.
+
+- Only the `io` module exists in v1 (`import std io;`); an unrecognized
+  module name after `std` is a compile error.
+- Like `import mod`, `import std io;` must appear before any other
+  top-level statement, and `verb run` (JIT) does not support it — use
+  `verb build`/`compile`.
+- Cross-compiling to a Windows target (`--target windows-x86_64` /
+  `windows-arm64`) with `import std io;` is not supported in v1 — the
+  implementation uses POSIX socket APIs unavailable under the mingw
+  cross toolchain.
+
+See `docs/superpowers/specs/2026-07-20-std-io-import-design.md` for
+the full design.
+
 ## Language
 
 See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
