@@ -995,6 +995,8 @@ impl<'ctx> Codegen<'ctx> {
                         .with_hint("declare new variables with 'assign' or 'declare'".to_string())
                 })?;
                 let v = self.gen_expr(value)?;
+                let old = self.builder.build_load(self.value_ty, cell, "old").unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[old.into()]);
                 self.builder.build_store(cell, v).unwrap();
                 Ok(())
             }

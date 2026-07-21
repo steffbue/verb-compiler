@@ -74,6 +74,9 @@ fn vars() { run_ok("vars"); }
 fn declare_vars() { run_ok("declare"); }
 
 #[test]
+fn reassign_releases_previous_string_value() { run_ok("reassign_strings"); }
+
+#[test]
 fn control() { run_ok("control"); }
 
 #[test]

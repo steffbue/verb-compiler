@@ -1,0 +1,5 @@
+assign s "a";
+loop assign i 0; i trails 5; i be i add 1 begin
+  s be s join "x";
+end
+print(s);
