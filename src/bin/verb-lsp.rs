@@ -343,6 +343,7 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
         "or" => "`a or b` — logical OR.",
         "not" => "`not a` — logical negation.",
         "join" => "`a join b` — string/value concatenation.",
+        "list" => "`list e1, e2, ...` — array literal (no closing delimiter; see `get`/`set`/`push`/`pop`/`len`).",
         _ => return None,
     })
 }
@@ -359,7 +360,7 @@ fn completion_items(src: &str) -> Value {
     for word in [
         "assign", "declare", "be", "make", "return", "check", "orelse", "repeat", "loop", "begin",
         "end", "import", "std", "true", "false", "nil", "add", "sub", "neg", "times", "div", "mod",
-        "equals", "differs", "trails", "beats", "atmost", "atleast", "and", "or", "not", "join",
+        "equals", "differs", "trails", "beats", "atmost", "atleast", "and", "or", "not", "join", "list",
     ] {
         items.push(json!({
             "label": word,

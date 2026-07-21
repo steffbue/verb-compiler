@@ -17,6 +17,7 @@ pub struct Codegen<'ctx> {
     builder: Builder<'ctx>,
     value_ty: StructType<'ctx>,
     closure_ty: StructType<'ctx>,
+    array_ty: StructType<'ctx>,
     ptr_ty: PointerType<'ctx>,
     scopes: Vec<HashMap<String, PointerValue<'ctx>>>,
     globals: HashMap<String, PointerValue<'ctx>>,
@@ -36,14 +37,17 @@ impl<'ctx> Codegen<'ctx> {
         let value_ty = ctx.struct_type(&[ctx.i8_type().into(), ctx.i64_type().into()], false);
         let closure_ty =
             ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into(), ptr_ty.into()], false);
+        let array_ty =
+            ctx.struct_type(&[ctx.i64_type().into(), ctx.i64_type().into(), ptr_ty.into()], false);
         let cg = Self {
-            ctx, module, builder, value_ty, closure_ty, ptr_ty,
+            ctx, module, builder, value_ty, closure_ty, array_ty, ptr_ty,
             scopes: Vec::new(), globals: HashMap::new(), externs: HashMap::new(),
             imports: Vec::new(), std_imports: Vec::new(), fn_depth: 0, fn_counter: 0,
             cur_file: String::new(),
         };
         cg.declare_libc();
         cg.build_type_name_fn();
+        cg.build_print_value_fn();
         cg.build_print_fn();
         cg.build_truthy_fn();
         cg.build_arith_fns();
@@ -52,6 +56,12 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_concat_fn();
         cg.build_neg_fn();
         cg.build_check_call_fn();
+        cg.build_array_len_fn();
+        cg.build_array_check_fn();
+        cg.build_array_get_fn();
+        cg.build_array_set_fn();
+        cg.build_array_push_fn();
+        cg.build_array_pop_fn();
         cg
     }
 
@@ -132,7 +142,7 @@ impl<'ctx> Codegen<'ctx> {
         let mut cases = Vec::new();
         for (t, name) in [(TAG_NIL, "nil"), (TAG_BOOL, "bool"), (TAG_INT, "int"),
                           (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn"),
-                          (TAG_MAP, "map")] {
+                          (TAG_ARRAY, "array"), (TAG_MAP, "map")] {
             let bb = self.ctx.append_basic_block(f, name);
             self.builder.position_at_end(bb);
             let s = self.cstr(name);
@@ -151,11 +161,17 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap().into_pointer_value()
     }
 
-    // ----- generated runtime helper: verb_print(value) -----
+    /// Like `malloc_bytes`, but the size is a runtime value (used when an
+    /// array buffer's size depends on its element count, not a fixed layout).
+    fn malloc_bytes_dyn(&self, n: IntValue<'ctx>) -> PointerValue<'ctx> {
+        self.call_named("malloc", &[n.into()]).unwrap().into_pointer_value()
+    }
 
-    fn build_print_fn(&self) {
+    // ----- generated runtime helper: verb_print_value(value) — no trailing newline -----
+
+    fn build_print_value_fn(&self) {
         let fnty = self.ctx.void_type().fn_type(&[self.value_ty.into()], false);
-        let f = self.module.add_function("verb_print", fnty, None);
+        let f = self.module.add_function("verb_print_value", fnty, None);
         let entry = self.ctx.append_basic_block(f, "entry");
         self.builder.position_at_end(entry);
         let v = f.get_nth_param(0).unwrap().into_struct_value();
@@ -168,6 +184,7 @@ impl<'ctx> Codegen<'ctx> {
         let float_bb = self.ctx.append_basic_block(f, "float");
         let str_bb = self.ctx.append_basic_block(f, "string");
         let clos_bb = self.ctx.append_basic_block(f, "closure");
+        let arr_bb = self.ctx.append_basic_block(f, "array");
         let map_bb = self.ctx.append_basic_block(f, "map");
         let done = self.ctx.append_basic_block(f, "done");
 
@@ -179,38 +196,84 @@ impl<'ctx> Codegen<'ctx> {
             (i8t.const_int(TAG_FLOAT, false), float_bb),
             (i8t.const_int(TAG_STR, false), str_bb),
             (i8t.const_int(TAG_CLOSURE, false), clos_bb),
+            (i8t.const_int(TAG_ARRAY, false), arr_bb),
             (i8t.const_int(TAG_MAP, false), map_bb),
         ]).unwrap();
 
         self.builder.position_at_end(nil_bb);
-        self.call_named("printf", &[self.cstr("nil\n").into()]);
+        self.call_named("printf", &[self.cstr("nil").into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(bool_bb);
         let is_true = self.builder.build_int_compare(
             inkwell::IntPredicate::NE, pay, self.ctx.i64_type().const_zero(), "istrue").unwrap();
-        let ts = self.cstr("true\n");
-        let fs = self.cstr("false\n");
+        let ts = self.cstr("true");
+        let fs = self.cstr("false");
         let sel = self.builder.build_select(is_true, ts, fs, "boolstr").unwrap();
         self.call_named("printf", &[sel.into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(int_bb);
-        self.call_named("printf", &[self.cstr("%lld\n").into(), pay.into()]);
+        self.call_named("printf", &[self.cstr("%lld").into(), pay.into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(float_bb);
         let fv = self.builder.build_bit_cast(pay, self.ctx.f64_type(), "f").unwrap();
-        self.call_named("printf", &[self.cstr("%g\n").into(), fv.into()]);
+        self.call_named("printf", &[self.cstr("%g").into(), fv.into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(str_bb);
         let sp = self.builder.build_int_to_ptr(pay, self.ptr_ty, "sptr").unwrap();
-        self.call_named("printf", &[self.cstr("%s\n").into(), sp.into()]);
+        self.call_named("printf", &[self.cstr("%s").into(), sp.into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(clos_bb);
-        self.call_named("printf", &[self.cstr("<fn>\n").into()]);
+        self.call_named("printf", &[self.cstr("<fn>").into()]);
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        self.builder.position_at_end(arr_bb);
+        let hdr = self.builder.build_int_to_ptr(pay, self.ptr_ty, "hdr").unwrap();
+        let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
+        let len = self.builder.build_load(self.ctx.i64_type(), lenp, "len").unwrap().into_int_value();
+        let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
+        self.call_named("printf", &[self.cstr("[").into()]);
+
+        let idxp = self.entry_alloca(self.ctx.i64_type().into(), "pidx");
+        self.builder.build_store(idxp, self.ctx.i64_type().const_zero()).unwrap();
+        let cond_bb = self.ctx.append_basic_block(f, "print.cond");
+        let body_bb = self.ctx.append_basic_block(f, "print.body");
+        let sep_bb = self.ctx.append_basic_block(f, "print.sep");
+        let elem_bb = self.ctx.append_basic_block(f, "print.elem");
+        let end_bb = self.ctx.append_basic_block(f, "print.end");
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.builder.position_at_end(cond_bb);
+        let i = self.builder.build_load(self.ctx.i64_type(), idxp, "i").unwrap().into_int_value();
+        let more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, i, len, "more").unwrap();
+        self.builder.build_conditional_branch(more, body_bb, end_bb).unwrap();
+
+        self.builder.position_at_end(body_bb);
+        let is_first = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ, i, self.ctx.i64_type().const_zero(), "isfirst").unwrap();
+        self.builder.build_conditional_branch(is_first, elem_bb, sep_bb).unwrap();
+
+        self.builder.position_at_end(sep_bb);
+        self.call_named("printf", &[self.cstr(", ").into()]);
+        self.builder.build_unconditional_branch(elem_bb).unwrap();
+
+        self.builder.position_at_end(elem_bb);
+        let slot = unsafe {
+            self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot")
+        }.unwrap();
+        let elemv = self.builder.build_load(self.value_ty, slot, "elemv").unwrap().into_struct_value();
+        self.call_named("verb_print_value", &[elemv.into()]);
+        let next = self.builder.build_int_add(i, self.ctx.i64_type().const_int(1, false), "next").unwrap();
+        self.builder.build_store(idxp, next).unwrap();
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.builder.position_at_end(end_bb);
+        self.call_named("printf", &[self.cstr("]").into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(map_bb);
@@ -218,6 +281,19 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(done);
+        self.builder.build_return(None).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_print(value) — adds trailing newline -----
+
+    fn build_print_fn(&self) {
+        let fnty = self.ctx.void_type().fn_type(&[self.value_ty.into()], false);
+        let f = self.module.add_function("verb_print", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let v = f.get_nth_param(0).unwrap().into_struct_value();
+        self.call_named("verb_print_value", &[v.into()]);
+        self.call_named("printf", &[self.cstr("\n").into()]);
         self.builder.build_return(None).unwrap();
     }
 
@@ -614,6 +690,289 @@ impl<'ctx> Codegen<'ctx> {
                       &[arity.into(), argc.into()]);
     }
 
+    // ----- generated runtime helper: verb_array_len(value, i32, i32) -> value -----
+
+    fn build_array_len_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_array_len",
+            self.value_ty.fn_type(&[self.value_ty.into(), i32t.into(), i32t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let arr = f.get_nth_param(0).unwrap().into_struct_value();
+        let line = f.get_nth_param(1).unwrap().into_int_value();
+        let col = f.get_nth_param(2).unwrap().into_int_value();
+
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let bad_bb = self.ctx.append_basic_block(f, "badtype");
+        let tag = self.tag_of(arr);
+        let is_arr = self.builder.build_int_compare(
+            EQ, tag, self.ctx.i8_type().const_int(TAG_ARRAY, false), "isarr").unwrap();
+        self.builder.build_conditional_branch(is_arr, ok_bb, bad_bb).unwrap();
+
+        self.builder.position_at_end(bad_bb);
+        self.abort_at(line, col, "'len' needs an array, got %s", &[self.type_name(tag)]);
+
+        self.builder.position_at_end(ok_bb);
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(arr), self.ptr_ty, "hdr").unwrap();
+        let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+        let len = self.builder.build_load(self.ctx.i64_type(), lenp, "len").unwrap().into_int_value();
+        let rv = self.make_val(TAG_INT, len);
+        self.builder.build_return(Some(&rv)).unwrap();
+    }
+
+    // ----- shared: verb_array_check(value arr, value idx, i32 line, i32 col, ptr opname) -> i64 (validated index) -----
+
+    /// Aborts unless `arr` is an array and `idx` is an int within bounds;
+    /// returns the validated index as a plain i64. `opname` is a %s-ready
+    /// C string ("get" or "set") used in error messages.
+    fn build_array_check_fn(&self) {
+        use inkwell::IntPredicate::{EQ, SLT, SGE};
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_array_check",
+            i64t.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into(), self.ptr_ty.into()],
+                false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let arr = f.get_nth_param(0).unwrap().into_struct_value();
+        let idx = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+        let opname = f.get_nth_param(4).unwrap().into_pointer_value();
+
+        let arr_ok_bb = self.ctx.append_basic_block(f, "arrok");
+        let arr_bad_bb = self.ctx.append_basic_block(f, "arrbad");
+        let atag = self.tag_of(arr);
+        let is_arr = self.builder.build_int_compare(
+            EQ, atag, self.ctx.i8_type().const_int(TAG_ARRAY, false), "isarr").unwrap();
+        self.builder.build_conditional_branch(is_arr, arr_ok_bb, arr_bad_bb).unwrap();
+
+        self.builder.position_at_end(arr_bad_bb);
+        self.abort_at(line, col, "'%s' needs an array, got %s", &[opname.into(), self.type_name(atag)]);
+
+        self.builder.position_at_end(arr_ok_bb);
+        let idx_ok_bb = self.ctx.append_basic_block(f, "idxok");
+        let idx_bad_bb = self.ctx.append_basic_block(f, "idxbad");
+        let itag = self.tag_of(idx);
+        let is_int = self.builder.build_int_compare(
+            EQ, itag, self.ctx.i8_type().const_int(TAG_INT, false), "isint").unwrap();
+        self.builder.build_conditional_branch(is_int, idx_ok_bb, idx_bad_bb).unwrap();
+
+        self.builder.position_at_end(idx_bad_bb);
+        self.abort_at(line, col, "'%s' needs an int index, got %s", &[opname.into(), self.type_name(itag)]);
+
+        self.builder.position_at_end(idx_ok_bb);
+        let i = self.payload_of(idx);
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(arr), self.ptr_ty, "hdr").unwrap();
+        let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+        let len = self.builder.build_load(i64t, lenp, "len").unwrap().into_int_value();
+        let too_low = self.builder.build_int_compare(SLT, i, i64t.const_zero(), "toolow").unwrap();
+        let too_high = self.builder.build_int_compare(SGE, i, len, "toohigh").unwrap();
+        let out_of_range = self.builder.build_or(too_low, too_high, "oor").unwrap();
+        let inrange_bb = self.ctx.append_basic_block(f, "inrange");
+        let oor_bb = self.ctx.append_basic_block(f, "oor");
+        self.builder.build_conditional_branch(out_of_range, oor_bb, inrange_bb).unwrap();
+
+        self.builder.position_at_end(oor_bb);
+        self.abort_at(line, col, "index %lld out of bounds for array of length %lld", &[i.into(), len.into()]);
+
+        self.builder.position_at_end(inrange_bb);
+        self.builder.build_return(Some(&i)).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_array_get(arr, idx, line, col) -> value -----
+
+    fn build_array_get_fn(&self) {
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_array_get",
+            self.value_ty.fn_type(&[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let arr = f.get_nth_param(0).unwrap().into_struct_value();
+        let idx = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+
+        let opname = self.cstr("get");
+        let i = self.call_named("verb_array_check", &[arr.into(), idx.into(), line.into(), col.into(), opname.into()])
+            .unwrap().into_int_value();
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(arr), self.ptr_ty, "hdr").unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
+        let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
+        let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot") }.unwrap();
+        let v = self.builder.build_load(self.value_ty, slot, "v").unwrap().into_struct_value();
+        self.builder.build_return(Some(&v)).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_array_set(arr, idx, v, line, col) -> value (returns v) -----
+
+    fn build_array_set_fn(&self) {
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_array_set",
+            self.value_ty.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()],
+                false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let arr = f.get_nth_param(0).unwrap().into_struct_value();
+        let idx = f.get_nth_param(1).unwrap().into_struct_value();
+        let v = f.get_nth_param(2).unwrap().into_struct_value();
+        let line = f.get_nth_param(3).unwrap().into_int_value();
+        let col = f.get_nth_param(4).unwrap().into_int_value();
+
+        let opname = self.cstr("set");
+        let i = self.call_named("verb_array_check", &[arr.into(), idx.into(), line.into(), col.into(), opname.into()])
+            .unwrap().into_int_value();
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(arr), self.ptr_ty, "hdr").unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
+        let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
+        let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot") }.unwrap();
+        self.builder.build_store(slot, v).unwrap();
+        self.builder.build_return(Some(&v)).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_array_push(arr, v, line, col) -> value (nil) -----
+
+    fn build_array_push_fn(&self) {
+        use inkwell::IntPredicate::{EQ, SLT};
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_array_push",
+            self.value_ty.fn_type(&[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let arr = f.get_nth_param(0).unwrap().into_struct_value();
+        let v = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let bad_bb = self.ctx.append_basic_block(f, "badtype");
+        let atag = self.tag_of(arr);
+        let is_arr = self.builder.build_int_compare(
+            EQ, atag, self.ctx.i8_type().const_int(TAG_ARRAY, false), "isarr").unwrap();
+        self.builder.build_conditional_branch(is_arr, ok_bb, bad_bb).unwrap();
+
+        self.builder.position_at_end(bad_bb);
+        self.abort_at(line, col, "'push' needs an array, got %s", &[self.type_name(atag)]);
+
+        self.builder.position_at_end(ok_bb);
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(arr), self.ptr_ty, "hdr").unwrap();
+        let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+        let capp = self.builder.build_struct_gep(self.array_ty, hdr, 1, "capp").unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
+        let len = self.builder.build_load(i64t, lenp, "len").unwrap().into_int_value();
+        let cap = self.builder.build_load(i64t, capp, "cap").unwrap().into_int_value();
+
+        let grow_bb = self.ctx.append_basic_block(f, "grow");
+        let after_grow_bb = self.ctx.append_basic_block(f, "afterGrow");
+        let need_grow = self.builder.build_int_compare(EQ, len, cap, "needgrow").unwrap();
+        self.builder.build_conditional_branch(need_grow, grow_bb, after_grow_bb).unwrap();
+
+        self.builder.position_at_end(grow_bb);
+        let one = i64t.const_int(1, false);
+        let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
+        let is_zero = self.builder.build_int_compare(EQ, cap, i64t.const_zero(), "capzero").unwrap();
+        let doubled = self.builder.build_int_mul(cap, i64t.const_int(2, false), "doubled").unwrap();
+        let new_cap = self.builder.build_select(is_zero, one, doubled, "newcap").unwrap().into_int_value();
+        let new_bytes = self.builder.build_int_mul(new_cap, i64t.const_int(16, false), "newbytes").unwrap();
+        let new_elems = self.malloc_bytes_dyn(new_bytes);
+
+        let idxp = self.entry_alloca(i64t.into(), "cpidx");
+        self.builder.build_store(idxp, i64t.const_zero()).unwrap();
+        let cp_cond = self.ctx.append_basic_block(f, "cp.cond");
+        let cp_body = self.ctx.append_basic_block(f, "cp.body");
+        let cp_end = self.ctx.append_basic_block(f, "cp.end");
+        self.builder.build_unconditional_branch(cp_cond).unwrap();
+
+        self.builder.position_at_end(cp_cond);
+        let i = self.builder.build_load(i64t, idxp, "i").unwrap().into_int_value();
+        let more = self.builder.build_int_compare(SLT, i, len, "more").unwrap();
+        self.builder.build_conditional_branch(more, cp_body, cp_end).unwrap();
+
+        self.builder.position_at_end(cp_body);
+        let src = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "src") }.unwrap();
+        let dst = unsafe { self.builder.build_in_bounds_gep(self.value_ty, new_elems, &[i], "dst") }.unwrap();
+        let elemv = self.builder.build_load(self.value_ty, src, "elemv").unwrap();
+        self.builder.build_store(dst, elemv).unwrap();
+        let next = self.builder.build_int_add(i, one, "next").unwrap();
+        self.builder.build_store(idxp, next).unwrap();
+        self.builder.build_unconditional_branch(cp_cond).unwrap();
+
+        self.builder.position_at_end(cp_end);
+        self.builder.build_store(capp, new_cap).unwrap();
+        self.builder.build_store(elemsp, new_elems).unwrap();
+        self.builder.build_unconditional_branch(after_grow_bb).unwrap();
+
+        self.builder.position_at_end(after_grow_bb);
+        let elems2 = self.builder.build_load(self.ptr_ty, elemsp, "elems2").unwrap().into_pointer_value();
+        let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems2, &[len], "slot") }.unwrap();
+        self.builder.build_store(slot, v).unwrap();
+        let newlen = self.builder.build_int_add(len, one, "newlen").unwrap();
+        self.builder.build_store(lenp, newlen).unwrap();
+        let nilv = self.nil_val();
+        self.builder.build_return(Some(&nilv)).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_array_pop(arr, line, col) -> value -----
+
+    fn build_array_pop_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_array_pop",
+            self.value_ty.fn_type(&[self.value_ty.into(), i32t.into(), i32t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let arr = f.get_nth_param(0).unwrap().into_struct_value();
+        let line = f.get_nth_param(1).unwrap().into_int_value();
+        let col = f.get_nth_param(2).unwrap().into_int_value();
+
+        let arrok_bb = self.ctx.append_basic_block(f, "arrok");
+        let arrbad_bb = self.ctx.append_basic_block(f, "arrbad");
+        let atag = self.tag_of(arr);
+        let is_arr = self.builder.build_int_compare(
+            EQ, atag, self.ctx.i8_type().const_int(TAG_ARRAY, false), "isarr").unwrap();
+        self.builder.build_conditional_branch(is_arr, arrok_bb, arrbad_bb).unwrap();
+
+        self.builder.position_at_end(arrbad_bb);
+        self.abort_at(line, col, "'pop' needs an array, got %s", &[self.type_name(atag)]);
+
+        self.builder.position_at_end(arrok_bb);
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(arr), self.ptr_ty, "hdr").unwrap();
+        let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
+        let len = self.builder.build_load(i64t, lenp, "len").unwrap().into_int_value();
+
+        let nonempty_bb = self.ctx.append_basic_block(f, "nonempty");
+        let empty_bb = self.ctx.append_basic_block(f, "empty");
+        let is_empty = self.builder.build_int_compare(EQ, len, i64t.const_zero(), "isempty").unwrap();
+        self.builder.build_conditional_branch(is_empty, empty_bb, nonempty_bb).unwrap();
+
+        self.builder.position_at_end(empty_bb);
+        self.abort_at(line, col, "pop from empty array", &[]);
+
+        self.builder.position_at_end(nonempty_bb);
+        let newlen = self.builder.build_int_sub(len, i64t.const_int(1, false), "newlen").unwrap();
+        let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
+        let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[newlen], "slot") }.unwrap();
+        let v = self.builder.build_load(self.value_ty, slot, "v").unwrap().into_struct_value();
+        self.builder.build_store(lenp, newlen).unwrap();
+        self.builder.build_return(Some(&v)).unwrap();
+    }
+
     /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.
     fn make_closure(&self, fnv: FunctionValue<'ctx>, arity: usize) -> StructValue<'ctx> {
         let p = self.malloc_bytes(24);
@@ -932,6 +1291,32 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             Expr::Call { callee, args, line, col } => self.gen_call(callee, args, *line, *col),
+            Expr::ArrayLit(elems) => {
+                let n = elems.len() as u64;
+                let hdr = self.malloc_bytes(24); // { i64 len, i64 cap, ptr elems }
+                let elems_buf = if n == 0 {
+                    self.ptr_ty.const_null()
+                } else {
+                    self.malloc_bytes(n * 16) // n * sizeof(%verb.value)
+                };
+                for (i, e) in elems.iter().enumerate() {
+                    let v = self.gen_expr(e)?;
+                    let slot = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            self.value_ty, elems_buf,
+                            &[self.ctx.i64_type().const_int(i as u64, false)], "slot")
+                    }.unwrap();
+                    self.builder.build_store(slot, v).unwrap();
+                }
+                let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+                self.builder.build_store(lenp, self.ctx.i64_type().const_int(n, false)).unwrap();
+                let capp = self.builder.build_struct_gep(self.array_ty, hdr, 1, "capp").unwrap();
+                self.builder.build_store(capp, self.ctx.i64_type().const_int(n, false)).unwrap();
+                let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
+                self.builder.build_store(elemsp, elems_buf).unwrap();
+                let bits = self.builder.build_ptr_to_int(hdr, self.ctx.i64_type(), "abits").unwrap();
+                Ok(self.make_val(TAG_ARRAY, bits))
+            }
         }
     }
 
@@ -1004,6 +1389,60 @@ impl<'ctx> Codegen<'ctx> {
                 let v = self.gen_expr(&args[0])?;
                 self.call_named("verb_print", &[v.into()]);
                 return Ok(self.nil_val());
+            }
+            if name == "len" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("len takes exactly 1 argument", line, col));
+                }
+                let v = self.gen_expr(&args[0])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_array_len", &[v.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                return Ok(rv);
+            }
+            if name == "get" {
+                if args.len() != 2 {
+                    return Err(CompileError::new("get takes exactly 2 arguments", line, col));
+                }
+                let arr = self.gen_expr(&args[0])?;
+                let idx = self.gen_expr(&args[1])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_array_get", &[arr.into(), idx.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                return Ok(rv);
+            }
+            if name == "set" {
+                if args.len() != 3 {
+                    return Err(CompileError::new("set takes exactly 3 arguments", line, col));
+                }
+                let arr = self.gen_expr(&args[0])?;
+                let idx = self.gen_expr(&args[1])?;
+                let v = self.gen_expr(&args[2])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_array_set", &[arr.into(), idx.into(), v.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                return Ok(rv);
+            }
+            if name == "push" {
+                if args.len() != 2 {
+                    return Err(CompileError::new("push takes exactly 2 arguments", line, col));
+                }
+                let arr = self.gen_expr(&args[0])?;
+                let v = self.gen_expr(&args[1])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_array_push", &[arr.into(), v.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                return Ok(rv);
+            }
+            if name == "pop" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("pop takes exactly 1 argument", line, col));
+                }
+                let arr = self.gen_expr(&args[0])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_array_pop", &[arr.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                return Ok(rv);
             }
             let is_bound = self.lookup(name).is_some();
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {

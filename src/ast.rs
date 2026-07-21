@@ -15,6 +15,7 @@ pub enum Expr {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, line: u32, col: u32 },
     Unary { op: UnOp, expr: Box<Expr>, line: u32, col: u32 },
     Call { callee: Box<Expr>, args: Vec<Expr>, line: u32, col: u32 },
+    ArrayLit(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

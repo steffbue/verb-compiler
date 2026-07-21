@@ -443,6 +443,14 @@ impl Parser {
                 self.expect(&TokenKind::RParen, "')'")?;
                 e
             }
+            TokenKind::List => {
+                self.advance(); // list
+                let mut elems = vec![self.expression()?];
+                while self.matches(&TokenKind::Comma) {
+                    elems.push(self.expression()?);
+                }
+                Expr::ArrayLit(elems)
+            }
             _ => return Err(self.err_found("expected expression")),
         };
         Ok(e)
@@ -552,6 +560,67 @@ mod tests {
                 assert_eq!(name, "sum");
                 assert_eq!(params, &vec!["a".to_string(), "b".to_string()]);
                 assert!(matches!(&body[0], Stmt::Return { value: Some(_) }));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_list_literal() {
+        match expr("list 1, 2, 3") {
+            Expr::ArrayLit(elems) => assert_eq!(elems, vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_single_element_list_literal() {
+        match expr("list 1") {
+            Expr::ArrayLit(elems) => assert_eq!(elems, vec![Expr::Int(1)]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_literal_as_trailing_call_arg_works() {
+        // push(a, list 1, 2) — list eats "1, 2", then ')' stops it, so push
+        // still sees exactly 2 arguments.
+        let p = parse(lex("push(a, list 1, 2);").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::ExprStmt(Expr::Call { args, .. }) => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], Expr::Var(n, ..) if n == "a"));
+                assert!(matches!(&args[1], Expr::ArrayLit(elems) if elems.len() == 2));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_literal_swallows_a_would_be_sibling_call_arg() {
+        // foo(list 1, 2, 3) — list greedily eats "1, 2, 3", leaving foo with
+        // exactly 1 argument (the array), not 2. Documents the accepted
+        // no-delimiter limitation from the design spec.
+        let p = parse(lex("foo(list 1, 2, 3);").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::ExprStmt(Expr::Call { args, .. }) => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&args[0], Expr::ArrayLit(elems) if elems.len() == 3));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_literal_swallows_a_nested_list_literal() {
+        // list list 1, 2, list 3, 4 — the outer list's first (and only)
+        // element parse hits `list` again, which itself greedily eats
+        // everything through the end of input. Outer ends up with exactly
+        // one element. Documents the accepted nesting limitation.
+        match expr("list list 1, 2, list 3, 4") {
+            Expr::ArrayLit(elems) => {
+                assert_eq!(elems.len(), 1);
+                assert!(matches!(&elems[0], Expr::ArrayLit(inner) if inner.len() == 3));
             }
             other => panic!("{other:?}"),
         }

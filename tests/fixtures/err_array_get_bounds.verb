@@ -1,0 +1,2 @@
+assign a list 1, 2;
+print(get(a, 5));

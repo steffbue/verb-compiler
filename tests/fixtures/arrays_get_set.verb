@@ -1,0 +1,6 @@
+assign a list 10, 20, 30;
+print(get(a, 0));
+print(get(a, 2));
+set(a, 1, 99);
+print(a);
+print(set(a, 0, 7));

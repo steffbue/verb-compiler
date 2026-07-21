@@ -200,6 +200,7 @@ fn token_text(tok: &Token) -> String {
         Import => "import".into(),
         Mod => "mod".into(),
         Std => "std".into(),
+        List => "list".into(),
         Add => "add".into(),
         Sub => "sub".into(),
         Neg => "neg".into(),
@@ -355,5 +356,10 @@ mod tests {
     #[test]
     fn rejects_invalid_syntax() {
         assert!(format("assign x;").is_err());
+    }
+
+    #[test]
+    fn formats_list_literal() {
+        assert_eq!(fmt("assign a list 1,   2,3;"), "assign a list 1, 2, 3;\n");
     }
 }

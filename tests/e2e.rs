@@ -46,6 +46,66 @@ fn run_err(name: &str, msg: &str) {
 fn literals() { run_ok("literals"); }
 
 #[test]
+fn array_literal_prints() { run_ok("arrays_literal"); }
+
+#[test]
+fn array_len() { run_ok("arrays_len"); }
+
+#[test]
+fn array_len_type_error_aborts() {
+    run_err("err_array_len_type", "'len' needs an array, got int");
+}
+
+#[test]
+fn array_get_set() { run_ok("arrays_get_set"); }
+
+#[test]
+fn array_get_type_error_aborts() {
+    run_err("err_array_get_type", "'get' needs an array, got int");
+}
+
+#[test]
+fn array_get_index_type_error_aborts() {
+    run_err("err_array_get_index_type", "'get' needs an int index, got string");
+}
+
+#[test]
+fn array_get_bounds_error_aborts() {
+    run_err("err_array_get_bounds", "index 5 out of bounds for array of length 2");
+}
+
+#[test]
+fn array_push_pop_grows() { run_ok("arrays_push_pop"); }
+
+#[test]
+fn array_push_type_error_aborts() {
+    run_err("err_array_push_type", "'push' needs an array, got int");
+}
+
+#[test]
+fn array_pop_empty_aborts() {
+    run_err("err_array_pop_empty", "pop from empty array");
+}
+
+#[test]
+fn array_of_arrays() { run_ok("arrays_of_arrays"); }
+
+#[test]
+fn array_of_closures() { run_ok("arrays_of_closures"); }
+
+#[test]
+fn array_literal_emits_malloc_and_store_in_ir() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/arrays_literal.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("call ptr @malloc"), "no malloc call in IR:\n{ir}");
+    assert!(ir.contains("@verb_print_value"), "no verb_print_value in IR:\n{ir}");
+}
+
+#[test]
 fn arith() { run_ok("arith"); }
 
 #[test]
