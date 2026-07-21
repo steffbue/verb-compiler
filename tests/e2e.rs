@@ -641,6 +641,34 @@ fn build_links_and_runs_a_program_using_std_io_files() {
 }
 
 #[test]
+fn std_io_file_roundtrip_allocates_through_verb_alloc() {
+    // Mirrors build_links_and_runs_a_program_using_std_io_files, but under
+    // its own fixture + temp-file path (verb_e2e_gc_v2_roundtrip.tmp) so
+    // this doesn't race the other std-io file-roundtrip test over the same
+    // hardcoded path under cargo test's default parallelism. Exercises the
+    // verb_alloc-backed file_read/file_write/file_append path so that any
+    // retain/release GC touches this string without corrupting memory.
+    let _ = std::fs::remove_file("verb_e2e_gc_v2_roundtrip.tmp");
+    let out_path = std::env::temp_dir().join("verb_e2e_gc_std_io_file_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/gc_std_io_file_roundtrip.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/gc_std_io_file_roundtrip.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file("verb_e2e_gc_v2_roundtrip.tmp");
+}
+
+#[test]
 fn cross_build_links_a_program_using_std_io_for_a_non_host_non_windows_target() {
     if !zig_available() {
         eprintln!("skipping: zig not on PATH");
