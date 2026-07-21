@@ -452,6 +452,21 @@ fn verb_map_cpp_compiles_standalone() {
     let _ = std::fs::remove_file(&obj);
 }
 
+#[test]
+fn verb_std_thread_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_std_thread_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-pthread", "-c",
+            "runtime/verb_std_thread.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_std_thread.cpp");
+    assert!(status.success(), "runtime/verb_std_thread.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
 // ----- AOT host / cross build + multi-file (from main) -----
 
 #[test]
