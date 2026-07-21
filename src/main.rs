@@ -94,7 +94,12 @@ struct ParsedArgs {
     out: Option<String>,
     emit_llvm: bool,
     target: Option<String>,
+    /// Global library search dirs (`-L<dir>`), applied to every target.
     lib_dirs: Vec<String>,
+    /// Per-target library search dirs (`-L<label>=<dir>`), each applied only
+    /// to the matching `--target` label — lets a single `--target all` run
+    /// supply a different, arch-matched library per target (INTEG-02).
+    target_lib_dirs: Vec<(String, String)>,
 }
 
 fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
@@ -107,6 +112,7 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     let mut emit_llvm = false;
     let mut target = None;
     let mut lib_dirs = Vec::new();
+    let mut target_lib_dirs = Vec::new();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -131,7 +137,18 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
                 i += 1;
             }
             a if a.starts_with("-L") && a.len() > 2 => {
-                lib_dirs.push(a.to_string());
+                // `-L<label>=<dir>` scopes a search dir to one `--target` label;
+                // a plain `-L<dir>` (or any `=`-form whose prefix isn't a valid
+                // target) stays global and applies to every target.
+                match a[2..].split_once('=') {
+                    Some((label, dir))
+                        if !dir.is_empty() && targets::Target::parse(label).is_ok() =>
+                    {
+                        let canon = targets::Target::parse(label).unwrap().label();
+                        target_lib_dirs.push((canon, format!("-L{dir}")));
+                    }
+                    _ => lib_dirs.push(a.to_string()),
+                }
                 i += 1;
             }
             f => {
@@ -143,7 +160,7 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     if files.is_empty() {
         return None;
     }
-    Some(ParsedArgs { cmd, files, out, emit_llvm, target, lib_dirs })
+    Some(ParsedArgs { cmd, files, out, emit_llvm, target, lib_dirs, target_lib_dirs })
 }
 
 fn die(e: CompileError, sources: &[(String, String)]) -> ! {
@@ -168,9 +185,11 @@ fn die(e: CompileError, sources: &[(String, String)]) -> ! {
 
 fn usage() -> ! {
     eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
-    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]");
-    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]  (alias for build)");
+    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]");
+    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]  (alias for build)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
+    eprintln!("       -L<dir>            library search dir applied to every target");
+    eprintln!("       -L<target>=<dir>   library search dir applied only to that --target (e.g. -Llinux-arm64=./libs/arm); use with --target all to supply arch-matched libs per target");
     exit(2)
 }
 
@@ -245,14 +264,15 @@ fn main() {
             let out = parsed.out.unwrap_or_else(|| usage());
             match parsed.target.as_deref() {
                 None => build_aot_host(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
-                Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
+                Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs, &parsed.target_lib_dirs),
                 Some(t) => {
                     let target = targets::Target::parse(t).unwrap_or_else(|e| {
                         eprintln!("error: {e}");
                         exit(2);
                     });
                     check_zig_available();
-                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &parsed.lib_dirs) {
+                    let lib_dirs = resolve_lib_dirs(&parsed.lib_dirs, &parsed.target_lib_dirs, &target.label());
+                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &lib_dirs) {
                         eprintln!("error: {e}");
                         exit(1);
                     }
@@ -455,13 +475,27 @@ fn build_aot_cross(
     Ok(())
 }
 
-fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
+/// Effective library search dirs for one target: the global `-L<dir>` set plus
+/// any `-L<label>=<dir>` scoped to this target's label. Lets `--target all`
+/// cross-link an FFI import against a different, arch-matched library per target.
+fn resolve_lib_dirs(global: &[String], scoped: &[(String, String)], label: &str) -> Vec<String> {
+    let mut dirs = global.to_vec();
+    for (l, dir) in scoped {
+        if l == label {
+            dirs.push(dir.clone());
+        }
+    }
+    dirs
+}
+
+fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String], target_lib_dirs: &[(String, String)]) {
     check_zig_available();
     let mut failures = 0;
     let mut results: Vec<(String, Result<(), String>)> = Vec::new();
     for target in targets::ALL {
         let labeled_out = format!("{out}-{}", target.label());
-        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, lib_dirs);
+        let effective = resolve_lib_dirs(lib_dirs, target_lib_dirs, &target.label());
+        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, &effective);
         if res.is_err() {
             failures += 1;
         }
@@ -514,6 +548,58 @@ mod tests {
         ])).unwrap();
         assert_eq!(p.files, vec!["a.verb".to_string()]);
         assert_eq!(p.lib_dirs, vec!["-L/opt/lib".to_string(), "-L./libs".to_string()]);
+        assert!(p.target_lib_dirs.is_empty());
+    }
+
+    #[test]
+    fn parses_per_target_lib_dirs() {
+        let p = parse_cli(&args(&[
+            "verb", "build", "a.verb", "-o", "out",
+            "-L/opt/lib",                      // global
+            "-Llinux-arm64=./libs/arm",        // scoped
+            "-Lmacos-x86_64=/opt/mac",         // scoped
+            "-Llinux-x86=./libs/x86",          // scoped, x86 alias -> canonical label
+        ])).unwrap();
+        // Global stays in lib_dirs.
+        assert_eq!(p.lib_dirs, vec!["-L/opt/lib".to_string()]);
+        // Scoped land in target_lib_dirs, labels canonicalized (x86 -> x86_64).
+        assert_eq!(
+            p.target_lib_dirs,
+            vec![
+                ("linux-arm64".to_string(), "-L./libs/arm".to_string()),
+                ("macos-x86_64".to_string(), "-L/opt/mac".to_string()),
+                ("linux-x86_64".to_string(), "-L./libs/x86".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_target_prefix_before_equals_stays_global() {
+        // A dir path that happens to contain '=' but whose prefix isn't a valid
+        // target label must remain a global search dir, verbatim.
+        let p = parse_cli(&args(&[
+            "verb", "build", "a.verb", "-o", "out", "-L/weird=path/lib",
+        ])).unwrap();
+        assert_eq!(p.lib_dirs, vec!["-L/weird=path/lib".to_string()]);
+        assert!(p.target_lib_dirs.is_empty());
+    }
+
+    #[test]
+    fn resolve_lib_dirs_merges_global_and_matching_scoped() {
+        let global = vec!["-L/opt/lib".to_string()];
+        let scoped = vec![
+            ("linux-arm64".to_string(), "-L./arm".to_string()),
+            ("macos-arm64".to_string(), "-L./mac".to_string()),
+        ];
+        assert_eq!(
+            resolve_lib_dirs(&global, &scoped, "linux-arm64"),
+            vec!["-L/opt/lib".to_string(), "-L./arm".to_string()]
+        );
+        // No scoped match -> global only.
+        assert_eq!(
+            resolve_lib_dirs(&global, &scoped, "linux-x86_64"),
+            vec!["-L/opt/lib".to_string()]
+        );
     }
 
     #[test]

@@ -962,7 +962,12 @@ fn integration_example_zero_leaks() {
 /// libmathlib built with the same zig triple used for the program link.
 /// Callers must guard with `zig_available()` before invoking this.
 fn build_mathlib_for_target(label: &str, zig_triple: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("verb_e2e_cross_libs_{label}"));
+    // Unique per call so concurrently-running tests (each cross-building the
+    // same set of labels) never share a lib dir and race on `mathlib.o`.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NONCE: AtomicUsize = AtomicUsize::new(0);
+    let n = NONCE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verb_e2e_cross_libs_{label}_{n}"));
     std::fs::create_dir_all(&dir).unwrap();
 
     let obj_path = dir.join("mathlib.o");
@@ -1066,5 +1071,77 @@ fn integration_example_cross_builds_all_targets() {
         let meta = std::fs::metadata(&expected_path)
             .unwrap_or_else(|e| panic!("missing output for {label} at {expected_path:?}: {e}"));
         assert!(meta.len() > 0, "empty output for {label}");
+    }
+}
+
+/// Proves the literal `verb build --target all` invocation named in ROADMAP
+/// Success Criterion 2 (INTEG-02): a SINGLE `--target all` run cross-links an
+/// FFI-importing program for all 6 targets, each against its own arch-matched
+/// libmathlib supplied via the `-L<target>=<dir>` per-target convention.
+///
+/// Uses `examples/integration_all_windows.verb` (no `std io`) so all 6 targets
+/// are linkable in one program -- the full `integration_all.verb` carries
+/// `import std io`, which by design cannot cross-compile to Windows, and that
+/// pre-existing exception is covered by the per-target-loop test above. Here we
+/// want a clean all-6-succeed summary that isolates the per-target-lib fix.
+///
+/// Before this fix, `--target all` broadcast one shared `-L` set to every
+/// target, so at most one target's library was arch-compatible and the rest
+/// failed with linker architecture-mismatch errors. Build-only (D-05).
+#[test]
+fn target_all_resolves_per_target_libs() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_e2e_target_all_per_lib");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // (label, zig_triple) matching src/targets.rs::ALL / Target::zig_triple().
+    let targets: [(&str, &str); 6] = [
+        ("linux-x86_64", "x86_64-linux-gnu"),
+        ("linux-arm64", "aarch64-linux-gnu"),
+        ("macos-x86_64", "x86_64-macos-none"),
+        ("macos-arm64", "aarch64-macos-none"),
+        ("windows-x86_64", "x86_64-windows-gnu"),
+        ("windows-arm64", "aarch64-windows-gnu"),
+    ];
+
+    let out = dir.join("intg_all");
+
+    // One arch-matched libmathlib per target, each scoped via `-L<label>=<dir>`.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_verb"));
+    cmd.args([
+        "build",
+        "examples/integration_all_windows.verb",
+        "-o",
+        out.to_str().unwrap(),
+        "--target",
+        "all",
+    ]);
+    for (label, zig_triple) in targets {
+        let lib_dir = build_mathlib_for_target(label, zig_triple);
+        cmd.arg(format!("-L{label}={}", lib_dir.display()));
+    }
+
+    let res = cmd.output().unwrap();
+    assert!(
+        res.status.success(),
+        "`--target all` with per-target libs failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&res.stdout),
+        String::from_utf8_lossy(&res.stderr),
+    );
+
+    // Every target's labeled artifact exists and is non-empty (build_aot_all
+    // writes `<out>-<label>`; windows gets `.exe` appended by adjust_output).
+    for (label, _) in targets {
+        let path = if label.starts_with("windows") {
+            dir.join(format!("intg_all-{label}.exe"))
+        } else {
+            dir.join(format!("intg_all-{label}"))
+        };
+        let meta = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("missing --target all output for {label} at {path:?}: {e}"));
+        assert!(meta.len() > 0, "empty --target all output for {label}");
     }
 }
