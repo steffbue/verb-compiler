@@ -38,6 +38,16 @@ extern "C" {
     fn map_has(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
     fn map_remove(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
     fn map_len(m: VerbValueAbi) -> VerbValueAbi;
+    fn read_line() -> VerbValueAbi;
+    fn file_read(path: VerbValueAbi) -> VerbValueAbi;
+    fn file_write(path: VerbValueAbi, contents: VerbValueAbi) -> VerbValueAbi;
+    fn file_append(path: VerbValueAbi, contents: VerbValueAbi) -> VerbValueAbi;
+    fn tcp_connect(host: VerbValueAbi, port: VerbValueAbi) -> VerbValueAbi;
+    fn tcp_listen(port: VerbValueAbi) -> VerbValueAbi;
+    fn tcp_accept(fd: VerbValueAbi) -> VerbValueAbi;
+    fn send_line(fd: VerbValueAbi, s: VerbValueAbi) -> VerbValueAbi;
+    fn recv_line(fd: VerbValueAbi) -> VerbValueAbi;
+    fn close_conn(fd: VerbValueAbi) -> VerbValueAbi;
 }
 
 // Under `verb run` the program module (src/codegen.rs) emits the real
@@ -89,7 +99,7 @@ fn register_jit_runtime_symbols<'ctx>(
     ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
     module: &inkwell::module::Module<'ctx>,
 ) {
-    let symbols: [(&str, usize); 7] = [
+    let symbols: [(&str, usize); 17] = [
         ("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize),
         ("map_new", map_new as *const () as usize),
         ("map_set", map_set as *const () as usize),
@@ -97,6 +107,16 @@ fn register_jit_runtime_symbols<'ctx>(
         ("map_has", map_has as *const () as usize),
         ("map_remove", map_remove as *const () as usize),
         ("map_len", map_len as *const () as usize),
+        ("read_line", read_line as *const () as usize),
+        ("file_read", file_read as *const () as usize),
+        ("file_write", file_write as *const () as usize),
+        ("file_append", file_append as *const () as usize),
+        ("tcp_connect", tcp_connect as *const () as usize),
+        ("tcp_listen", tcp_listen as *const () as usize),
+        ("tcp_accept", tcp_accept as *const () as usize),
+        ("send_line", send_line as *const () as usize),
+        ("recv_line", recv_line as *const () as usize),
+        ("close_conn", close_conn as *const () as usize),
     ];
     for (name, addr) in symbols {
         if let Some(f) = module.get_function(name) {

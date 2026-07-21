@@ -657,15 +657,10 @@ fn multi_file_build_path_accepts_multiple_files() {
 // ----- std io -----
 
 #[test]
-fn run_rejects_programs_with_std_io_import() {
-    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(["run", "tests/fixtures/std_io_file_roundtrip.verb"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
-    assert!(stderr.contains("std io"), "stderr: {stderr}");
+fn run_executes_std_io_file_roundtrip() {
+    let _ = std::fs::remove_file("verb_e2e_std_io_roundtrip.tmp");
+    run_ok("std_io_file_roundtrip");
+    let _ = std::fs::remove_file("verb_e2e_std_io_roundtrip.tmp");
 }
 
 #[test]
