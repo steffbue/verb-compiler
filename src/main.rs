@@ -317,6 +317,7 @@ fn main() {
 const RUNTIME_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime");
 const STD_IO_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_io.cpp");
 const MAP_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_map.cpp");
+const STD_THREAD_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_thread.cpp");
 
 /// Compiles the bundled `runtime/verb_std_io.cpp` into an object file with
 /// `compiler` (`"cc"`/`"c++"` for the host, `"zig"` for cross targets),
@@ -354,6 +355,30 @@ fn compile_map_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, Strin
     Ok(obj)
 }
 
+/// Compiles the bundled `runtime/verb_std_thread.cpp` into an object
+/// file. See `compile_std_io_obj`. `-pthread` is required by
+/// `std::thread`/`std::mutex`/`std::condition_variable` on Linux
+/// (glibc splits pthread symbols into a separate archive there); macOS's
+/// libc++ links threading support unconditionally, so the flag is a
+/// harmless no-op there, and is applied unconditionally rather than
+/// gated on host OS to keep this function symmetric with its zig-cross
+/// caller in `build_aot_cross`, which cannot check the *host*'s OS
+/// (only the *target*'s).
+fn compile_std_thread_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, String> {
+    let obj = std::env::temp_dir().join(format!("verb_std_thread_{}.o", std::process::id()));
+    let mut cmd = Command::new(compiler);
+    cmd.args(extra_args);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-pthread", "-c", STD_THREAD_CPP, "-o"]);
+    cmd.arg(&obj);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile {STD_THREAD_CPP}: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to compile {STD_THREAD_CPP}"));
+    }
+    Ok(obj)
+}
+
 fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
     use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
@@ -374,6 +399,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_std_thread = std_imports.iter().any(|m| m == "thread");
     // `runtime/verb_map.cpp` is now linked into every build, not just ones that
     // `import std map`: codegen's `verb_release_value` references
     // `verb_map_destroy_contents` unconditionally and nothing strips it. Since a
@@ -396,6 +422,18 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         eprintln!("error: {e}");
         exit(1);
     });
+    let std_thread_obj = if wants_std_thread {
+        let extra_link_args: &[&str] = if cfg!(target_os = "linux") { &["-pthread"] } else { &[] };
+        Some(compile_std_thread_obj(linker, extra_link_args).unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&obj);
+            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            let _ = std::fs::remove_file(&map_obj);
+            eprintln!("error: {e}");
+            exit(1);
+        }))
+    } else {
+        None
+    };
 
     let mut cmd = Command::new(linker);
     cmd.arg(&obj).arg("-o").arg(out);
@@ -403,6 +441,12 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
+    if let Some(p) = &std_thread_obj {
+        cmd.arg(p);
+    }
+    if wants_std_thread && cfg!(target_os = "linux") {
+        cmd.arg("-pthread");
+    }
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -415,6 +459,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
             let _ = std::fs::remove_file(&obj);
             if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
             let _ = std::fs::remove_file(&map_obj);
+            if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
             eprintln!("error: failed to run linker '{linker}': {e}");
             exit(1);
         }
@@ -422,6 +467,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
+    if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         eprintln!("link failed");
         exit(1);
@@ -441,11 +487,19 @@ fn build_aot_cross(
     };
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_std_thread = std_imports.iter().any(|m| m == "thread");
     if wants_std_io && target.is_windows() {
         return Err(
             "'import std io' is not supported when cross-compiling to a Windows target in v1 \
              (POSIX socket APIs aren't available under the mingw cross toolchain) -- build \
              natively on Windows instead, or drop 'import std io'".to_string(),
+        );
+    }
+    if wants_std_thread && target.is_windows() {
+        return Err(
+            "'import std thread' is not supported when cross-compiling to a Windows target in v1 \
+             (std::thread isn't available under the mingw cross toolchain used here) -- build \
+             natively on Windows instead, or drop 'import std thread'".to_string(),
         );
     }
 
@@ -473,6 +527,16 @@ fn build_aot_cross(
     };
     // Always linked now — see build_aot_host for why verb_map.cpp is unconditional.
     let map_obj = compile_map_obj("zig", &["c++", "-target", target.zig_triple()])?;
+    let std_thread_obj = if wants_std_thread {
+        let extra: Vec<&str> = if target.os == targets::Os::Linux {
+            vec!["c++", "-target", target.zig_triple(), "-pthread"]
+        } else {
+            vec!["c++", "-target", target.zig_triple()]
+        };
+        Some(compile_std_thread_obj("zig", &extra)?)
+    } else {
+        None
+    };
 
     // Imports/lib_dirs are forwarded to zig c++ so cross-linking works when the imported
     // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
@@ -486,6 +550,12 @@ fn build_aot_cross(
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
+    if let Some(p) = &std_thread_obj {
+        cmd.arg(p);
+    }
+    if wants_std_thread && target.os == targets::Os::Linux {
+        cmd.arg("-pthread");
+    }
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -496,6 +566,7 @@ fn build_aot_cross(
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
+    if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         return Err("link failed".to_string());
     }

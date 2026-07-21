@@ -152,9 +152,9 @@ impl Parser {
         // time), `std` module names are first-party and fully known ahead
         // of time, so an unrecognized one is rejected here rather than at
         // link time.
-        if name != "io" && name != "map" {
+        if name != "io" && name != "map" && name != "thread" {
             return Err(CompileError::new(
-                format!("unknown std module '{name}' (known std modules: io, map)"),
+                format!("unknown std module '{name}' (known std modules: io, map, thread)"),
                 l, c,
             ));
         }
@@ -712,6 +712,7 @@ mod tests {
         assert!(err.msg.contains("unknown std module 'vector'"), "{}", err.msg);
         assert!(err.msg.contains("io"), "{}", err.msg);
         assert!(err.msg.contains("map"), "{}", err.msg);
+        assert!(err.msg.contains("thread"), "{}", err.msg);
     }
 
     #[test]
@@ -727,6 +728,26 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(prog.std_imports, vec!["io".to_string()]);
         assert_eq!(prog.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_std_thread_import() {
+        let p = parse(lex("import std thread;").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["thread".to_string()]);
+        assert!(p.imports.is_empty());
+    }
+
+    #[test]
+    fn dedups_repeated_std_thread_import() {
+        let p = parse(lex("import std thread; import std thread;").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["thread".to_string()]);
+    }
+
+    #[test]
+    fn std_io_map_and_thread_imports_coexist() {
+        let p = parse(lex("import std io; import std map; import std thread; print(1);").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["io".to_string(), "map".to_string(), "thread".to_string()]);
+        assert_eq!(p.body.len(), 1);
     }
 
     #[test]

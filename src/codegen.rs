@@ -2058,6 +2058,14 @@ impl<'ctx> Codegen<'ctx> {
                     return self.gen_std_io_call(name, arity, args, line, col);
                 }
             }
+            if !is_bound && name == "thread_spawn" && self.std_imports.iter().any(|m| m == "thread") {
+                return self.gen_thread_spawn(args, line, col);
+            }
+            if !is_bound && self.std_imports.iter().any(|m| m == "thread") {
+                if let Some(arity) = thread_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, line, col);
+                }
+            }
             if !is_bound && !self.imports.is_empty() {
                 return self.gen_extern_call(name, args, line, col);
             }
@@ -2134,6 +2142,62 @@ impl<'ctx> Codegen<'ctx> {
             self.call_named("verb_release_value", &[(*v).into()]);
         }
         Ok(result)
+    }
+
+    /// `thread_spawn(closure)` -- the one `std thread` function that can't
+    /// go through `gen_std_io_call`'s generic VerbValue-in/out path,
+    /// because a closure's VerbValue can't cross the C++ boundary
+    /// (verb.h: "Tag 5 (closure) never crosses this boundary"). Instead:
+    /// arity-check the closure via the same `verb_check_call` runtime
+    /// helper `gen_call`'s own closure-invocation fallback tail uses
+    /// (line ~2010), pull `fn_ptr`/`env` straight out of the closure
+    /// struct (same GEP indices `make_closure` writes), and hand those
+    /// two raw pointers to `thread_spawn_raw` (runtime/verb_std_thread.cpp)
+    /// -- which sidesteps the boundary rule entirely since it never
+    /// receives a VerbValue closure, only plain pointers.
+    fn gen_thread_spawn(&mut self, args: &[Expr], line: u32, col: u32)
+        -> Result<StructValue<'ctx>, CompileError>
+    {
+        if args.len() != 1 {
+            return Err(CompileError::new(
+                format!("std thread fn 'thread_spawn' takes 1 argument(s), got {}", args.len()),
+                line, col,
+            ));
+        }
+        let cv = self.gen_expr(&args[0])?;
+        let argc = self.ctx.i64_type().const_zero();
+        let (lc, cc) = self.loc_consts(line, col);
+        let clos_ptr = self.call_named(
+            "verb_check_call", &[cv.into(), argc.into(), lc.into(), cc.into()])
+            .unwrap().into_pointer_value();
+
+        let fpp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 0, "fpp").unwrap();
+        let fp = self.builder.build_load(self.ptr_ty, fpp, "fp").unwrap();
+        let epp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 2, "epp").unwrap();
+        let env = self.builder.build_load(self.ptr_ty, epp, "env").unwrap();
+        // fp/env are plain pointers copied out of the closure struct above;
+        // nothing -- not this function, not thread_spawn_raw's trampoline,
+        // not the spawned thread -- ever dereferences the closure struct
+        // itself again. Releasing cv's temporary retain-on-load here is
+        // exactly as safe as gen_call's own closure-invocation fallback tail
+        // releasing it before its indirect call: the struct's fate past this
+        // point is irrelevant, only fp (a static code pointer) and env
+        // (always null -- closures never capture) are used from here on.
+        self.call_named("verb_release_value", &[cv.into()]);
+
+        let fnv = match self.externs.get("thread_spawn_raw").copied() {
+            Some(fnv) => fnv,
+            None => {
+                let fnty = self.ptr_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
+                let fnv = self.module.add_function("thread_spawn_raw", fnty, None);
+                self.externs.insert("thread_spawn_raw".to_string(), fnv);
+                fnv
+            }
+        };
+        let handle_ptr = self.builder.build_call(fnv, &[fp.into(), env.into()], "spawned")
+            .unwrap().try_as_basic_value().basic().unwrap().into_pointer_value();
+        let handle_int = self.builder.build_ptr_to_int(handle_ptr, self.ctx.i64_type(), "handlei").unwrap();
+        Ok(self.make_val(TAG_INT, handle_int))
     }
 
     /// A call to a name that isn't a local variable or a known Verb `fn`,
@@ -2225,6 +2289,28 @@ const MAP_FUNCS: &[(&str, usize)] = &[
 
 fn map_func_arity(name: &str) -> Option<usize> {
     MAP_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
+/// Fixed name -> arity table for the `thread` module's built-in
+/// functions that fit the generic `gen_std_io_call` VerbValue-in/out
+/// shape (see runtime/verb_std_thread.cpp and the design spec).
+/// `thread_spawn` is deliberately absent -- its closure argument can't
+/// cross the C++ boundary as a VerbValue, so it gets its own dispatch
+/// arm and codegen (`gen_thread_spawn`), added in the next task. See
+/// `IO_FUNCS`.
+const THREAD_FUNCS: &[(&str, usize)] = &[
+    ("thread_join", 1),
+    ("thread_sleep_ms", 1),
+    ("mutex_new", 0),
+    ("mutex_lock", 1),
+    ("mutex_unlock", 1),
+    ("channel_new", 0),
+    ("channel_send", 2),
+    ("channel_recv", 1),
+];
+
+fn thread_func_arity(name: &str) -> Option<usize> {
+    THREAD_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -2410,5 +2496,136 @@ mod tests {
         cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap();
         let ir = cg.module().print_to_string().to_string();
         assert!(!ir.contains("verb_debug_checkpoint"), "{ir}");
+    }
+
+    #[test]
+    fn std_thread_mutex_call_with_correct_arity_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::Assign {
+            name: "m".to_string(),
+            value: Expr::Call {
+                callee: Box::new(Expr::Var("mutex_new".to_string(), 1, 1)),
+                args: vec![],
+                line: 1, col: 1,
+            },
+            line: 1, col: 1,
+        }];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["thread".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_thread_arity_mismatch_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("mutex_lock".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        }, 1, 1)];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["thread".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("mutex_lock"), "{}", err.msg);
+        assert!(err.msg.contains("takes 1 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_thread_name_ignored_without_import_std_thread() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("mutex_new".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        }, 1, 1)];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("undefined variable"), "{}", err.msg);
+    }
+
+    #[test]
+    fn all_std_thread_generic_funcs_compile_ok() {
+        // channel_send/channel_recv/mutex_lock/mutex_unlock/thread_join/
+        // thread_sleep_ms all take a plausible number of int args; this
+        // just proves each name+arity in THREAD_FUNCS (other than
+        // thread_spawn, covered separately in Task 4's tests) type-checks
+        // through the generic gen_std_io_call path.
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let call1 = |name: &str, argc: usize| Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var(name.to_string(), 1, 1)),
+            args: (0..argc).map(|_| Expr::Int(1)).collect(),
+            line: 1, col: 1,
+        }, 1, 1);
+        let stmts = vec![
+            call1("mutex_lock", 1),
+            call1("mutex_unlock", 1),
+            call1("channel_send", 2),
+            call1("channel_recv", 1),
+            call1("thread_join", 1),
+            call1("thread_sleep_ms", 1),
+        ];
+        let stmt_files = vec!["a.verb".to_string(); stmts.len()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["thread".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_thread_spawn_with_0_arity_closure_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![
+            Stmt::Fn {
+                name: "work".to_string(),
+                params: vec![],
+                body: vec![],
+                line: 1, col: 1,
+            },
+            Stmt::ExprStmt(Expr::Call {
+                callee: Box::new(Expr::Var("thread_spawn".to_string(), 2, 1)),
+                args: vec![Expr::Var("work".to_string(), 2, 13)],
+                line: 2, col: 1,
+            }, 2, 1),
+        ];
+        let stmt_files = vec!["a.verb".to_string(); stmts.len()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["thread".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_thread_spawn_arity_mismatch_is_a_compile_error() {
+        // thread_spawn itself always takes exactly 1 argument (the
+        // closure) -- passing 0 or 2+ args is the same "wrong argument
+        // count" error every other std fn gives, independent of the
+        // closure's own arity (checked separately, at the
+        // verb_check_call/runtime-abort level, not here).
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("thread_spawn".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        }, 1, 1)];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["thread".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("thread_spawn"), "{}", err.msg);
+        assert!(err.msg.contains("takes 1 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_thread_spawn_name_ignored_without_import_std_thread() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("thread_spawn".to_string(), 1, 1)),
+            args: vec![Expr::Int(1)],
+            line: 1, col: 1,
+        }, 1, 1)];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("undefined variable"), "{}", err.msg);
     }
 }
