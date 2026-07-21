@@ -951,9 +951,36 @@ impl<'ctx> Codegen<'ctx> {
         }
         self.scopes.pop();
         if self.cur_block_open() {
+            self.emit_gc_debug_dump(main);
             self.builder.build_return(Some(&self.ctx.i32_type().const_zero())).unwrap();
         }
         Ok(())
+    }
+
+    /// If `VERB_GC_DEBUG` is set in the environment, prints
+    /// `verb_gc_live=<n>` to stdout, where `<n>` is the number of
+    /// outstanding `verb_alloc` blocks (strings/closures/cells) at
+    /// program exit. Purely a test/debugging hook -- silent otherwise,
+    /// and never affects a program's own output.
+    fn emit_gc_debug_dump(&self, main: FunctionValue<'ctx>) {
+        let i64t = self.ctx.i64_type();
+        let env_name = self.cstr("VERB_GC_DEBUG");
+        let flag = self.call_named("getenv", &[env_name.into()]).unwrap().into_pointer_value();
+        let flag_int = self.builder.build_ptr_to_int(flag, i64t, "flagi").unwrap();
+        let is_set = self.builder.build_int_compare(
+            inkwell::IntPredicate::NE, flag_int, i64t.const_zero(), "gc_debug").unwrap();
+        let dbg_bb = self.ctx.append_basic_block(main, "gc.debug");
+        let cont_bb = self.ctx.append_basic_block(main, "gc.cont");
+        self.builder.build_conditional_branch(is_set, dbg_bb, cont_bb).unwrap();
+
+        self.builder.position_at_end(dbg_bb);
+        let live_ptr = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
+        let live = self.builder.build_load(i64t, live_ptr, "live").unwrap();
+        let fmt = self.cstr("verb_gc_live=%lld\n");
+        self.call_named("printf", &[fmt.into(), live.into()]);
+        self.builder.build_unconditional_branch(cont_bb).unwrap();
+
+        self.builder.position_at_end(cont_bb);
     }
 
     fn cur_block_open(&self) -> bool {

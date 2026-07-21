@@ -656,3 +656,33 @@ fn early_return_from_nested_block_releases_open_scopes() { run_ok("early_return_
 
 #[test]
 fn early_return_in_if_then_leaves_scopes_intact_for_else_branch() { run_ok("early_return_if_else_outer_var"); }
+
+fn assert_no_leaks(fixture: &str) {
+    let out_path = std::env::temp_dir().join(format!("verb_test_gc_{fixture}"));
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", &format!("tests/fixtures/{fixture}.verb"), "-o", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{fixture}: build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).env("VERB_GC_DEBUG", "1").output().unwrap();
+    assert!(run.status.success(), "{fixture}: run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("{fixture}: no verb_gc_live line in stdout:\n{stdout}"));
+    assert_eq!(live_line, "verb_gc_live=0", "{fixture}: leaked heap objects:\n{stdout}");
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn gc_stress_loop_leaks_nothing() { assert_no_leaks("gc_stress"); }
+
+#[test]
+fn gc_no_leaks_across_representative_programs() {
+    for fixture in ["strings", "functions", "control", "reassign_strings", "early_return_releases", "early_return_if_else_outer_var"] {
+        assert_no_leaks(fixture);
+    }
+}
+
+#[test]
+fn gc_no_leaks_with_std_io_file_roundtrip() { assert_no_leaks("std_io_file_roundtrip"); }

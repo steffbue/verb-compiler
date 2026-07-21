@@ -12,6 +12,15 @@
 #include <stdint.h>
 #include <string.h>
 
+// Defined by Verb's own generated LLVM module (src/codegen.rs,
+// build_alloc_fn): allocates n bytes with an 8-byte GC refcount header
+// prefixed, initialized to 1. Any C++ code that hands a heap-owned
+// string back to Verb MUST allocate through this, not malloc/strdup --
+// verb_retain_value/verb_release_value read a refcount at ptr-8 for
+// every string they see, static or heap, and an unheadered pointer there
+// is undefined behavior the first time Verb retains or releases it.
+extern "C" void* verb_alloc(int64_t n);
+
 typedef struct { int8_t tag; int64_t payload; } VerbValue;
 
 enum {

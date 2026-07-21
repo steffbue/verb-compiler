@@ -68,6 +68,24 @@ extern "C" VerbValue c_sqrt(VerbValue x) {
 
 Any type-checking of arguments (is this actually a float?) is the C++ implementation's own responsibility, using `verb_is`/tag constants — Verb performs none at the call boundary. This mirrors the "no per-fn declared types" decision: there is no static type to check against.
 
+### Returning heap-owned strings
+
+If an extern function returns a *new* string (not one it received as an
+argument and is just echoing back), allocate it with `verb_alloc` (declared
+in `verb.h`), not `malloc`/`strdup`:
+
+    extern "C" VerbValue make_greeting(VerbValue name) {
+        std::string s = std::string("hello, ") + verb_as_string(name);
+        char* out = static_cast<char*>(verb_alloc(s.size() + 1));
+        std::memcpy(out, s.data(), s.size() + 1);
+        return verb_string(out);
+    }
+
+Verb's GC (see `docs/superpowers/specs/2026-07-21-refcounting-gc-design.md`)
+reads a refcount header at `ptr - 8` for every string it retains or
+releases. A string allocated any other way doesn't have that header, and
+the first retain/release Verb performs on it is undefined behavior.
+
 ## AST
 
 ```rust

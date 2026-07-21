@@ -1,0 +1,9 @@
+assign total 0;
+loop assign i 0; i trails 2000; i be i add 1 begin
+  declare s;
+  s be "iteration" join "-done";
+  check s equals "iteration-done" begin
+    total be total add 1;
+  end
+end
+print(total);
