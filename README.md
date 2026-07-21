@@ -87,6 +87,39 @@ Verb programs can call `extern "C"` functions from a native library:
 See `docs/superpowers/specs/2026-07-20-cpp-import-design.md` for the full
 design.
 
+## Importing other Verb files
+
+`import mod` also pulls in another Verb source file, not just a C++
+library — the CLI itself now only ever takes a single entry file, so
+multi-file programs are built entirely through this:
+
+    %% utils.verb
+    make double(x) begin
+      return x times 2;
+    end
+
+    %% main.verb
+    import mod utils.verb;
+
+    print(double(21));
+
+- Disambiguation is purely by name: `import mod <name>;` (no `.verb`
+  suffix) is a C++ library; `import mod <name>.verb;` is a Verb source
+  file.
+- The path is a bare filename (no `/`, no subdirectories in v1), resolved
+  relative to the directory of the file doing the importing — not the
+  current working directory.
+- Imports are recursive (an imported file can `import mod` further files)
+  and deduplicated (the same file imported from two places is only
+  included once). A file that imports itself, directly or transitively,
+  is a compile error.
+- Everything imported lands in one flat global scope, same as if it had
+  all been written in one file — there's no `utils.helper()`-style
+  qualified access in v1.
+
+See `docs/superpowers/specs/2026-07-21-verb-file-import-design.md` for the
+full design.
+
 ## Standard library I/O (`import std io`)
 
 Unlike `import mod`, which requires writing your own `extern "C"`
