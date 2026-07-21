@@ -209,6 +209,39 @@ same as `std io`.
 
 See `docs/superpowers/specs/2026-07-21-maps-design.md` for the full design.
 
+## Memory management (reference-counting GC)
+
+Every heap-owned Verb value — string buffers, closure structs, array
+headers, map objects, boxed variable cells, and top-level globals — is
+reference-counted and freed automatically when its last reference goes
+away. You don't manage memory by hand; there is no `free`.
+
+- Each heap block carries an 8-byte refcount header. Codegen inserts
+  retain/release calls at every value-copy and scope-exit point,
+  including early-return unwinding, global rebinding, and program exit.
+- String literals are immortal: they get a static sentinel header and are
+  never freed (and never counted as live).
+- `runtime/verb_map.cpp` is always compiled and embedded into the `verb`
+  binary (via `build.rs`), regardless of `import std map`, because the
+  GC's core dispatch references it unconditionally. `verb run` (JIT)
+  resolves it through `inkwell`'s `add_global_mapping`.
+
+This is refcounting only — there is **no cycle collector**. A
+self-referential structure (e.g. `push(a, a)`, or a map that stores
+itself) leaks in a bounded, confined way: the objects in the cycle are
+never freed, but there is no corruption and no unbounded growth. Avoid
+building reference cycles if you care about freeing every byte.
+
+Set `VERB_GC_DEBUG=1` in the environment to print `verb_gc_live=<n>` at
+program exit, where `<n>` is the number of outstanding heap blocks — `0`
+means no leaks. It's a test/debugging hook: silent unless the env var is
+set, and it never affects a program's own output.
+
+    VERB_GC_DEBUG=1 ./hello       # prints program output, then verb_gc_live=0
+
+See `docs/superpowers/specs/2026-07-21-refcounting-gc-v2-design.md` for
+the full design.
+
 ## Standard library time (`import std time`)
 
 `import std time;` gives Verb programs wall-clock/monotonic millisecond
@@ -271,7 +304,8 @@ See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
 
 ## Known v1 limitations
 
-- No GC — heap allocations are never freed
+- Reference-counting GC only — no cycle collector, so reference cycles
+  leak in a bounded way (see "Memory management" above)
 - No `break`/`continue`, no anonymous functions
 - No closures — a nested `make` cannot reference any variable from its
   enclosing function's scope (not even ones declared before it); it can
