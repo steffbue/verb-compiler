@@ -685,4 +685,15 @@ fn gc_no_leaks_across_representative_programs() {
 }
 
 #[test]
-fn gc_no_leaks_with_std_io_file_roundtrip() { assert_no_leaks("std_io_file_roundtrip"); }
+fn gc_no_leaks_with_std_io_file_roundtrip() {
+    // Uses its own fixture (std_io_file_roundtrip_gc) writing to its own temp
+    // path (verb_e2e_gc_leak_check.tmp) rather than reusing
+    // std_io_file_roundtrip.verb — that fixture and its hardcoded temp path
+    // are also used by build_links_and_runs_a_program_using_std_io_files,
+    // which asserts on the file's actual content. Since cargo test runs
+    // tests concurrently by default, sharing the same path would let the two
+    // tests race on the same file.
+    let _ = std::fs::remove_file("verb_e2e_gc_leak_check.tmp");
+    assert_no_leaks("std_io_file_roundtrip_gc");
+    let _ = std::fs::remove_file("verb_e2e_gc_leak_check.tmp");
+}
