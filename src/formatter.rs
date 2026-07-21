@@ -357,4 +357,9 @@ mod tests {
     fn rejects_invalid_syntax() {
         assert!(format("assign x;").is_err());
     }
+
+    #[test]
+    fn formats_list_literal() {
+        assert_eq!(fmt("assign a list 1,   2,3;"), "assign a list 1, 2, 3;\n");
+    }
 }

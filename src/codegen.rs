@@ -886,6 +886,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             Expr::Call { callee, args, line, col } => self.gen_call(callee, args, *line, *col),
+            Expr::ArrayLit(_) => unimplemented!("array literal codegen (Task 3)"),
         }
     }
 
