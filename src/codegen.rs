@@ -1470,7 +1470,11 @@ impl<'ctx> Codegen<'ctx> {
 
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
-            Stmt::ExprStmt(e) => { self.gen_expr(e)?; Ok(()) }
+            Stmt::ExprStmt(e) => {
+                let v = self.gen_expr(e)?;
+                self.call_named("verb_release_value", &[v.into()]);
+                Ok(())
+            }
             Stmt::Assign { name, value } => {
                 let v = self.gen_expr(value)?;
                 self.bind(name, v);
@@ -1487,6 +1491,8 @@ impl<'ctx> Codegen<'ctx> {
                         .with_hint("declare new variables with 'assign' or 'declare'".to_string())
                 })?;
                 let v = self.gen_expr(value)?;
+                let old = self.builder.build_load(self.value_ty, cell, "old").unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[old.into()]);
                 self.builder.build_store(cell, v).unwrap();
                 Ok(())
             }
@@ -1499,6 +1505,7 @@ impl<'ctx> Codegen<'ctx> {
             Stmt::If { cond, then_body, else_body } => {
                 let cv = self.gen_expr(cond)?;
                 let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
+                self.call_named("verb_release_value", &[cv.into()]);
                 let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let then_bb = self.ctx.append_basic_block(f, "if.then");
                 let else_bb = self.ctx.append_basic_block(f, "if.else");
@@ -1535,6 +1542,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(cond_bb);
                 let cv = self.gen_expr(cond)?;
                 let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
+                self.call_named("verb_release_value", &[cv.into()]);
                 self.builder.build_conditional_branch(t, body_bb, end_bb).unwrap();
 
                 self.builder.position_at_end(body_bb);
@@ -1636,8 +1644,10 @@ impl<'ctx> Codegen<'ctx> {
             Expr::Nil => Ok(self.nil_val()),
             Expr::Var(name, line, col) => {
                 if let Some(cell) = self.lookup(name) {
-                    return Ok(self.builder.build_load(self.value_ty, cell, name)
-                        .unwrap().into_struct_value());
+                    let v = self.builder.build_load(self.value_ty, cell, name)
+                        .unwrap().into_struct_value();
+                    self.call_named("verb_retain_value", &[v.into()]);
+                    return Ok(v);
                 }
                 Err(self.undefined_var(name, *line, *col))
             }
@@ -1647,12 +1657,15 @@ impl<'ctx> Codegen<'ctx> {
                 match op {
                     UnOp::Neg => {
                         let (lc, cc) = self.loc_consts(*line, *col);
-                        Ok(self.call_named("verb_neg", &[v.into(), lc.into(), cc.into()])
-                            .unwrap().into_struct_value())
+                        let out = self.call_named("verb_neg", &[v.into(), lc.into(), cc.into()])
+                            .unwrap().into_struct_value();
+                        self.call_named("verb_release_value", &[v.into()]);
+                        Ok(out)
                     }
                     UnOp::Not => {
                         let t = self.call_named("verb_truthy", &[v.into()])
                             .unwrap().into_int_value();
+                        self.call_named("verb_release_value", &[v.into()]);
                         let inv = self.builder.build_not(t, "inv").unwrap();
                         Ok(self.bool_val(inv))
                     }
@@ -1710,6 +1723,9 @@ impl<'ctx> Codegen<'ctx> {
             };
             self.builder.position_at_end(rhs_bb);
             let r = self.gen_expr(rhs)?;
+            // rhs_bb is only entered when `r` becomes the result instead of
+            // `l`, so the owned temporary `l` is being discarded here.
+            self.call_named("verb_release_value", &[l.into()]);
             let rhs_end = self.builder.get_insert_block().unwrap();
             self.builder.build_unconditional_branch(merge).unwrap();
             self.builder.position_at_end(merge);
@@ -1736,6 +1752,8 @@ impl<'ctx> Codegen<'ctx> {
             self.call_named(helper, &[l.into(), r.into(), lc.into(), cc.into()])
                 .unwrap().into_struct_value()
         };
+        self.call_named("verb_release_value", &[l.into()]);
+        self.call_named("verb_release_value", &[r.into()]);
         if matches!(op, BinOp::Ne) {
             let p = self.payload_of(out);
             let flipped = self.builder.build_xor(
@@ -1756,6 +1774,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 let v = self.gen_expr(&args[0])?;
                 self.call_named("verb_print", &[v.into()]);
+                self.call_named("verb_release_value", &[v.into()]);
                 return Ok(self.nil_val());
             }
             if name == "len" {
@@ -1850,6 +1869,7 @@ impl<'ctx> Codegen<'ctx> {
         let fp = self.builder.build_load(self.ptr_ty, fpp, "fp").unwrap().into_pointer_value();
         let epp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 2, "epp").unwrap();
         let env = self.builder.build_load(self.ptr_ty, epp, "env").unwrap();
+        self.call_named("verb_release_value", &[cv.into()]);
 
         let fnty = self.value_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
         let out = self.builder.build_indirect_call(
@@ -1892,8 +1912,12 @@ impl<'ctx> Codegen<'ctx> {
         };
         let args_bv: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
             argvals.iter().map(|v| (*v).into()).collect();
-        Ok(self.builder.build_call(fnv, &args_bv, "std_io_call")
-            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value())
+        let result = self.builder.build_call(fnv, &args_bv, "std_io_call")
+            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+        for v in &argvals {
+            self.call_named("verb_release_value", &[(*v).into()]);
+        }
+        Ok(result)
     }
 
     /// A call to a name that isn't a local variable or a known Verb `fn`,
@@ -1941,8 +1965,12 @@ impl<'ctx> Codegen<'ctx> {
         };
         let args_bv: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
             argvals.iter().map(|v| (*v).into()).collect();
-        Ok(self.builder.build_call(fnv, &args_bv, "extern_call")
-            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value())
+        let result = self.builder.build_call(fnv, &args_bv, "extern_call")
+            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+        for v in &argvals {
+            self.call_named("verb_release_value", &[(*v).into()]);
+        }
+        Ok(result)
     }
 }
 
