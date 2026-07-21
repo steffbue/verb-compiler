@@ -497,15 +497,10 @@ fn no_files_given_shows_usage() {
     assert!(stderr.contains("usage:"), "stderr: {stderr}");
 }
 
-fn run_ok_multi(names: &[&str], expected_name: &str) {
-    let files: Vec<String> = names
-        .iter()
-        .map(|n| format!("tests/fixtures/{n}.verb"))
-        .collect();
-    let mut args = vec!["run".to_string()];
-    args.extend(files);
+#[test]
+fn verb_file_import_links_and_runs() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(&args)
+        .args(["run", "tests/fixtures/multifile_b.verb"])
         .output()
         .unwrap();
     assert!(
@@ -514,24 +509,14 @@ fn run_ok_multi(names: &[&str], expected_name: &str) {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = std::fs::read_to_string(format!("tests/fixtures/{expected_name}.expected")).unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
 #[test]
-fn multi_file_links_and_runs() {
-    run_ok_multi(&["multifile_a", "multifile_b"], "multifile");
-}
-
-#[test]
-fn multi_file_emits_single_merged_llvm_module() {
+fn verb_file_import_emits_a_single_merged_llvm_module() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "run",
-            "tests/fixtures/multifile_a.verb",
-            "tests/fixtures/multifile_b.verb",
-            "--emit-llvm",
-        ])
+        .args(["run", "tests/fixtures/multifile_b.verb", "--emit-llvm"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -540,13 +525,9 @@ fn multi_file_emits_single_merged_llvm_module() {
 }
 
 #[test]
-fn multi_file_error_names_the_correct_file() {
+fn verb_file_import_error_names_the_importing_file_not_the_imported_one() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "run",
-            "tests/fixtures/multifile_err_a.verb",
-            "tests/fixtures/multifile_err_b.verb",
-        ])
+        .args(["run", "tests/fixtures/multifile_err_b.verb"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -563,24 +544,67 @@ fn multi_file_error_names_the_correct_file() {
 }
 
 #[test]
-fn multi_file_build_path_accepts_multiple_files() {
-    let dir = std::env::temp_dir().join("verb_multifile_build_test");
+fn verb_file_import_build_path_links_and_runs() {
+    let dir = std::env::temp_dir().join("verb_import_build_test");
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("multifile_bin");
+    let bin = dir.join("verb_file_import_bin");
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "build",
-            "tests/fixtures/multifile_a.verb",
-            "tests/fixtures/multifile_b.verb",
-            "-o",
-            bin.to_str().unwrap(),
-        ])
+        .args(["build", "tests/fixtures/multifile_b.verb", "-o", bin.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
     let run = Command::new(&bin).output().unwrap();
     let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
+
+#[test]
+fn cli_rejects_more_than_one_entry_file() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/multifile_a.verb", "tests/fixtures/multifile_b.verb"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "stderr: {stderr}");
+}
+
+#[test]
+fn verb_file_import_dedups_a_diamond_dependency() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/diamond_entry.verb"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/diamond.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn verb_file_import_cycle_is_a_compile_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/cycle_a.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("import cycle"), "stderr: {stderr}");
+}
+
+#[test]
+fn verb_file_import_missing_file_is_a_clear_error() {
+    let dir = std::env::temp_dir().join("verb_missing_import_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("entry.verb");
+    std::fs::write(&entry, "import mod nope.verb;\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", entry.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nope.verb"), "stderr: {stderr}");
 }
 
 // ----- std io -----
