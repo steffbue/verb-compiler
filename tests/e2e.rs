@@ -951,3 +951,50 @@ fn integration_example_zero_leaks() {
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file("verb_integration_demo.tmp");
 }
+
+/// Compiles tests/fixtures/cpp/mathlib.cpp for a specific cross-compile
+/// target via `zig c++ -target <triple>` and archives the resulting object
+/// into a static `libmathlib.a` in a per-target directory (for `-L<dir>`).
+///
+/// A host-built libmathlib (see `build_mathlib_fixture`, which produces a
+/// host `.dylib`) cannot link into a foreign-target binary -- see the
+/// comment on `build_aot_cross` in src/main.rs. Each target needs its own
+/// libmathlib built with the same zig triple used for the program link.
+/// Callers must guard with `zig_available()` before invoking this.
+fn build_mathlib_for_target(label: &str, zig_triple: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("verb_e2e_cross_libs_{label}"));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let obj_path = dir.join("mathlib.o");
+    let compile = Command::new("zig")
+        .args([
+            "c++",
+            "-target", zig_triple,
+            "-std=c++17",
+            "-Iruntime",
+            "-c",
+            "tests/fixtures/cpp/mathlib.cpp",
+            "-o", obj_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to invoke zig c++ to cross-compile the mathlib test fixture");
+    assert!(
+        compile.status.success(),
+        "zig c++ failed to compile mathlib.cpp for target {label} ({zig_triple}): {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let lib_path = dir.join("libmathlib.a");
+    let archive = Command::new("zig")
+        .args(["ar", "rcs", lib_path.to_str().unwrap(), obj_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke zig ar to archive libmathlib.a");
+    assert!(
+        archive.status.success(),
+        "zig ar failed to archive libmathlib.a for target {label}: {}",
+        String::from_utf8_lossy(&archive.stderr)
+    );
+
+    let _ = std::fs::remove_file(&obj_path);
+    dir
+}
