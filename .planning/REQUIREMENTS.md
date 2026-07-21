@@ -105,7 +105,7 @@ Requirements for the current milestone. Each maps to a roadmap phase.
   `import std io`, `import std map`, and arrays compiles and runs correctly
   end-to-end via `verb build`, producing zero GC leaks (`verb_gc_live=0`)
 
-- [ ] **INTEG-02**: That same integration program (or an equivalent)
+- [x] **INTEG-02**: That same integration program (or an equivalent)
   cross-compiles successfully via `verb build --target all`, confirming
   imports/stdlib/arrays/maps/GC all function under every supported target's
   build path (excluding the documented Windows `std io` limitation)
@@ -180,7 +180,7 @@ Which phases cover which requirements.
 | TOOL-02 | Phase 7 | Complete |
 | HOUSEKEEP-01 | Phase 8 | Complete |
 | INTEG-01 | Phase 8 | Complete |
-| INTEG-02 | Phase 8 | Pending |
+| INTEG-02 | Phase 8 | Complete |
 
 **Coverage:**
 
