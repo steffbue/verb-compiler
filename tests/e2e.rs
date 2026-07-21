@@ -679,9 +679,21 @@ fn gc_stress_loop_leaks_nothing() { assert_no_leaks("gc_stress"); }
 
 #[test]
 fn gc_no_leaks_across_representative_programs() {
-    for fixture in ["strings", "functions", "control", "reassign_strings", "early_return_releases", "early_return_if_else_outer_var"] {
+    for fixture in ["strings", "functions", "control", "reassign_strings", "early_return_releases", "early_return_if_else_outer_var", "gc_and_or_strings", "gc_redeclare"] {
         assert_no_leaks(fixture);
     }
+}
+
+#[test]
+fn gc_short_circuit_and_or_discards_unchosen_operand_without_leaking() {
+    run_ok("gc_and_or_strings");
+    assert_no_leaks("gc_and_or_strings");
+}
+
+#[test]
+fn gc_redeclaring_a_name_in_the_same_scope_releases_the_orphaned_cell() {
+    run_ok("gc_redeclare");
+    assert_no_leaks("gc_redeclare");
 }
 
 #[test]

@@ -143,13 +143,16 @@ Concretely:
 Any C++ code that hands a heap string to Verb (`runtime/verb_std_io.cpp`'s
 `file_read` etc., and user `import mod` externs per
 `docs/superpowers/specs/2026-07-20-cpp-import-design.md`) must allocate
-that string through a new helper, `verb_alloc_string(const char*)` (wraps
-`verb_alloc` + copies bytes), instead of raw `malloc`/`strdup`. A string
-pointer without a valid header at `payload - 8` will corrupt memory the
-first time `verb_retain_value`/`verb_release_value` touches it. This
-needs a small update to `runtime/verb.h` (add `verb_alloc_string`) and
-`runtime/verb_std_io.cpp` (use it instead of `strdup`/raw `malloc`), plus
-a note in the import docs about the new contract for extern authors.
+that string through `verb_alloc(int64_t n)` itself — the same
+LLVM-module-defined allocator Verb's own codegen uses (declared `extern
+"C"` in `runtime/verb.h`, defined by `build_alloc_fn` in `src/codegen.rs`
+and linked in from the compiled module) — instead of raw `malloc`/`strdup`.
+A string pointer without a valid header at `payload - 8` will corrupt
+memory the first time `verb_retain_value`/`verb_release_value` touches
+it. This needs a small update to `runtime/verb.h` (declare `verb_alloc`)
+and `runtime/verb_std_io.cpp` (call it instead of `strdup`/raw `malloc`,
+copying bytes manually as before), plus a note in the import docs about
+the new contract for extern authors.
 
 ### Testing
 

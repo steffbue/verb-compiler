@@ -1,0 +1,6 @@
+assign a "x" join "1";
+assign b "y" join "2";
+assign c a and b;
+print(c);
+assign d a or b;
+print(d);

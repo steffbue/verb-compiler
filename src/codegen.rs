@@ -1031,13 +1031,17 @@ impl<'ctx> Codegen<'ctx> {
                 let v = self.gen_expr(value)?;
                 let cell = self.malloc_bytes(16);
                 self.builder.build_store(cell, v).unwrap();
-                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                if let Some(old_cell) = self.scopes.last_mut().unwrap().insert(name.clone(), cell) {
+                    self.call_named("verb_release_cell", &[old_cell.into()]);
+                }
                 Ok(())
             }
             Stmt::Declare { name } => {
                 let cell = self.malloc_bytes(16);
                 self.builder.build_store(cell, self.nil_val()).unwrap();
-                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                if let Some(old_cell) = self.scopes.last_mut().unwrap().insert(name.clone(), cell) {
+                    self.call_named("verb_release_cell", &[old_cell.into()]);
+                }
                 Ok(())
             }
             Stmt::Reassign { name, value, line, col } => {
@@ -1137,7 +1141,9 @@ impl<'ctx> Codegen<'ctx> {
                 let clos = self.make_closure(fnv, params.len());
                 let cell = self.malloc_bytes(16);
                 self.builder.build_store(cell, clos).unwrap();
-                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                if let Some(old_cell) = self.scopes.last_mut().unwrap().insert(name.clone(), cell) {
+                    self.call_named("verb_release_cell", &[old_cell.into()]);
+                }
 
                 let saved_bb = self.builder.get_insert_block().unwrap();
                 let saved_scopes = std::mem::take(&mut self.scopes);
@@ -1262,6 +1268,9 @@ impl<'ctx> Codegen<'ctx> {
             };
             self.builder.position_at_end(rhs_bb);
             let r = self.gen_expr(rhs)?;
+            // rhs_bb is only entered when `r` becomes the result instead of `l`,
+            // so the owned temporary `l` is being discarded here — release it.
+            self.call_named("verb_release_value", &[l.into()]);
             let rhs_end = self.builder.get_insert_block().unwrap();
             self.builder.build_unconditional_branch(merge).unwrap();
             self.builder.position_at_end(merge);

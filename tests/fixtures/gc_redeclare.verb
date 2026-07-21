@@ -1,0 +1,3 @@
+assign x "first" join "!";
+assign x "second" join "!";
+print(x);
