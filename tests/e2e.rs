@@ -378,18 +378,6 @@ fn build_with_l_flag_forwards_it_without_breaking_the_build() {
     let _ = std::fs::remove_file(&out_path);
 }
 
-#[test]
-fn run_rejects_programs_with_imports() {
-    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(["run", "tests/fixtures/import_extern_call.verb"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
-    assert!(stderr.contains("mathlib"), "stderr: {stderr}");
-}
-
 /// Compiles tests/fixtures/cpp/mathlib.cpp into a shared library once per
 /// test run and returns the directory it landed in (for `-L`).
 fn build_mathlib_fixture() -> std::path::PathBuf {
@@ -408,6 +396,35 @@ fn build_mathlib_fixture() -> std::path::PathBuf {
         .expect("failed to invoke c++ to build the mathlib test fixture");
     assert!(status.success(), "failed to compile tests/fixtures/cpp/mathlib.cpp");
     dir
+}
+
+#[test]
+fn run_executes_mod_import() {
+    let lib_dir = build_mathlib_fixture();
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "run",
+            "tests/fixtures/import_mathlib.verb",
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .env("DYLD_LIBRARY_PATH", &lib_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/import_mathlib.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn run_mod_import_missing_library_errors_clearly() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/import_mathlib.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("mathlib"), "stderr: {stderr}");
+    assert!(stderr.contains("verb build"), "stderr: {stderr}");
 }
 
 fn build_and_run_ok(name: &str, lib_dir: &std::path::Path) {

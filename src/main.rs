@@ -225,6 +225,34 @@ fn usage() -> ! {
     exit(2)
 }
 
+/// Resolves an `import mod <name>` to a shared library file for the JIT to
+/// dlopen. Searches each `-L<dir>` (prefix stripped) for `lib<name>.dylib`
+/// (macOS) / `lib<name>.so` (Linux); if none exists on disk, returns the bare
+/// filename so the OS loader can search its default paths. Static `.a`
+/// archives are intentionally unsupported under `verb run` — use `verb build`.
+fn resolve_mod_lib(name: &str, lib_dirs: &[String]) -> Result<PathBuf, String> {
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let filename = format!("lib{name}.{ext}");
+    let dirs: Vec<&str> = lib_dirs.iter().map(|d| d.trim_start_matches("-L")).collect();
+    for dir in &dirs {
+        let candidate = PathBuf::from(dir).join(&filename);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Fall back to the bare name only if the loader can find it on its default
+    // search path; otherwise report a clear error naming the searched dirs.
+    let bare = PathBuf::from(&filename);
+    if inkwell::support::load_library_permanently(&bare).is_ok() {
+        return Ok(bare);
+    }
+    Err(format!(
+        "cannot find shared library for 'import mod {name}' ({filename}); searched: [{}]. \
+         'verb run' can only load shared libraries — use 'verb build' for static linking.",
+        dirs.join(", ")
+    ))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let parsed = parse_cli(&args).unwrap_or_else(|| usage());
@@ -275,6 +303,20 @@ fn main() {
                     eprintln!("JIT error: {e}");
                     exit(1);
                 });
+            // Make the host process's own symbols searchable by MCJIT, then
+            // dlopen each `import mod` shared library so its symbols resolve
+            // during module finalization.
+            inkwell::support::load_visible_symbols();
+            for lib in &imports {
+                let path = resolve_mod_lib(lib, &parsed.lib_dirs).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    exit(1);
+                });
+                if inkwell::support::load_library_permanently(&path).is_err() {
+                    eprintln!("error: failed to load shared library {}", path.display());
+                    exit(1);
+                }
+            }
             // Map/io entry points must be wired before the module is finalized
             // (finalization happens on the first get_function_address below).
             register_jit_runtime_symbols(&ee, cg.module());
@@ -587,5 +629,25 @@ mod tests {
     #[test]
     fn rejects_no_command() {
         assert!(parse_cli(&args(&["verb"])).is_none());
+    }
+
+    #[test]
+    fn resolve_mod_lib_finds_shared_lib_in_l_dir() {
+        let dir = std::env::temp_dir().join(format!("verb_resolve_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+        let lib = dir.join(format!("libwidget.{ext}"));
+        std::fs::write(&lib, b"").unwrap();
+
+        let found = resolve_mod_lib("widget", &[format!("-L{}", dir.display())]).unwrap();
+        assert_eq!(found, lib);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_mod_lib_missing_reports_name_and_dirs() {
+        let err = resolve_mod_lib("nope", &["-L/does/not/exist".to_string()]).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(err.contains("/does/not/exist"), "{err}");
     }
 }
