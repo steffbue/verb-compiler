@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::{exit, Command};
 
 use verb::codegen;
+use verb::debugger;
 use verb::error::CompileError;
 use verb::lexer;
 use verb::parser;
@@ -101,6 +102,7 @@ fn die(e: CompileError, sources: &[(String, String)]) -> ! {
 
 fn usage() -> ! {
     eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
+    eprintln!("       verb debug <file.verb>");
     eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]");
     eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]  (alias for build)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
@@ -142,6 +144,9 @@ fn main() {
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
+    if parsed.cmd == "debug" {
+        cg.enable_debug_hooks();
+    }
     cg.compile_program(&stmts, &stmt_files, &imports, &std_imports).unwrap_or_else(|e| die(e, &sources));
 
     if parsed.emit_llvm {
@@ -166,6 +171,48 @@ fn main() {
                     eprintln!("JIT error: {e}");
                     exit(1);
                 });
+            unsafe {
+                let main_fn = ee
+                    .get_function::<unsafe extern "C" fn() -> i32>("main")
+                    .expect("no main");
+                exit(main_fn.call());
+            }
+        }
+        "debug" => {
+            if !imports.is_empty() || !std_imports.is_empty() {
+                let mut names = imports.clone();
+                names.extend(std_imports.iter().map(|m| format!("std {m}")));
+                eprintln!(
+                    "error: 'verb debug' does not support imports ({}); use 'verb build' instead",
+                    names.join(", ")
+                );
+                exit(1);
+            }
+            let ee = cg
+                .module()
+                .create_jit_execution_engine(inkwell::OptimizationLevel::None)
+                .unwrap_or_else(|e| {
+                    eprintln!("JIT error: {e}");
+                    exit(1);
+                });
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_checkpoint").unwrap(),
+                debugger::verb_debug_checkpoint as *const () as usize,
+            );
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_push_frame").unwrap(),
+                debugger::verb_debug_push_frame as *const () as usize,
+            );
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_pop_frame").unwrap(),
+                debugger::verb_debug_pop_frame as *const () as usize,
+            );
+            let print_value_addr = ee.get_function_address("verb_print_value").unwrap_or_else(|e| {
+                eprintln!("JIT error resolving verb_print_value: {e}");
+                exit(1);
+            });
+            debugger::set_print_value_fn(print_value_addr);
+            debugger::run_pre_start_console();
             unsafe {
                 let main_fn = ee
                     .get_function::<unsafe extern "C" fn() -> i32>("main")
@@ -467,5 +514,12 @@ mod tests {
     #[test]
     fn rejects_no_command() {
         assert!(parse_cli(&args(&["verb"])).is_none());
+    }
+
+    #[test]
+    fn parses_debug_command() {
+        let p = parse_cli(&args(&["verb", "debug", "a.verb"])).unwrap();
+        assert_eq!(p.cmd, "debug");
+        assert_eq!(p.files, vec!["a.verb".to_string()]);
     }
 }

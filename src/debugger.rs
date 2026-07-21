@@ -239,6 +239,23 @@ pub fn set_print_value_fn(addr: usize) {
     PRINT_VALUE_FN.with(|f| *f.borrow_mut() = addr);
 }
 
+extern "C" {
+    fn fflush(stream: *mut std::ffi::c_void) -> i32;
+}
+
+/// Flushes libc's stdout buffer (a NULL argument flushes every open
+/// stream). The JIT-compiled program prints through libc `printf`, a
+/// completely separate buffer from Rust's `io::stdout()` -- when stdout
+/// isn't a TTY (e.g. piped, as in tests), libc block-buffers instead of
+/// line-buffering, so without an explicit flush at the right points the
+/// two buffers interleave out of order (a debugger message can appear
+/// before or after program output that actually ran earlier/later).
+fn flush_libc_stdout() {
+    unsafe {
+        fflush(std::ptr::null_mut());
+    }
+}
+
 fn call_print_value(v: RawVerbValue) {
     let addr = PRINT_VALUE_FN.with(|f| *f.borrow());
     if addr == 0 {
@@ -247,6 +264,7 @@ fn call_print_value(v: RawVerbValue) {
     }
     let f: extern "C" fn(RawVerbValue) = unsafe { std::mem::transmute(addr) };
     f(v);
+    flush_libc_stdout();
     println!();
 }
 
@@ -349,6 +367,10 @@ pub unsafe extern "C" fn verb_debug_checkpoint(line: u32, vars: *const DebugVar,
     if !stop {
         return;
     }
+    // Flush any pending libc-buffered output from statements that already
+    // ran (e.g. a `print(...)` just before this line) so it appears before
+    // this message, not after -- see `flush_libc_stdout`.
+    flush_libc_stdout();
     println!("stopped at line {line}");
     let slice = if vars.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(vars, n_vars) } };
     run_console(Some(slice));

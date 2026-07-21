@@ -1213,8 +1213,16 @@ impl<'ctx> Codegen<'ctx> {
         if !self.debug_hooks {
             return;
         }
-        let vars: Vec<(&String, &PointerValue<'ctx>)> =
-            self.scopes.iter().flat_map(|s| s.iter()).collect();
+        // Innermost scope first (so a shadowing local wins over an outer
+        // one, matching `lookup`'s own precedence), then globals -- a
+        // bare top-level `assign x 1;` outside any function/block binds
+        // through `bind`'s `self.scopes.is_empty()` branch straight into
+        // `self.globals`, so omitting globals here would make the most
+        // common flat-script case invisible to `print`.
+        let vars: Vec<(&String, &PointerValue<'ctx>)> = self.scopes.iter().rev()
+            .flat_map(|s| s.iter())
+            .chain(self.globals.iter())
+            .collect();
         let n = vars.len();
         let arr_ty = self.debugvar_ty.array_type(n as u32);
         let arr = self.entry_alloca(arr_ty.into(), "dbgvars");
