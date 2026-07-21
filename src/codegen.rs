@@ -43,6 +43,8 @@ impl<'ctx> Codegen<'ctx> {
             cur_file: String::new(),
         };
         cg.declare_libc();
+        cg.declare_gc_globals();
+        cg.build_alloc_fn();
         cg.build_type_name_fn();
         cg.build_print_fn();
         cg.build_truthy_fn();
@@ -68,6 +70,22 @@ impl<'ctx> Codegen<'ctx> {
         self.module.add_function("strcpy", pt.fn_type(&[pt.into(), pt.into()], false), None);
         self.module.add_function("strcat", pt.fn_type(&[pt.into(), pt.into()], false), None);
         self.module.add_function("strcmp", i32t.fn_type(&[pt.into(), pt.into()], false), None);
+        self.module.add_function("free", self.ctx.void_type().fn_type(&[pt.into()], false), None);
+        self.module.add_function("getenv", pt.fn_type(&[pt.into()], false), None);
+    }
+
+    fn declare_gc_globals(&self) {
+        let i64t = self.ctx.i64_type();
+        let g = self.module.add_global(i64t, None, "verb_gc_live");
+        g.set_initializer(&i64t.const_zero());
+    }
+
+    fn inc_live_counter(&self) {
+        let i64t = self.ctx.i64_type();
+        let g = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
+        let cur = self.builder.build_load(i64t, g, "gc_live").unwrap().into_int_value();
+        let next = self.builder.build_int_add(cur, i64t.const_int(1, false), "gc_live1").unwrap();
+        self.builder.build_store(g, next).unwrap();
     }
 
     // ----- value helpers -----
@@ -145,8 +163,33 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_switch(tag, default_bb, &cases).unwrap();
     }
 
+    /// Runtime helper: verb_alloc(i64 n) -> ptr. Wraps `malloc` with an
+    /// 8-byte refcount header (initialized to 1) prefixed to every heap
+    /// block Verb owns; the returned pointer is the payload -- the header
+    /// lives at payload-8. String literals get the same header shape
+    /// baked into their LLVM global (see `static_string_ptr`, Task 2) so
+    /// retain/release never need to know statically whether a given
+    /// string pointer is heap or static.
+    fn build_alloc_fn(&self) {
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ptr_ty.fn_type(&[i64t.into()], false);
+        let f = self.module.add_function("verb_alloc", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let n = f.get_nth_param(0).unwrap().into_int_value();
+        let total = self.builder.build_int_add(n, i64t.const_int(8, false), "total").unwrap();
+        let raw = self.call_named("malloc", &[total.into()]).unwrap().into_pointer_value();
+        self.builder.build_store(raw, i64t.const_int(1, false)).unwrap();
+        let payload = unsafe {
+            self.builder.build_in_bounds_gep(
+                self.ctx.i8_type(), raw, &[i64t.const_int(8, false)], "payload")
+        }.unwrap();
+        self.inc_live_counter();
+        self.builder.build_return(Some(&payload)).unwrap();
+    }
+
     fn malloc_bytes(&self, n: u64) -> PointerValue<'ctx> {
-        self.call_named("malloc", &[self.ctx.i64_type().const_int(n, false).into()])
+        self.call_named("verb_alloc", &[self.ctx.i64_type().const_int(n, false).into()])
             .unwrap().into_pointer_value()
     }
 
@@ -508,7 +551,7 @@ impl<'ctx> Codegen<'ctx> {
         let lb = self.call_named("strlen", &[sb.into()]).unwrap().into_int_value();
         let sum = self.builder.build_int_add(la, lb, "sum").unwrap();
         let size = self.builder.build_int_add(sum, self.ctx.i64_type().const_int(1, false), "sz").unwrap();
-        let buf = self.call_named("malloc", &[size.into()]).unwrap().into_pointer_value();
+        let buf = self.call_named("verb_alloc", &[size.into()]).unwrap().into_pointer_value();
         self.call_named("strcpy", &[buf.into(), sa.into()]);
         self.call_named("strcat", &[buf.into(), sb.into()]);
         let bits = self.builder.build_ptr_to_int(buf, self.ctx.i64_type(), "bits").unwrap();

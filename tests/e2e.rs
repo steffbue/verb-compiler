@@ -146,6 +146,16 @@ fn emits_llvm_ir() {
     assert!(ir.contains("define i32 @main"), "no main in IR: {ir}");
 }
 
+#[test]
+fn verb_alloc_is_emitted() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/strings.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("define ptr @verb_alloc"), "no verb_alloc in IR:\n{ir}");
+}
+
 // ----- C++ import / extern (from cpp-import) -----
 
 #[test]
