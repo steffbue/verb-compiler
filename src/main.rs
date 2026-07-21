@@ -8,6 +8,73 @@ use verb::lexer;
 use verb::parser;
 use verb::targets;
 
+// --- JIT runtime symbol resolution -----------------------------------------
+//
+// `src/codegen.rs` emits `verb_release_value` into *every* module, and its
+// map branch calls `verb_map_destroy_contents` (defined in
+// `runtime/verb_map.cpp`). There is no dead-code stripping anywhere in this
+// pipeline, so that reference is always live — even in a program that never
+// touches maps. For AOT builds we always link `runtime/verb_map.cpp` (below);
+// for the JIT `run` path we compile that unit into this binary (see build.rs)
+// and hand its address to MCJIT via `add_global_mapping` in
+// `register_jit_runtime_symbols`. Add future
+// always-referenced-but-conditionally-defined runtime symbols the same way:
+// list the `.cpp` in build.rs, and add a tuple to `register_jit_runtime_symbols`.
+
+// C++ ABI mirror of `VerbValue` (`{ i8, i64 }`) — see runtime/verb.h. Only
+// used to give the host stubs below a matching signature; never populated.
+#[repr(C)]
+pub struct VerbValueAbi {
+    pub tag: i8,
+    pub payload: i64,
+}
+
+extern "C" {
+    /// Defined in `runtime/verb_map.cpp`, compiled into this binary by build.rs.
+    fn verb_map_destroy_contents(payload: *mut std::ffi::c_void);
+}
+
+// `runtime/verb_map.cpp` (linked into this binary) references these three
+// symbols, but they are emitted into each *JIT module* by codegen, not the
+// host — so the host linker has nothing to resolve them against. These
+// definitions satisfy the link. They are never reached at runtime under
+// `verb run`, which rejects imports (so no map value can exist, so
+// `verb_map_destroy_contents` — the only host code that would call them —
+// never runs). They abort loudly rather than silently corrupt state if that
+// invariant is ever broken.
+#[no_mangle]
+pub extern "C" fn verb_alloc(_n: i64) -> *mut std::ffi::c_void {
+    eprintln!("internal error: host verb_alloc stub called (verb run cannot use maps)");
+    std::process::abort();
+}
+#[no_mangle]
+pub extern "C" fn verb_retain_value(_v: VerbValueAbi) {
+    eprintln!("internal error: host verb_retain_value stub called (verb run cannot use maps)");
+    std::process::abort();
+}
+#[no_mangle]
+pub extern "C" fn verb_release_value(_v: VerbValueAbi) {
+    eprintln!("internal error: host verb_release_value stub called (verb run cannot use maps)");
+    std::process::abort();
+}
+
+/// Registers runtime symbols that codegen references unconditionally but whose
+/// definitions live in C++ runtime units compiled into this binary, so MCJIT
+/// can resolve the reference for every `run` — including programs that never
+/// exercise the symbol. Extend the array to add more such symbols.
+fn register_jit_runtime_symbols<'ctx>(
+    ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
+    module: &inkwell::module::Module<'ctx>,
+) {
+    let symbols: [(&str, usize); 1] =
+        [("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize)];
+    for (name, addr) in symbols {
+        if let Some(f) = module.get_function(name) {
+            ee.add_global_mapping(&f, addr);
+        }
+    }
+}
+
 fn check_zig_available() {
     let ok = std::process::Command::new("zig")
         .arg("version")
@@ -171,6 +238,7 @@ fn main() {
                     eprintln!("JIT error: {e}");
                     exit(1);
                 });
+            register_jit_runtime_symbols(&ee, cg.module());
             unsafe {
                 let main_fn = ee
                     .get_function::<unsafe extern "C" fn() -> i32>("main")
@@ -306,8 +374,12 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
-    let wants_map = std_imports.iter().any(|m| m == "map");
-    let linker = if imports.is_empty() && !wants_std_io && !wants_map { "cc" } else { "c++" };
+    // `runtime/verb_map.cpp` is now linked into every build, not just ones that
+    // `import std map`: codegen's `verb_release_value` references
+    // `verb_map_destroy_contents` unconditionally and nothing strips it. Since a
+    // C++ translation unit's symbol is now always present, the link must always
+    // go through the C++ driver — the old "cc when no imports" fast path is gone.
+    let linker = "c++";
 
     let std_io_obj = if wants_std_io {
         Some(compile_std_io_obj(linker, &[]).unwrap_or_else(|e| {
@@ -318,25 +390,19 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     } else {
         None
     };
-    let map_obj = if wants_map {
-        Some(compile_map_obj(linker, &[]).unwrap_or_else(|e| {
-            let _ = std::fs::remove_file(&obj);
-            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
-            eprintln!("error: {e}");
-            exit(1);
-        }))
-    } else {
-        None
-    };
+    let map_obj = compile_map_obj(linker, &[]).unwrap_or_else(|e| {
+        let _ = std::fs::remove_file(&obj);
+        if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+        eprintln!("error: {e}");
+        exit(1);
+    });
 
     let mut cmd = Command::new(linker);
     cmd.arg(&obj).arg("-o").arg(out);
     if let Some(p) = &std_io_obj {
         cmd.arg(p);
     }
-    if let Some(p) = &map_obj {
-        cmd.arg(p);
-    }
+    cmd.arg(&map_obj);
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -348,14 +414,14 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         Err(e) => {
             let _ = std::fs::remove_file(&obj);
             if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
-            if let Some(p) = &map_obj { let _ = std::fs::remove_file(p); }
+            let _ = std::fs::remove_file(&map_obj);
             eprintln!("error: failed to run linker '{linker}': {e}");
             exit(1);
         }
     };
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
-    if let Some(p) = &map_obj { let _ = std::fs::remove_file(p); }
+    let _ = std::fs::remove_file(&map_obj);
     if !status.success() {
         eprintln!("link failed");
         exit(1);
@@ -375,7 +441,6 @@ fn build_aot_cross(
     };
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
-    let wants_map = std_imports.iter().any(|m| m == "map");
     if wants_std_io && target.is_windows() {
         return Err(
             "'import std io' is not supported when cross-compiling to a Windows target in v1 \
@@ -406,24 +471,21 @@ fn build_aot_cross(
     } else {
         None
     };
-    let map_obj = if wants_map {
-        Some(compile_map_obj("zig", &["c++", "-target", target.zig_triple()])?)
-    } else {
-        None
-    };
+    // Always linked now — see build_aot_host for why verb_map.cpp is unconditional.
+    let map_obj = compile_map_obj("zig", &["c++", "-target", target.zig_triple()])?;
 
-    // Imports/lib_dirs are forwarded to zig cc/c++ so cross-linking works when the imported
+    // Imports/lib_dirs are forwarded to zig c++ so cross-linking works when the imported
     // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
     // fixtures won't link for a foreign target — that requires target-built libraries.
-    let linker_subcmd = if imports.is_empty() && !wants_std_io && !wants_map { "cc" } else { "c++" };
+    // The link always goes through `zig c++` now that a C++ unit (verb_map.cpp) is
+    // always present; the old "cc when no imports" fast path is gone.
+    let linker_subcmd = "c++";
     let mut cmd = Command::new("zig");
     cmd.args([linker_subcmd, "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()]);
     if let Some(p) = &std_io_obj {
         cmd.arg(p);
     }
-    if let Some(p) = &map_obj {
-        cmd.arg(p);
-    }
+    cmd.arg(&map_obj);
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -433,7 +495,7 @@ fn build_aot_cross(
     let status = cmd.status().map_err(|e| format!("zig failed to start: {e}"))?;
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
-    if let Some(p) = &map_obj { let _ = std::fs::remove_file(p); }
+    let _ = std::fs::remove_file(&map_obj);
     if !status.success() {
         return Err("link failed".to_string());
     }

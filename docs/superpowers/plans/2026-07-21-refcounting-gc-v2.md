@@ -1565,6 +1565,23 @@ change to:
 
 - [ ] **Step 3: Free the old `elems` buffer on `push`'s grow path**
 
+**Correction (found during Task 4's review — the exact same bug existed
+in `build_release_value_fn`'s array-free path and was fixed there;
+apply the same two corrections here):** `elems` is itself a
+`malloc_bytes`/`verb_alloc` *payload* pointer (its actual malloc'd
+address is `header_ptr(elems)`, i.e. `elems - 8`) — freeing `elems`
+directly corrupts the heap. And since it was originally allocated via
+`verb_alloc` (incrementing `verb_gc_live`), freeing it must be paired
+with a `dec_live_counter()` call, or the counter never balances back to
+zero for any program that triggers a `push` regrowth. Both fixes are
+guarded by the same null check: an array literal with `n == 0` has
+`elems == null` (never routed through `verb_alloc` at all — see
+`Expr::ArrayLit`), and `header_ptr(null)` is a garbage pointer, not
+null — calling `free()` on it would be undefined behavior, so the null
+case must be skipped entirely, not just relied on `free(NULL)` being a
+no-op (that reasoning only held for the old, incorrect direct-free
+version).
+
 Find (inside `build_array_push_fn`):
 ```rust
         self.builder.position_at_end(cp_end);
@@ -1575,7 +1592,19 @@ Find (inside `build_array_push_fn`):
 change to:
 ```rust
         self.builder.position_at_end(cp_end);
-        self.call_named("free", &[elems.into()]);
+        let old_elems_addr = self.builder.build_ptr_to_int(elems, i64t, "old_elems_addr").unwrap();
+        let old_elems_null = self.builder.build_int_compare(
+            EQ, old_elems_addr, i64t.const_zero(), "old_elems_null").unwrap();
+        let free_old_bb = self.ctx.append_basic_block(f, "free_old_elems");
+        let skip_free_old_bb = self.ctx.append_basic_block(f, "skip_free_old_elems");
+        self.builder.build_conditional_branch(old_elems_null, skip_free_old_bb, free_old_bb).unwrap();
+
+        self.builder.position_at_end(free_old_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[self.header_ptr(elems).into()]);
+        self.builder.build_unconditional_branch(skip_free_old_bb).unwrap();
+
+        self.builder.position_at_end(skip_free_old_bb);
         self.builder.build_store(capp, new_cap).unwrap();
         self.builder.build_store(elemsp, new_elems).unwrap();
         self.builder.build_unconditional_branch(after_grow_bb).unwrap();
@@ -1583,18 +1612,14 @@ change to:
 (`elems` here is the *old* buffer, already loaded earlier in `grow_bb`
 via `let elems = self.builder.build_load(self.ptr_ty, elemsp,
 "elems")...`, and every element has already been copied into
-`new_elems` by the loop just above this point. This is a plain `free`,
-not `verb_release_cell`/`verb_release_value` — `elems` was never
-independently refcounted; it's owned outright by the array header, and
-Task 2's `TAG_ARRAY` release path already frees whatever the *current*
-`elems` pointer is when the header itself is freed. This closes the
-pre-existing leak where every reallocation on `push` leaked the prior
-buffer. `n == 0` initial arrays have `elems == null` per the array
-literal codegen, and growing FROM an empty array only reaches this path
-when `cap > 0` already — the very first grow (`cap == 0 -> 1`) also
-takes this path since `elems` is `null` in that case, and `free(NULL)`
-is always a safe no-op per the C standard, so no special-casing for the
-zero-capacity case is needed.)
+`new_elems` by the loop just above this point. This is a plain `free`
+of the old buffer's real malloc'd address, not
+`verb_release_cell`/`verb_release_value` — `elems` was never
+independently refcounted as a *value*; it's owned outright by the array
+header, and Task 2's `TAG_ARRAY` release path already frees whatever
+the *current* `elems` pointer is when the header itself is freed, the
+same way. This closes the pre-existing leak where every reallocation on
+`push` leaked the prior buffer, and keeps `verb_gc_live` balanced.)
 
 - [ ] **Step 4: Release array-builtin operands at their `gen_call` sites**
 
@@ -1796,9 +1821,15 @@ running the fixture first:
 Create `tests/fixtures/gc_arrays_regrow.verb` (the array's own buffer
 reallocates on every capacity doubling regardless of what's stored in
 it, so plain ints are enough to exercise the Step 3 grow-path fix — no
-need for heap-allocated elements here):
+need for heap-allocated elements here).
+
+**Correction (found during implementation):** the grammar has no
+zero-element list literal — `list;` doesn't parse. Seed the array with
+one throwaway element and `pop` it back off before the loop instead;
+output is unaffected and the regrowth path is exercised identically:
 ```
-assign a list;
+assign a list 0;
+pop(a);
 loop assign i 0; i trails 50; i be i add 1 begin
   push(a, i);
 end
@@ -1913,7 +1944,21 @@ placement-`new` constructs the `unordered_map` in that memory. This
 needs `#include <new>` for placement-new — add that include alongside
 `<cstring>`/`<unordered_map>` at the top of the file.)
 
-- [ ] **Step 3: Retain the aliased/duplicated return values in `map_set` and `map_get`**
+- [ ] **Step 3: Release the old value on overwrite, and retain the aliased/duplicated return/stored values, in `map_set` and `map_get`**
+
+**Correction (found during implementation, by Task 3's developer, when
+the generic argument-release convention from Task 3 Step 8 exposed it):**
+`map_set` doesn't just alias `m` into its return value — it also
+*stores* `v` permanently into the map, a second home for that
+argument's reference that the generic `gen_std_io_call` argument-release
+convention (Task 3 Step 8) has no way to know about; it releases every
+argument uniformly after the call, on the (normally correct) assumption
+that the callee only reads them. `map_set` is the exception: it takes
+ownership of `v`, so it must retain `v` itself to compensate, the same
+way it already retains `m`. Separately: overwriting an existing key's
+value with `(*impl)[k] = v` previously discarded the old value with no
+release — the same orphan-leak class already fixed for cell/global
+reassignment.
 
 Find:
 ```cpp
@@ -1937,7 +1982,22 @@ change to:
 extern "C" VerbValue map_set(VerbValue m, VerbValue k, VerbValue v) {
     VerbMapImpl* impl = as_impl(m);
     if (!impl || !is_valid_key(k)) return verb_nil();
+    auto it = impl->find(k);
+    if (it != impl->end()) {
+        // Overwriting an existing key would otherwise silently orphan
+        // its old value -- the same leak class as reassigning a cell or
+        // global without releasing the old value first.
+        verb_release_value(it->second);
+    }
     (*impl)[k] = v;
+    // `v` is now owned by the map (a second home for the caller's
+    // argument), but the generic std-io/std-map argument-release
+    // convention will still release the caller's `v` temporary right
+    // after this call returns -- it has no way to know this particular
+    // function took ownership instead of just reading it. One retain
+    // covers that second home, mirroring `m`'s retain below for the
+    // same reason (aliased into the return value).
+    verb_retain_value(v);
     // `m` is about to be released once (by the generic std-io/std-map
     // argument-release convention) and returned once -- two homes for
     // one incoming reference now need one retain to cover the second.

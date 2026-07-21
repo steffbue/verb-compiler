@@ -18,7 +18,17 @@
 #include "verb.h"
 
 #include <cstring>
+#include <new>
 #include <unordered_map>
+
+// Defined by Verb's own generated LLVM module (src/codegen.rs). GC
+// contract: any heap value this file allocates must go through
+// verb_alloc, not new/malloc; any VerbValue this file duplicates into a
+// second live home (stored in the map AND handed back to the caller, or
+// read out of the map as an independent copy) must be retained first.
+extern "C" void* verb_alloc(int64_t n);
+extern "C" void verb_retain_value(VerbValue v);
+extern "C" void verb_release_value(VerbValue v);
 
 namespace {
 
@@ -68,13 +78,34 @@ VerbMapImpl* as_impl(VerbValue m) {
 } // namespace
 
 extern "C" VerbValue map_new() {
-    return verb_map(new VerbMapImpl());
+    void* mem = verb_alloc(sizeof(VerbMapImpl));
+    new (mem) VerbMapImpl();
+    return verb_map(mem);
 }
 
 extern "C" VerbValue map_set(VerbValue m, VerbValue k, VerbValue v) {
     VerbMapImpl* impl = as_impl(m);
     if (!impl || !is_valid_key(k)) return verb_nil();
+    auto it = impl->find(k);
+    if (it != impl->end()) {
+        // Overwriting an existing key would otherwise silently orphan
+        // its old value -- the same leak class as reassigning a cell or
+        // global without releasing the old value first.
+        verb_release_value(it->second);
+    }
     (*impl)[k] = v;
+    // `v` is now owned by the map (a second home for the caller's
+    // argument), but the generic std-io/std-map argument-release
+    // convention will still release the caller's `v` temporary right
+    // after this call returns -- it has no way to know this particular
+    // function took ownership instead of just reading it. One retain
+    // covers that second home, mirroring `m`'s retain below for the
+    // same reason (aliased into the return value).
+    verb_retain_value(v);
+    // `m` is about to be released once (by the generic std-io/std-map
+    // argument-release convention) and returned once -- two homes for
+    // one incoming reference now need one retain to cover the second.
+    verb_retain_value(m);
     return m;
 }
 
@@ -83,6 +114,9 @@ extern "C" VerbValue map_get(VerbValue m, VerbValue k) {
     if (!impl || !is_valid_key(k)) return verb_nil();
     auto it = impl->find(k);
     if (it == impl->end()) return verb_nil();
+    // The map keeps its own stored copy; retain before handing back an
+    // independent one, mirroring array `get`.
+    verb_retain_value(it->second);
     return it->second;
 }
 
@@ -102,4 +136,22 @@ extern "C" VerbValue map_len(VerbValue m) {
     VerbMapImpl* impl = as_impl(m);
     if (!impl) return verb_int(0);
     return verb_int(static_cast<int64_t>(impl->size()));
+}
+
+// Called by the LLVM-defined verb_release_value (src/codegen.rs) when a
+// map's refcount hits zero, before the map's header is freed. Cascades
+// into every stored key/value (releasing any heap-owned string/closure/
+// array/map they hold), then explicitly runs the destructor -- required
+// because map_new used placement-new, not `new`, so `delete` here would
+// be undefined behavior (it would call operator delete on memory that
+// wasn't allocated by operator new). The header's actual `free()` happens
+// back in verb_release_value, once, the same place every heap kind's
+// header gets freed.
+extern "C" void verb_map_destroy_contents(void* payload) {
+    auto* impl = static_cast<VerbMapImpl*>(payload);
+    for (auto& [k, v] : *impl) {
+        verb_release_value(k);
+        verb_release_value(v);
+    }
+    impl->~VerbMapImpl();
 }

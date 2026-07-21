@@ -43,6 +43,30 @@ fn run_err(name: &str, msg: &str) {
     );
 }
 
+/// Builds `fixture`, runs it with `VERB_GC_DEBUG=1`, and asserts the
+/// binary reports `verb_gc_live=0` at exit -- i.e. every heap-owned value
+/// (string, closure, array, map, cell) the program allocated was released
+/// by the time it exits. Does not check the program's own stdout/output
+/// beyond locating the `verb_gc_live=` line -- callers that also care
+/// about output correctness should use `run_ok` separately or inline
+/// their own check.
+fn assert_no_leaks(fixture: &str) {
+    let out_path = std::env::temp_dir().join(format!("verb_test_gc_v2_{fixture}"));
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", &format!("tests/fixtures/{fixture}.verb"), "-o", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{fixture}: build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).env("VERB_GC_DEBUG", "1").output().unwrap();
+    assert!(run.status.success(), "{fixture}: run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("{fixture}: no verb_gc_live line in stdout:\n{stdout}"));
+    assert_eq!(live_line, "verb_gc_live=0", "{fixture}: leaked heap objects:\n{stdout}");
+    let _ = std::fs::remove_file(&out_path);
+}
+
 #[test]
 fn literals() { run_ok("literals"); }
 
@@ -93,6 +117,15 @@ fn array_of_arrays() { run_ok("arrays_of_arrays"); }
 
 #[test]
 fn array_of_closures() { run_ok("arrays_of_closures"); }
+
+#[test]
+fn nested_arrays_retain_and_release_correctly() { run_ok("gc_arrays_nested"); }
+
+#[test]
+fn arrays_of_closures_retain_and_release_correctly() { run_ok("gc_arrays_of_closures"); }
+
+#[test]
+fn array_push_regrowth_frees_old_buffers() { run_ok("gc_arrays_regrow"); }
 
 #[test]
 fn array_literal_emits_malloc_and_store_in_ir() {
@@ -240,6 +273,20 @@ fn string_literals_carry_a_static_gc_sentinel_header() {
     assert!(ir.contains("-9223372036854775808"), "no GC static sentinel in IR:\n{ir}");
     assert!(ir.contains("private unnamed_addr constant { i64,"),
         "string literal global isn't private/unnamed_addr:\n{ir}");
+}
+
+#[test]
+fn gc_retain_release_functions_are_emitted() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/strings.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    for sym in ["@verb_retain_value", "@verb_release_value", "@verb_retain_cell", "@verb_release_cell"] {
+        assert!(ir.contains(sym), "missing {sym} in IR:\n{ir}");
+    }
+    assert!(ir.contains("declare void @verb_map_destroy_contents"),
+        "verb_map_destroy_contents not declared:\n{ir}");
 }
 
 // ----- C++ import / extern (from cpp-import) -----
@@ -628,6 +675,34 @@ fn build_links_and_runs_a_program_using_std_io_files() {
 }
 
 #[test]
+fn std_io_file_roundtrip_allocates_through_verb_alloc() {
+    // Mirrors build_links_and_runs_a_program_using_std_io_files, but under
+    // its own fixture + temp-file path (verb_e2e_gc_v2_roundtrip.tmp) so
+    // this doesn't race the other std-io file-roundtrip test over the same
+    // hardcoded path under cargo test's default parallelism. Exercises the
+    // verb_alloc-backed file_read/file_write/file_append path so that any
+    // retain/release GC touches this string without corrupting memory.
+    let _ = std::fs::remove_file("verb_e2e_gc_v2_roundtrip.tmp");
+    let out_path = std::env::temp_dir().join("verb_e2e_gc_std_io_file_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/gc_std_io_file_roundtrip.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/gc_std_io_file_roundtrip.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file("verb_e2e_gc_v2_roundtrip.tmp");
+}
+
+#[test]
 fn cross_build_links_a_program_using_std_io_for_a_non_host_non_windows_target() {
     if !zig_available() {
         eprintln!("skipping: zig not on PATH");
@@ -735,6 +810,26 @@ fn build_links_and_runs_a_program_using_std_map() {
 }
 
 #[test]
+fn map_with_heap_valued_entries_retains_and_releases_correctly() {
+    let out_path = std::env::temp_dir().join("verb_e2e_gc_map_heap_values_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/gc_map_heap_values.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/gc_map_heap_values.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
 fn cross_build_links_a_program_using_std_map_for_a_non_host_target() {
     if !zig_available() {
         eprintln!("skipping: zig not on PATH");
@@ -825,4 +920,60 @@ fn debug_quit_mid_session_exits_cleanly() {
     let prog = "assign x 1;\nprint(x);\n";
     let out = run_debug_session(prog, "break 1\nrun\nquit\n");
     assert!(out.contains("stopped at line 1"), "{out}");
+}
+
+#[test]
+fn reassign_and_short_circuit_release_correctly() { run_ok("gc_reassign_and_or"); }
+
+#[test]
+fn global_reassignment_releases_previous_value() { run_ok("gc_global_reassign"); }
+
+#[test]
+fn early_return_from_nested_loop_and_if_else_leaves_scopes_intact() { run_ok("gc_early_return_nested"); }
+
+#[test]
+fn gc_no_leaks_across_all_heap_kinds() {
+    for fixture in [
+        "strings", "closures", "arrays_literal", "arrays_get_set", "arrays_push_pop",
+        "arrays_of_arrays", "arrays_of_closures", "std_map_basic",
+        "gc_reassign_and_or", "gc_global_reassign", "gc_early_return_nested",
+        "gc_arrays_nested", "gc_arrays_of_closures", "gc_arrays_regrow",
+        "gc_map_heap_values", "gc_std_io_file_roundtrip",
+    ] {
+        assert_no_leaks(fixture);
+    }
+}
+
+#[test]
+fn gc_stress_all_kinds_leaks_nothing() { assert_no_leaks("gc_stress_all_kinds"); }
+
+#[test]
+fn gc_cyclic_array_leak_is_confined_not_corrupting() {
+    // A self-referential array cannot be reclaimed by pure refcounting --
+    // this is a known, accepted limitation (see the design spec's "cycle
+    // limitation" section), resolved by a separate follow-up sub-project
+    // (a backup cycle collector), not this one. This test's job is only
+    // to prove the failure mode is a small, fixed, bounded leak -- the
+    // cyclic array's own one block -- not unbounded growth, corruption,
+    // or a crash.
+    let out_path = std::env::temp_dir().join("verb_test_gc_v2_cyclic");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/gc_cyclic_array_leaks_confined.verb", "-o", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).env("VERB_GC_DEBUG", "1").output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("3\n"), "unexpected program output:\n{stdout}");
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("no verb_gc_live line in stdout:\n{stdout}"));
+    // Exactly the cyclic array's own header block leaks (its refcount
+    // never reaches zero because it holds a reference to itself) -- a
+    // small, fixed, non-zero number, not zero and not unbounded.
+    assert_ne!(live_line, "verb_gc_live=0", "expected a confined leak, got none:\n{stdout}");
+    let live_n: i64 = live_line.strip_prefix("verb_gc_live=").unwrap().parse().unwrap();
+    assert!((1..=2).contains(&live_n), "expected a small, bounded leak count, got {live_n}:\n{stdout}");
+    let _ = std::fs::remove_file(&out_path);
 }

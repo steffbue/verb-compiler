@@ -1,0 +1,8 @@
+import std map;
+
+assign m map_new();
+map_set(m, "name", "compiler" join "!");
+map_set(m, "list", list 1, 2, 3);
+print(map_get(m, "name"));
+print(len(map_get(m, "list")));
+print(map_len(m));

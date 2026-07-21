@@ -1,0 +1,6 @@
+assign inner1 list 1, 2;
+assign inner2 list 3, 4;
+assign outer list inner1, inner2;
+push(get(outer, 1), 5);
+print(get(get(outer, 1), 2));
+print(len(outer));

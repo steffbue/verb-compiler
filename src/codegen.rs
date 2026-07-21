@@ -63,10 +63,18 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_check_call_fn();
         cg.build_array_len_fn();
         cg.build_array_check_fn();
+        // verb_retain_value/verb_release_value must be declared before
+        // build_array_get_fn/build_array_set_fn, which now call_named
+        // "verb_retain_value" while building their bodies (call_named
+        // requires the callee to already exist in the module).
+        cg.build_retain_value_fn();
+        cg.build_release_value_fn();
         cg.build_array_get_fn();
         cg.build_array_set_fn();
         cg.build_array_push_fn();
         cg.build_array_pop_fn();
+        cg.build_retain_cell_fn();
+        cg.build_release_cell_fn();
         cg
     }
 
@@ -111,6 +119,8 @@ impl<'ctx> Codegen<'ctx> {
         self.module.add_function("strcmp", i32t.fn_type(&[pt.into(), pt.into()], false), None);
         self.module.add_function("free", self.ctx.void_type().fn_type(&[pt.into()], false), None);
         self.module.add_function("getenv", pt.fn_type(&[pt.into()], false), None);
+        self.module.add_function(
+            "verb_map_destroy_contents", self.ctx.void_type().fn_type(&[pt.into()], false), None);
     }
 
     fn declare_gc_globals(&self) {
@@ -124,6 +134,26 @@ impl<'ctx> Codegen<'ctx> {
         let g = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
         let cur = self.builder.build_load(i64t, g, "gc_live").unwrap().into_int_value();
         let next = self.builder.build_int_add(cur, i64t.const_int(1, false), "gc_live1").unwrap();
+        self.builder.build_store(g, next).unwrap();
+    }
+
+    /// Given a payload pointer (what a `VerbValue` or a cell already
+    /// points at), returns a pointer to its 8-byte refcount header,
+    /// living immediately before it. Valid for every string, closure,
+    /// array, map, and cell pointer Verb ever produces.
+    fn header_ptr(&self, payload: PointerValue<'ctx>) -> PointerValue<'ctx> {
+        let i64t = self.ctx.i64_type();
+        unsafe {
+            self.builder.build_in_bounds_gep(
+                self.ctx.i8_type(), payload, &[i64t.const_int((-8i64) as u64, true)], "hdr")
+        }.unwrap()
+    }
+
+    fn dec_live_counter(&self) {
+        let i64t = self.ctx.i64_type();
+        let g = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
+        let cur = self.builder.build_load(i64t, g, "gc_live").unwrap().into_int_value();
+        let next = self.builder.build_int_sub(cur, i64t.const_int(1, false), "gc_live1").unwrap();
         self.builder.build_store(g, next).unwrap();
     }
 
@@ -263,6 +293,53 @@ impl<'ctx> Codegen<'ctx> {
     fn malloc_bytes(&self, n: u64) -> PointerValue<'ctx> {
         self.call_named("verb_alloc", &[self.ctx.i64_type().const_int(n, false).into()])
             .unwrap().into_pointer_value()
+    }
+
+    fn release_scope(&self, scope: &HashMap<String, PointerValue<'ctx>>) {
+        for cell in scope.values() {
+            self.call_named("verb_release_cell", &[(*cell).into()]);
+        }
+    }
+
+    /// Releases every cell in every currently-open scope (this function's
+    /// own scope stack -- already isolated per-function via the
+    /// `saved_scopes` swap in `Stmt::Fn`), innermost first. Read-only over
+    /// `self.scopes`: never pops. Must run immediately before *every*
+    /// path that can leave a function or the top-level program -- an
+    /// explicit `return`, or an implicit end-of-body/end-of-program
+    /// return -- since Step 2's scope-pop cleanup only fires on normal
+    /// block fall-through and is skipped once a block is already
+    /// terminated.
+    fn release_all_open_scopes(&self) {
+        for scope in self.scopes.iter().rev() {
+            self.release_scope(scope);
+        }
+    }
+
+    /// If `VERB_GC_DEBUG` is set in the environment, prints
+    /// `verb_gc_live=<n>` to stdout, where `<n>` is the number of
+    /// outstanding `verb_alloc` blocks (strings/closures/arrays/maps/cells)
+    /// at program exit. Purely a test/debugging hook -- silent otherwise,
+    /// and never affects a program's own output.
+    fn emit_gc_debug_dump(&self, main: FunctionValue<'ctx>) {
+        let i64t = self.ctx.i64_type();
+        let env_name = self.cstr("VERB_GC_DEBUG");
+        let flag = self.call_named("getenv", &[env_name.into()]).unwrap().into_pointer_value();
+        let flag_int = self.builder.build_ptr_to_int(flag, i64t, "flagi").unwrap();
+        let is_set = self.builder.build_int_compare(
+            inkwell::IntPredicate::NE, flag_int, i64t.const_zero(), "gc_debug").unwrap();
+        let dbg_bb = self.ctx.append_basic_block(main, "gc.debug");
+        let cont_bb = self.ctx.append_basic_block(main, "gc.cont");
+        self.builder.build_conditional_branch(is_set, dbg_bb, cont_bb).unwrap();
+
+        self.builder.position_at_end(dbg_bb);
+        let live_ptr = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
+        let live = self.builder.build_load(i64t, live_ptr, "live").unwrap();
+        let fmt = self.cstr("verb_gc_live=%lld\n");
+        self.call_named("printf", &[fmt.into(), live.into()]);
+        self.builder.build_unconditional_branch(cont_bb).unwrap();
+
+        self.builder.position_at_end(cont_bb);
     }
 
     /// Like `malloc_bytes`, but the size is a runtime value (used when an
@@ -912,6 +989,9 @@ impl<'ctx> Codegen<'ctx> {
         let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
         let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot") }.unwrap();
         let v = self.builder.build_load(self.value_ty, slot, "v").unwrap().into_struct_value();
+        // The array's own slot keeps its reference; `get` hands back an
+        // independent copy, mirroring Expr::Var's retain-on-load.
+        self.call_named("verb_retain_value", &[v.into()]);
         self.builder.build_return(Some(&v)).unwrap();
     }
 
@@ -940,6 +1020,12 @@ impl<'ctx> Codegen<'ctx> {
         let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
         let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
         let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot") }.unwrap();
+        // `v` (the caller's owned temporary) is about to have two homes --
+        // the array slot and the returned value -- where before it had
+        // one. One retain covers the second home; the slot's copy is the
+        // transfer of `v`'s original ownership (no separate op needed for
+        // that half).
+        self.call_named("verb_retain_value", &[v.into()]);
         self.builder.build_store(slot, v).unwrap();
         self.builder.build_return(Some(&v)).unwrap();
     }
@@ -1015,6 +1101,19 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(cp_cond).unwrap();
 
         self.builder.position_at_end(cp_end);
+        let old_elems_addr = self.builder.build_ptr_to_int(elems, i64t, "old_elems_addr").unwrap();
+        let old_elems_null = self.builder.build_int_compare(
+            EQ, old_elems_addr, i64t.const_zero(), "old_elems_null").unwrap();
+        let free_old_bb = self.ctx.append_basic_block(f, "free_old_elems");
+        let skip_free_old_bb = self.ctx.append_basic_block(f, "skip_free_old_elems");
+        self.builder.build_conditional_branch(old_elems_null, skip_free_old_bb, free_old_bb).unwrap();
+
+        self.builder.position_at_end(free_old_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[self.header_ptr(elems).into()]);
+        self.builder.build_unconditional_branch(skip_free_old_bb).unwrap();
+
+        self.builder.position_at_end(skip_free_old_bb);
         self.builder.build_store(capp, new_cap).unwrap();
         self.builder.build_store(elemsp, new_elems).unwrap();
         self.builder.build_unconditional_branch(after_grow_bb).unwrap();
@@ -1077,6 +1176,298 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_return(Some(&v)).unwrap();
     }
 
+    /// Runtime helper: verb_retain_value(VerbValue v) -> void. No-op
+    /// unless v is a heap-identity tag (string, closure, array, map).
+    /// Static string literals (sentinel header) are skipped -- immortal,
+    /// count never moves.
+    fn build_retain_value_fn(&self) {
+        use inkwell::IntPredicate::*;
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.value_ty.into()], false);
+        let f = self.module.add_function("verb_retain_value", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let str_bb = self.ctx.append_basic_block(f, "str");
+        let str_bump_bb = self.ctx.append_basic_block(f, "str.bump");
+        let heap_check_bb = self.ctx.append_basic_block(f, "heap.check");
+        let heap_bump_bb = self.ctx.append_basic_block(f, "heap.bump");
+        let done_bb = self.ctx.append_basic_block(f, "done");
+
+        self.builder.position_at_end(entry);
+        let v = f.get_nth_param(0).unwrap().into_struct_value();
+        let (t, p) = (self.tag_of(v), self.payload_of(v));
+        let is_str = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STR, false), "is_str").unwrap();
+        self.builder.build_conditional_branch(is_str, str_bb, heap_check_bb).unwrap();
+
+        self.builder.position_at_end(str_bb);
+        let sp = self.builder.build_int_to_ptr(p, self.ptr_ty, "sp").unwrap();
+        let shdr = self.header_ptr(sp);
+        let scur = self.builder.build_load(i64t, shdr, "scur").unwrap().into_int_value();
+        let is_static = self.builder.build_int_compare(
+            EQ, scur, i64t.const_int(GC_STATIC_SENTINEL as u64, true), "is_static").unwrap();
+        self.builder.build_conditional_branch(is_static, done_bb, str_bump_bb).unwrap();
+
+        self.builder.position_at_end(str_bump_bb);
+        let snext = self.builder.build_int_add(scur, i64t.const_int(1, false), "snext").unwrap();
+        self.builder.build_store(shdr, snext).unwrap();
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // closure/array/map all share the same "always heap, always just
+        // bump the header" behavior for retain -- only release (Step 4)
+        // needs different cascade logic per tag.
+        self.builder.position_at_end(heap_check_bb);
+        let is_clos = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_CLOSURE, false), "is_clos").unwrap();
+        let is_arr = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ARRAY, false), "is_arr").unwrap();
+        let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
+        let is_clos_or_arr = self.builder.build_or(is_clos, is_arr, "is_clos_or_arr").unwrap();
+        let is_heap = self.builder.build_or(is_clos_or_arr, is_map, "is_heap").unwrap();
+        self.builder.build_conditional_branch(is_heap, heap_bump_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(heap_bump_bb);
+        let hp = self.builder.build_int_to_ptr(p, self.ptr_ty, "hp").unwrap();
+        let hhdr = self.header_ptr(hp);
+        let hcur = self.builder.build_load(i64t, hhdr, "hcur").unwrap().into_int_value();
+        let hnext = self.builder.build_int_add(hcur, i64t.const_int(1, false), "hnext").unwrap();
+        self.builder.build_store(hhdr, hnext).unwrap();
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+        self.builder.build_return(None).unwrap();
+    }
+
+    /// Runtime helper: verb_release_value(VerbValue v) -> void. No-op
+    /// unless v is a heap-identity tag; on those, decrements the header
+    /// and, at zero, cascades per-tag before freeing:
+    /// - STR: no cascade, just free (skip entirely if static sentinel).
+    /// - CLOSURE: no cascade (`env` is always null), just free.
+    /// - ARRAY: release every element 0..len (cascading into any
+    ///   heap-owned element), free `elems`, free the header.
+    /// - MAP: call `verb_map_destroy_contents` (defined in
+    ///   runtime/verb_map.cpp) to cascade-release every key/value and run
+    ///   the map's C++ destructor, then free the header here (the one
+    ///   place every heap kind's header actually gets `free`d).
+    fn build_release_value_fn(&self) {
+        use inkwell::IntPredicate::*;
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.value_ty.into()], false);
+        let f = self.module.add_function("verb_release_value", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let str_bb = self.ctx.append_basic_block(f, "str");
+        let str_live_bb = self.ctx.append_basic_block(f, "str.live");
+        let str_free_bb = self.ctx.append_basic_block(f, "str.free");
+        let clos_check_bb = self.ctx.append_basic_block(f, "clos.check");
+        let clos_bb = self.ctx.append_basic_block(f, "clos");
+        let clos_dec_bb = self.ctx.append_basic_block(f, "clos.dec");
+        let clos_free_bb = self.ctx.append_basic_block(f, "clos.free");
+        let arr_check_bb = self.ctx.append_basic_block(f, "arr.check");
+        let arr_bb = self.ctx.append_basic_block(f, "arr");
+        let arr_dec_bb = self.ctx.append_basic_block(f, "arr.dec");
+        let arr_free_bb = self.ctx.append_basic_block(f, "arr.free");
+        let arr_loop_cond_bb = self.ctx.append_basic_block(f, "arr.loop.cond");
+        let arr_loop_body_bb = self.ctx.append_basic_block(f, "arr.loop.body");
+        let arr_loop_end_bb = self.ctx.append_basic_block(f, "arr.loop.end");
+        let arr_free_elems_bb = self.ctx.append_basic_block(f, "arr.free_elems");
+        let arr_skip_elems_bb = self.ctx.append_basic_block(f, "arr.skip_elems");
+        let map_check_bb = self.ctx.append_basic_block(f, "map.check");
+        let map_bb = self.ctx.append_basic_block(f, "map");
+        let map_dec_bb = self.ctx.append_basic_block(f, "map.dec");
+        let map_free_bb = self.ctx.append_basic_block(f, "map.free");
+        let done_bb = self.ctx.append_basic_block(f, "done");
+
+        self.builder.position_at_end(entry);
+        let v = f.get_nth_param(0).unwrap().into_struct_value();
+        let (t, p) = (self.tag_of(v), self.payload_of(v));
+        let is_str = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STR, false), "is_str").unwrap();
+        self.builder.build_conditional_branch(is_str, str_bb, clos_check_bb).unwrap();
+
+        // ----- string -----
+        self.builder.position_at_end(str_bb);
+        let sp = self.builder.build_int_to_ptr(p, self.ptr_ty, "sp").unwrap();
+        let shdr = self.header_ptr(sp);
+        let scur = self.builder.build_load(i64t, shdr, "scur").unwrap().into_int_value();
+        let is_static = self.builder.build_int_compare(
+            EQ, scur, i64t.const_int(GC_STATIC_SENTINEL as u64, true), "is_static").unwrap();
+        self.builder.build_conditional_branch(is_static, done_bb, str_live_bb).unwrap();
+
+        self.builder.position_at_end(str_live_bb);
+        let snext = self.builder.build_int_sub(scur, i64t.const_int(1, false), "snext").unwrap();
+        self.builder.build_store(shdr, snext).unwrap();
+        let szero = self.builder.build_int_compare(EQ, snext, i64t.const_zero(), "szero").unwrap();
+        self.builder.build_conditional_branch(szero, str_free_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(str_free_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[shdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- closure (env always null: no cascade) -----
+        self.builder.position_at_end(clos_check_bb);
+        let is_clos = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_CLOSURE, false), "is_clos").unwrap();
+        self.builder.build_conditional_branch(is_clos, clos_bb, arr_check_bb).unwrap();
+
+        self.builder.position_at_end(clos_bb);
+        let cp = self.builder.build_int_to_ptr(p, self.ptr_ty, "cp").unwrap();
+        let chdr = self.header_ptr(cp);
+        let ccur = self.builder.build_load(i64t, chdr, "ccur").unwrap().into_int_value();
+        let cnext = self.builder.build_int_sub(ccur, i64t.const_int(1, false), "cnext").unwrap();
+        self.builder.build_store(chdr, cnext).unwrap();
+        let czero = self.builder.build_int_compare(EQ, cnext, i64t.const_zero(), "czero").unwrap();
+        self.builder.build_conditional_branch(czero, clos_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(clos_dec_bb);
+        self.builder.build_unconditional_branch(clos_free_bb).unwrap();
+
+        self.builder.position_at_end(clos_free_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[chdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- array: cascade into every element, then free elems + header -----
+        self.builder.position_at_end(arr_check_bb);
+        let is_arr = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ARRAY, false), "is_arr").unwrap();
+        self.builder.build_conditional_branch(is_arr, arr_bb, map_check_bb).unwrap();
+
+        self.builder.position_at_end(arr_bb);
+        let ap = self.builder.build_int_to_ptr(p, self.ptr_ty, "ap").unwrap();
+        let ahdr = self.header_ptr(ap);
+        let acur = self.builder.build_load(i64t, ahdr, "acur").unwrap().into_int_value();
+        let anext = self.builder.build_int_sub(acur, i64t.const_int(1, false), "anext").unwrap();
+        self.builder.build_store(ahdr, anext).unwrap();
+        let azero = self.builder.build_int_compare(EQ, anext, i64t.const_zero(), "azero").unwrap();
+        self.builder.build_conditional_branch(azero, arr_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(arr_dec_bb);
+        self.builder.build_unconditional_branch(arr_free_bb).unwrap();
+
+        self.builder.position_at_end(arr_free_bb);
+        let lenp = self.builder.build_struct_gep(self.array_ty, ap, 0, "lenp").unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, ap, 2, "elemsp").unwrap();
+        let len = self.builder.build_load(i64t, lenp, "len").unwrap().into_int_value();
+        let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
+        let idxp = self.entry_alloca(i64t.into(), "relidx");
+        self.builder.build_store(idxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(arr_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(arr_loop_cond_bb);
+        let i = self.builder.build_load(i64t, idxp, "i").unwrap().into_int_value();
+        let more = self.builder.build_int_compare(
+            inkwell::IntPredicate::SLT, i, len, "more").unwrap();
+        self.builder.build_conditional_branch(more, arr_loop_body_bb, arr_loop_end_bb).unwrap();
+
+        self.builder.position_at_end(arr_loop_body_bb);
+        let slot = unsafe {
+            self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot")
+        }.unwrap();
+        let elemv = self.builder.build_load(self.value_ty, slot, "elemv").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[elemv.into()]);
+        let inext = self.builder.build_int_add(i, i64t.const_int(1, false), "inext").unwrap();
+        self.builder.build_store(idxp, inext).unwrap();
+        self.builder.build_unconditional_branch(arr_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(arr_loop_end_bb);
+        self.dec_live_counter();
+        // `elems` (when non-null) was itself obtained via `malloc_bytes`/
+        // `verb_alloc`, so -- like every other heap-owned pointer here --
+        // its *actual* malloc'd address is `header_ptr(elems)` (elems-8),
+        // not `elems` itself; freeing `elems` directly corrupts the heap.
+        // A zero-length array's `elems` is a plain null (never routed
+        // through `verb_alloc` at all, see `Expr::ArrayLit`), so guard on
+        // that before computing/freeing the header.
+        let elems_addr = self.builder.build_ptr_to_int(elems, i64t, "elems_addr").unwrap();
+        let elems_null = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ, elems_addr, i64t.const_zero(), "elems_null").unwrap();
+        self.builder.build_conditional_branch(elems_null, arr_skip_elems_bb, arr_free_elems_bb).unwrap();
+
+        self.builder.position_at_end(arr_free_elems_bb);
+        // A non-empty array holds *two* separate verb_alloc blocks (the
+        // header and this elems buffer), so freeing both needs two
+        // decrements to balance the two increments `Expr::ArrayLit`
+        // caused -- the single decrement above (paired with `ahdr`'s
+        // free below) only accounts for the header.
+        self.dec_live_counter();
+        let ehdr = self.header_ptr(elems);
+        self.call_named("free", &[ehdr.into()]);
+        self.builder.build_unconditional_branch(arr_skip_elems_bb).unwrap();
+
+        self.builder.position_at_end(arr_skip_elems_bb);
+        self.call_named("free", &[ahdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- map: cascade via runtime/verb_map.cpp, then free header -----
+        self.builder.position_at_end(map_check_bb);
+        let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
+        self.builder.build_conditional_branch(is_map, map_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(map_bb);
+        let mp = self.builder.build_int_to_ptr(p, self.ptr_ty, "mp").unwrap();
+        let mhdr = self.header_ptr(mp);
+        let mcur = self.builder.build_load(i64t, mhdr, "mcur").unwrap().into_int_value();
+        let mnext = self.builder.build_int_sub(mcur, i64t.const_int(1, false), "mnext").unwrap();
+        self.builder.build_store(mhdr, mnext).unwrap();
+        let mzero = self.builder.build_int_compare(EQ, mnext, i64t.const_zero(), "mzero").unwrap();
+        self.builder.build_conditional_branch(mzero, map_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(map_dec_bb);
+        self.builder.build_unconditional_branch(map_free_bb).unwrap();
+
+        self.builder.position_at_end(map_free_bb);
+        self.call_named("verb_map_destroy_contents", &[mp.into()]);
+        self.dec_live_counter();
+        self.call_named("free", &[mhdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+        self.builder.build_return(None).unwrap();
+    }
+
+    /// Runtime helper: verb_retain_cell(ptr cell) -> void. Cells are
+    /// always heap-owned (never static like a string literal can be), so
+    /// this always bumps the header at cell-8, no tag/sentinel check.
+    fn build_retain_cell_fn(&self) {
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.ptr_ty.into()], false);
+        let f = self.module.add_function("verb_retain_cell", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let cell = f.get_nth_param(0).unwrap().into_pointer_value();
+        let hdr = self.header_ptr(cell);
+        let cur = self.builder.build_load(i64t, hdr, "cur").unwrap().into_int_value();
+        let next = self.builder.build_int_add(cur, i64t.const_int(1, false), "next").unwrap();
+        self.builder.build_store(hdr, next).unwrap();
+        self.builder.build_return(None).unwrap();
+    }
+
+    /// Runtime helper: verb_release_cell(ptr cell) -> void. Decrements
+    /// the header at cell-8; at zero, releases the `VerbValue` stored
+    /// inside (cascading into a heap-owned string/closure/array/map if
+    /// that's what the cell holds) and frees the cell block itself.
+    fn build_release_cell_fn(&self) {
+        use inkwell::IntPredicate::*;
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.ptr_ty.into()], false);
+        let f = self.module.add_function("verb_release_cell", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let free_bb = self.ctx.append_basic_block(f, "free");
+        let done_bb = self.ctx.append_basic_block(f, "done");
+
+        self.builder.position_at_end(entry);
+        let cell = f.get_nth_param(0).unwrap().into_pointer_value();
+        let hdr = self.header_ptr(cell);
+        let cur = self.builder.build_load(i64t, hdr, "cur").unwrap().into_int_value();
+        let next = self.builder.build_int_sub(cur, i64t.const_int(1, false), "next").unwrap();
+        self.builder.build_store(hdr, next).unwrap();
+        let zero = self.builder.build_int_compare(EQ, next, i64t.const_zero(), "zero").unwrap();
+        self.builder.build_conditional_branch(zero, free_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(free_bb);
+        let inner = self.builder.build_load(self.value_ty, cell, "inner").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[inner.into()]);
+        self.dec_live_counter();
+        self.call_named("free", &[hdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+        self.builder.build_return(None).unwrap();
+    }
+
     /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.
     fn make_closure(&self, fnv: FunctionValue<'ctx>, arity: usize) -> StructValue<'ctx> {
         let p = self.malloc_bytes(24);
@@ -1126,6 +1517,11 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         if self.cur_block_open() {
+            for slot in self.globals.values() {
+                let v = self.builder.build_load(self.value_ty, *slot, "gval").unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[v.into()]);
+            }
+            self.emit_gc_debug_dump(main);
             self.builder.build_return(Some(&self.ctx.i32_type().const_zero())).unwrap();
         }
         Ok(())
@@ -1175,11 +1571,15 @@ impl<'ctx> Codegen<'ctx> {
     fn bind(&mut self, name: &str, value: StructValue<'ctx>) {
         if self.scopes.is_empty() {
             let slot = self.global_slot(name);
+            let old = self.builder.build_load(self.value_ty, slot, "old_global").unwrap().into_struct_value();
+            self.call_named("verb_release_value", &[old.into()]);
             self.builder.build_store(slot, value).unwrap();
         } else {
             let cell = self.malloc_bytes(16);
             self.builder.build_store(cell, value).unwrap();
-            self.scopes.last_mut().unwrap().insert(name.to_string(), cell);
+            if let Some(old_cell) = self.scopes.last_mut().unwrap().insert(name.to_string(), cell) {
+                self.call_named("verb_release_cell", &[old_cell.into()]);
+            }
         }
     }
 
@@ -1251,7 +1651,11 @@ impl<'ctx> Codegen<'ctx> {
             self.emit_checkpoint(line);
         }
         match stmt {
-            Stmt::ExprStmt(e, ..) => { self.gen_expr(e)?; Ok(()) }
+            Stmt::ExprStmt(e, ..) => {
+                let v = self.gen_expr(e)?;
+                self.call_named("verb_release_value", &[v.into()]);
+                Ok(())
+            }
             Stmt::Assign { name, value, .. } => {
                 let v = self.gen_expr(value)?;
                 self.bind(name, v);
@@ -1268,18 +1672,25 @@ impl<'ctx> Codegen<'ctx> {
                         .with_hint("declare new variables with 'assign' or 'declare'".to_string())
                 })?;
                 let v = self.gen_expr(value)?;
+                let old = self.builder.build_load(self.value_ty, cell, "old").unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[old.into()]);
                 self.builder.build_store(cell, v).unwrap();
                 Ok(())
             }
             Stmt::Block(stmts, ..) => {
                 self.scopes.push(HashMap::new());
                 let r = self.gen_stmts(stmts);
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 r
             }
             Stmt::If { cond, then_body, else_body, .. } => {
                 let cv = self.gen_expr(cond)?;
                 let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
+                self.call_named("verb_release_value", &[cv.into()]);
                 let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                 let then_bb = self.ctx.append_basic_block(f, "if.then");
                 let else_bb = self.ctx.append_basic_block(f, "if.else");
@@ -1289,7 +1700,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(then_bb);
                 self.scopes.push(HashMap::new());
                 self.gen_stmts(then_body)?;
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(merge).unwrap();
                 }
@@ -1298,7 +1713,11 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(eb) = else_body {
                     self.scopes.push(HashMap::new());
                     self.gen_stmts(eb)?;
-                    self.scopes.pop();
+                    if self.cur_block_open() {
+                        if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                    } else {
+                        self.scopes.pop();
+                    }
                 }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(merge).unwrap();
@@ -1316,12 +1735,17 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(cond_bb);
                 let cv = self.gen_expr(cond)?;
                 let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
+                self.call_named("verb_release_value", &[cv.into()]);
                 self.builder.build_conditional_branch(t, body_bb, end_bb).unwrap();
 
                 self.builder.position_at_end(body_bb);
                 self.scopes.push(HashMap::new());
                 self.gen_stmts(body)?;
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(cond_bb).unwrap();
                 }
@@ -1383,6 +1807,7 @@ impl<'ctx> Codegen<'ctx> {
                     if self.debug_hooks {
                         self.call_named("verb_debug_pop_frame", &[]);
                     }
+                    self.release_all_open_scopes();
                     self.builder.build_return(Some(&self.nil_val())).unwrap();
                 }
                 self.scopes.pop();
@@ -1403,6 +1828,7 @@ impl<'ctx> Codegen<'ctx> {
                 if self.debug_hooks {
                     self.call_named("verb_debug_pop_frame", &[]);
                 }
+                self.release_all_open_scopes();
                 self.builder.build_return(Some(&v)).unwrap();
                 Ok(())
             }
@@ -1427,8 +1853,10 @@ impl<'ctx> Codegen<'ctx> {
             Expr::Nil => Ok(self.nil_val()),
             Expr::Var(name, line, col) => {
                 if let Some(cell) = self.lookup(name) {
-                    return Ok(self.builder.build_load(self.value_ty, cell, name)
-                        .unwrap().into_struct_value());
+                    let v = self.builder.build_load(self.value_ty, cell, name)
+                        .unwrap().into_struct_value();
+                    self.call_named("verb_retain_value", &[v.into()]);
+                    return Ok(v);
                 }
                 Err(self.undefined_var(name, *line, *col))
             }
@@ -1438,12 +1866,15 @@ impl<'ctx> Codegen<'ctx> {
                 match op {
                     UnOp::Neg => {
                         let (lc, cc) = self.loc_consts(*line, *col);
-                        Ok(self.call_named("verb_neg", &[v.into(), lc.into(), cc.into()])
-                            .unwrap().into_struct_value())
+                        let out = self.call_named("verb_neg", &[v.into(), lc.into(), cc.into()])
+                            .unwrap().into_struct_value();
+                        self.call_named("verb_release_value", &[v.into()]);
+                        Ok(out)
                     }
                     UnOp::Not => {
                         let t = self.call_named("verb_truthy", &[v.into()])
                             .unwrap().into_int_value();
+                        self.call_named("verb_release_value", &[v.into()]);
                         let inv = self.builder.build_not(t, "inv").unwrap();
                         Ok(self.bool_val(inv))
                     }
@@ -1501,6 +1932,9 @@ impl<'ctx> Codegen<'ctx> {
             };
             self.builder.position_at_end(rhs_bb);
             let r = self.gen_expr(rhs)?;
+            // rhs_bb is only entered when `r` becomes the result instead of
+            // `l`, so the owned temporary `l` is being discarded here.
+            self.call_named("verb_release_value", &[l.into()]);
             let rhs_end = self.builder.get_insert_block().unwrap();
             self.builder.build_unconditional_branch(merge).unwrap();
             self.builder.position_at_end(merge);
@@ -1527,6 +1961,8 @@ impl<'ctx> Codegen<'ctx> {
             self.call_named(helper, &[l.into(), r.into(), lc.into(), cc.into()])
                 .unwrap().into_struct_value()
         };
+        self.call_named("verb_release_value", &[l.into()]);
+        self.call_named("verb_release_value", &[r.into()]);
         if matches!(op, BinOp::Ne) {
             let p = self.payload_of(out);
             let flipped = self.builder.build_xor(
@@ -1547,6 +1983,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 let v = self.gen_expr(&args[0])?;
                 self.call_named("verb_print", &[v.into()]);
+                self.call_named("verb_release_value", &[v.into()]);
                 return Ok(self.nil_val());
             }
             if name == "len" {
@@ -1557,6 +1994,7 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_len", &[v.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[v.into()]);
                 return Ok(rv);
             }
             if name == "get" {
@@ -1568,6 +2006,8 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_get", &[arr.into(), idx.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
+                self.call_named("verb_release_value", &[idx.into()]);
                 return Ok(rv);
             }
             if name == "set" {
@@ -1580,6 +2020,8 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_set", &[arr.into(), idx.into(), v.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
+                self.call_named("verb_release_value", &[idx.into()]);
                 return Ok(rv);
             }
             if name == "push" {
@@ -1591,6 +2033,7 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_push", &[arr.into(), v.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
                 return Ok(rv);
             }
             if name == "pop" {
@@ -1601,6 +2044,7 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_pop", &[arr.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
                 return Ok(rv);
             }
             let is_bound = self.lookup(name).is_some();
@@ -1641,6 +2085,7 @@ impl<'ctx> Codegen<'ctx> {
         let fp = self.builder.build_load(self.ptr_ty, fpp, "fp").unwrap().into_pointer_value();
         let epp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 2, "epp").unwrap();
         let env = self.builder.build_load(self.ptr_ty, epp, "env").unwrap();
+        self.call_named("verb_release_value", &[cv.into()]);
 
         let fnty = self.value_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
         let out = self.builder.build_indirect_call(
@@ -1683,8 +2128,12 @@ impl<'ctx> Codegen<'ctx> {
         };
         let args_bv: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
             argvals.iter().map(|v| (*v).into()).collect();
-        Ok(self.builder.build_call(fnv, &args_bv, "std_io_call")
-            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value())
+        let result = self.builder.build_call(fnv, &args_bv, "std_io_call")
+            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+        for v in &argvals {
+            self.call_named("verb_release_value", &[(*v).into()]);
+        }
+        Ok(result)
     }
 
     /// A call to a name that isn't a local variable or a known Verb `fn`,
@@ -1732,8 +2181,12 @@ impl<'ctx> Codegen<'ctx> {
         };
         let args_bv: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
             argvals.iter().map(|v| (*v).into()).collect();
-        Ok(self.builder.build_call(fnv, &args_bv, "extern_call")
-            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value())
+        let result = self.builder.build_call(fnv, &args_bv, "extern_call")
+            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+        for v in &argvals {
+            self.call_named("verb_release_value", &[(*v).into()]);
+        }
+        Ok(result)
     }
 }
 
