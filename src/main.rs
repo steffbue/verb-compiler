@@ -191,6 +191,7 @@ fn main() {
 const RUNTIME_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime");
 const STD_IO_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_io.cpp");
 const MAP_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_map.cpp");
+const TIME_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_time.cpp");
 
 /// Compiles the bundled `runtime/verb_std_io.cpp` into an object file with
 /// `compiler` (`"cc"`/`"c++"` for the host, `"zig"` for cross targets),
@@ -228,6 +229,23 @@ fn compile_map_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, Strin
     Ok(obj)
 }
 
+/// Compiles the bundled `runtime/verb_time.cpp` into an object file. See
+/// `compile_std_io_obj`.
+fn compile_time_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, String> {
+    let obj = std::env::temp_dir().join(format!("verb_time_{}.o", std::process::id()));
+    let mut cmd = Command::new(compiler);
+    cmd.args(extra_args);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-c", TIME_CPP, "-o"]);
+    cmd.arg(&obj);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile {TIME_CPP}: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to compile {TIME_CPP}"));
+    }
+    Ok(obj)
+}
+
 fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
     use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
@@ -249,7 +267,8 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
     let wants_map = std_imports.iter().any(|m| m == "map");
-    let linker = if imports.is_empty() && !wants_std_io && !wants_map { "cc" } else { "c++" };
+    let wants_time = std_imports.iter().any(|m| m == "time");
+    let linker = if imports.is_empty() && !wants_std_io && !wants_map && !wants_time { "cc" } else { "c++" };
 
     let std_io_obj = if wants_std_io {
         Some(compile_std_io_obj(linker, &[]).unwrap_or_else(|e| {
@@ -270,6 +289,17 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     } else {
         None
     };
+    let time_obj = if wants_time {
+        Some(compile_time_obj(linker, &[]).unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&obj);
+            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            if let Some(p) = &map_obj { let _ = std::fs::remove_file(p); }
+            eprintln!("error: {e}");
+            exit(1);
+        }))
+    } else {
+        None
+    };
 
     let mut cmd = Command::new(linker);
     cmd.arg(&obj).arg("-o").arg(out);
@@ -277,6 +307,9 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         cmd.arg(p);
     }
     if let Some(p) = &map_obj {
+        cmd.arg(p);
+    }
+    if let Some(p) = &time_obj {
         cmd.arg(p);
     }
     for dir in lib_dirs {
@@ -291,6 +324,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
             let _ = std::fs::remove_file(&obj);
             if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
             if let Some(p) = &map_obj { let _ = std::fs::remove_file(p); }
+            if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
             eprintln!("error: failed to run linker '{linker}': {e}");
             exit(1);
         }
@@ -298,6 +332,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     if let Some(p) = &map_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         eprintln!("link failed");
         exit(1);
@@ -318,6 +353,7 @@ fn build_aot_cross(
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
     let wants_map = std_imports.iter().any(|m| m == "map");
+    let wants_time = std_imports.iter().any(|m| m == "time");
     if wants_std_io && target.is_windows() {
         return Err(
             "'import std io' is not supported when cross-compiling to a Windows target in v1 \
@@ -353,17 +389,25 @@ fn build_aot_cross(
     } else {
         None
     };
+    let time_obj = if wants_time {
+        Some(compile_time_obj("zig", &["c++", "-target", target.zig_triple()])?)
+    } else {
+        None
+    };
 
     // Imports/lib_dirs are forwarded to zig cc/c++ so cross-linking works when the imported
     // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
     // fixtures won't link for a foreign target — that requires target-built libraries.
-    let linker_subcmd = if imports.is_empty() && !wants_std_io && !wants_map { "cc" } else { "c++" };
+    let linker_subcmd = if imports.is_empty() && !wants_std_io && !wants_map && !wants_time { "cc" } else { "c++" };
     let mut cmd = Command::new("zig");
     cmd.args([linker_subcmd, "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()]);
     if let Some(p) = &std_io_obj {
         cmd.arg(p);
     }
     if let Some(p) = &map_obj {
+        cmd.arg(p);
+    }
+    if let Some(p) = &time_obj {
         cmd.arg(p);
     }
     for dir in lib_dirs {
@@ -376,6 +420,7 @@ fn build_aot_cross(
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     if let Some(p) = &map_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         return Err("link failed".to_string());
     }
