@@ -201,3 +201,175 @@ mod tests {
         assert!(parse_command("print").is_err());
     }
 }
+
+use std::cell::RefCell;
+use std::ffi::{c_char, CStr};
+use std::io::{self, BufRead, Write};
+
+/// Mirrors `Codegen`'s `value_ty` LLVM struct `{ i8, i64 }` byte-for-byte
+/// (both are the default, non-packed layout, so both insert the same
+/// 7-byte padding after `tag` — see docs/superpowers/specs/2026-07-21-interactive-debugger-design.md).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawVerbValue {
+    pub tag: u8,
+    pub payload: i64,
+}
+
+/// Mirrors the array Codegen's `emit_checkpoint` builds: `{ name: ptr, cell: ptr }`.
+#[repr(C)]
+pub struct DebugVar {
+    pub name: *const c_char,
+    pub cell: *mut RawVerbValue,
+}
+
+thread_local! {
+    static STATE: RefCell<DebuggerState> = RefCell::new(DebuggerState::new());
+    /// Raw address of the JIT-compiled `verb_print_value(VerbValue)` function,
+    /// resolved once via `ExecutionEngine::get_function_address` before the
+    /// program starts running (Task 6). 0 means "not yet set" — `print`
+    /// falls back to printing the raw tag/payload if so (should never
+    /// happen once Task 6 wires it up correctly).
+    static PRINT_VALUE_FN: RefCell<usize> = const { RefCell::new(0) };
+}
+
+/// Called once by the `debug` CLI command after creating the JIT execution
+/// engine, before running `main`.
+pub fn set_print_value_fn(addr: usize) {
+    PRINT_VALUE_FN.with(|f| *f.borrow_mut() = addr);
+}
+
+fn call_print_value(v: RawVerbValue) {
+    let addr = PRINT_VALUE_FN.with(|f| *f.borrow());
+    if addr == 0 {
+        println!("<tag={} payload={}>", v.tag, v.payload);
+        return;
+    }
+    let f: extern "C" fn(RawVerbValue) = unsafe { std::mem::transmute(addr) };
+    f(v);
+    println!();
+}
+
+/// Runs the blocking console: prints a prompt, reads a line, dispatches.
+/// `vars` is `None` before the first `run` (only break/delete/run/quit are
+/// meaningful then); `Some(&[DebugVar])` once stopped at a checkpoint.
+/// Returns when the user issues `continue`, `step`, or `run` (i.e. when
+/// execution should proceed), or exits the process on `quit`.
+fn run_console(vars: Option<&[DebugVar]>) {
+    let stdin = io::stdin();
+    loop {
+        print!("(vdb) ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            std::process::exit(0); // stdin closed
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cmd = match parse_command(&line) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("{e}");
+                continue;
+            }
+        };
+        match cmd {
+            Command::Break(n) => STATE.with(|s| s.borrow_mut().add_breakpoint(n)),
+            Command::Delete(n) => STATE.with(|s| s.borrow_mut().remove_breakpoint(n)),
+            Command::Run => {
+                let already_started = STATE.with(|s| s.borrow().started());
+                if already_started {
+                    println!("program already running");
+                    continue;
+                }
+                STATE.with(|s| s.borrow_mut().start());
+                return;
+            }
+            Command::Continue => {
+                let started = STATE.with(|s| s.borrow().started());
+                if !started {
+                    println!("program not running yet -- use 'run'");
+                    continue;
+                }
+                STATE.with(|s| s.borrow_mut().set_stepping(false));
+                return;
+            }
+            Command::Step => {
+                let started = STATE.with(|s| s.borrow().started());
+                if !started {
+                    println!("program not running yet -- use 'run'");
+                    continue;
+                }
+                STATE.with(|s| s.borrow_mut().set_stepping(true));
+                return;
+            }
+            Command::Print(name) => match vars {
+                None => println!("no running frame"),
+                Some(vs) => match find_var(vs, &name) {
+                    Some(v) => call_print_value(v),
+                    None => println!("no such variable '{name}' in scope"),
+                },
+            },
+            Command::Backtrace => {
+                let frames = STATE.with(|s| s.borrow().frames().to_vec());
+                if frames.is_empty() {
+                    println!("(no active calls)");
+                } else {
+                    for f in frames.iter().rev() {
+                        println!("{} (called at line {})", f.fn_name, f.call_line);
+                    }
+                }
+            }
+            Command::Quit => std::process::exit(0),
+        }
+    }
+}
+
+fn find_var(vars: &[DebugVar], name: &str) -> Option<RawVerbValue> {
+    vars.iter().find(|v| {
+        let n = unsafe { CStr::from_ptr(v.name) };
+        n.to_str() == Ok(name)
+    }).map(|v| unsafe { *v.cell })
+}
+
+/// The checkpoint hook: called by JIT'd code at the start of every
+/// statement when `Codegen::enable_debug_hooks` was used. Blocks on the
+/// console if stepping or a breakpoint is hit at `line`; otherwise
+/// returns immediately.
+///
+/// # Safety
+/// `vars`/`n_vars` must describe a valid `[DebugVar; n_vars]` built by
+/// `Codegen::emit_checkpoint` -- true for every call site, since this
+/// function is only ever reached via a JIT'd call instruction codegen
+/// itself emitted.
+pub unsafe extern "C" fn verb_debug_checkpoint(line: u32, vars: *const DebugVar, n_vars: usize) {
+    STATE.with(|s| s.borrow_mut().set_current_line(line));
+    let stop = STATE.with(|s| s.borrow().should_stop(line));
+    if !stop {
+        return;
+    }
+    println!("stopped at line {line}");
+    let slice = if vars.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(vars, n_vars) } };
+    run_console(Some(slice));
+}
+
+/// # Safety
+/// `fn_name` must be a valid NUL-terminated C string -- true for every
+/// call site, since codegen only ever passes a `self.cstr(name)` global.
+pub unsafe extern "C" fn verb_debug_push_frame(fn_name: *const c_char) {
+    let name = unsafe { CStr::from_ptr(fn_name) }.to_string_lossy().into_owned();
+    STATE.with(|s| s.borrow_mut().push_frame(name));
+}
+
+pub extern "C" fn verb_debug_pop_frame() {
+    STATE.with(|s| s.borrow_mut().pop_frame());
+}
+
+/// Runs the pre-execution console (only break/delete/run/quit are valid)
+/// until the user issues `run`. Called by the `debug` CLI command before
+/// invoking the JIT'd `main`.
+pub fn run_pre_start_console() {
+    println!("(vdb) verb debug -- type 'break <line>' then 'run', or 'quit'");
+    run_console(None);
+}
