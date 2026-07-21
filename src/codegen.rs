@@ -256,6 +256,21 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Releases every cell in every currently-open scope (this function's
+    /// own scope stack -- already isolated per-function via the
+    /// `saved_scopes` swap in `Stmt::Fn`), innermost first. Read-only over
+    /// `self.scopes`: never pops. Must run immediately before *every*
+    /// path that can leave a function or the top-level program -- an
+    /// explicit `return`, or an implicit end-of-body/end-of-program
+    /// return -- since Task 6's scope-pop cleanup only fires on normal
+    /// block fall-through and is skipped once a block is already
+    /// terminated.
+    fn release_all_open_scopes(&self) {
+        for scope in self.scopes.iter().rev() {
+            self.release_scope(scope);
+        }
+    }
+
     // ----- generated runtime helper: verb_print(value) -----
 
     fn build_print_fn(&self) {
@@ -931,6 +946,9 @@ impl<'ctx> Codegen<'ctx> {
                 break; // dead code after return/abort
             }
         }
+        if self.cur_block_open() {
+            self.release_all_open_scopes();
+        }
         self.scopes.pop();
         if self.cur_block_open() {
             self.builder.build_return(Some(&self.ctx.i32_type().const_zero())).unwrap();
@@ -1116,6 +1134,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.scopes.push(scope);
                 let r = self.gen_stmts(body);
                 if self.cur_block_open() {
+                    self.release_all_open_scopes();
                     self.builder.build_return(Some(&self.nil_val())).unwrap();
                 }
                 self.scopes.pop();
@@ -1133,6 +1152,7 @@ impl<'ctx> Codegen<'ctx> {
                     Some(e) => self.gen_expr(e)?,
                     None => self.nil_val(),
                 };
+                self.release_all_open_scopes();
                 self.builder.build_return(Some(&v)).unwrap();
                 Ok(())
             }

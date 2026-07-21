@@ -1,0 +1,12 @@
+make first_long(items) begin
+  loop assign i 0; i trails 5; i be i add 1 begin
+    declare cur;
+    cur be items join "!";
+    check cur equals "c!" begin
+      return cur;
+    end
+  end
+  return "none";
+end
+
+print(first_long("c"));

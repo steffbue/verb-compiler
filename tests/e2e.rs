@@ -650,3 +650,6 @@ fn gc_releases_block_scope_cells() {
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("call void @verb_release_cell"), "no cell release in IR:\n{ir}");
 }
+
+#[test]
+fn early_return_from_nested_block_releases_open_scopes() { run_ok("early_return_releases"); }
