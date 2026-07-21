@@ -20,15 +20,15 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    Assign { name: String, value: Expr },                    // assign x expr;
-    Declare { name: String },                                // declare x;  (starts as nil)
-    Reassign { name: String, value: Expr, line: u32, col: u32 }, // x be expr;
-    ExprStmt(Expr),
-    If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>> },
-    While { cond: Expr, body: Vec<Stmt> },
+    Assign { name: String, value: Expr, line: u32, col: u32 },
+    Declare { name: String, line: u32, col: u32 },
+    Reassign { name: String, value: Expr, line: u32, col: u32 },
+    ExprStmt(Expr, u32, u32),
+    If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>>, line: u32, col: u32 },
+    While { cond: Expr, body: Vec<Stmt>, line: u32, col: u32 },
     Fn { name: String, params: Vec<String>, body: Vec<Stmt>, line: u32, col: u32 },
     Return { value: Option<Expr> },
-    Block(Vec<Stmt>),
+    Block(Vec<Stmt>, u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 fn run_ok(name: &str) {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
@@ -868,6 +869,72 @@ fn cross_build_links_a_program_using_std_map_for_a_non_host_target() {
     let meta = std::fs::metadata(&bin)
         .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
     assert!(meta.len() > 0, "empty output for {label}");
+}
+
+fn run_debug_session(prog: &str, script: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // parallel test threads share this process's pid, so the pid alone isn't
+    // a unique directory name -- an earlier version of this helper collided
+    // across concurrently-running debug_* tests, each clobbering the others'
+    // t.verb mid-run.
+    let dir = std::env::temp_dir().join(format!("verb_dbg_test_{}_{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.verb");
+    std::fs::write(&file, prog).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .arg("debug")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn debug_breakpoint_and_print_variable() {
+    let prog = "assign x 1;\nassign y 2;\nprint(x add y);\n";
+    let out = run_debug_session(prog, "break 2\nrun\nprint x\ncontinue\nquit\n");
+    assert!(out.contains("stopped at line 2"), "{out}");
+    // "(vdb) 1" is the prompt immediately followed by `print x`'s output --
+    // a bare `out.contains('1')` would also pass on "line 1" and give no
+    // real signal that `print x` printed anything at all.
+    assert!(out.contains("(vdb) 1"), "{out}");
+}
+
+#[test]
+fn debug_step_through_statements() {
+    let prog = "assign x 1;\nassign y 2;\nprint(x add y);\n";
+    // `run` alone doesn't pause execution -- an initial breakpoint is
+    // needed to get the first stop, exactly like gdb requires a
+    // breakpoint before `run` if you want to stop at the very start.
+    let out = run_debug_session(prog, "break 1\nrun\nstep\nstep\nquit\n");
+    assert!(out.contains("stopped at line 1"), "{out}");
+    assert!(out.contains("stopped at line 2"), "{out}");
+}
+
+#[test]
+fn debug_backtrace_across_nested_call() {
+    let prog = "make inner()\nbegin\n  print(1);\nend\nmake outer()\nbegin\n  inner();\nend\nouter();\n";
+    // line 3 is 'print(1);' inside inner()
+    let out = run_debug_session(prog, "break 3\nrun\nbacktrace\ncontinue\nquit\n");
+    assert!(out.contains("stopped at line 3"), "{out}");
+    assert!(out.contains("inner"), "{out}");
+    assert!(out.contains("outer"), "{out}");
+}
+
+#[test]
+fn debug_quit_mid_session_exits_cleanly() {
+    let prog = "assign x 1;\nprint(x);\n";
+    let out = run_debug_session(prog, "break 1\nrun\nquit\n");
+    assert!(out.contains("stopped at line 1"), "{out}");
 }
 
 #[test]
