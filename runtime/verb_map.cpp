@@ -86,7 +86,22 @@ extern "C" VerbValue map_new() {
 extern "C" VerbValue map_set(VerbValue m, VerbValue k, VerbValue v) {
     VerbMapImpl* impl = as_impl(m);
     if (!impl || !is_valid_key(k)) return verb_nil();
+    auto it = impl->find(k);
+    if (it != impl->end()) {
+        // Overwriting an existing key would otherwise silently orphan
+        // its old value -- the same leak class as reassigning a cell or
+        // global without releasing the old value first.
+        verb_release_value(it->second);
+    }
     (*impl)[k] = v;
+    // `v` is now owned by the map (a second home for the caller's
+    // argument), but the generic std-io/std-map argument-release
+    // convention will still release the caller's `v` temporary right
+    // after this call returns -- it has no way to know this particular
+    // function took ownership instead of just reading it. One retain
+    // covers that second home, mirroring `m`'s retain below for the
+    // same reason (aliased into the return value).
+    verb_retain_value(v);
     // `m` is about to be released once (by the generic std-io/std-map
     // argument-release convention) and returned once -- two homes for
     // one incoming reference now need one retain to cover the second.
