@@ -487,6 +487,81 @@ fn verb_map_cpp_compiles_standalone() {
     let _ = std::fs::remove_file(&obj);
 }
 
+#[test]
+fn verb_process_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_process_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_process.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_process.cpp");
+    assert!(status.success(), "runtime/verb_process.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
+#[test]
+fn std_process_cwd_and_exe_path_are_non_nil() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_cwd_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_cwd_exe.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_cwd_exe.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn std_process_spawn_and_wait_roundtrip_exit_code() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_spawn_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_spawn_wait.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_spawn_wait.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn std_process_spawn_missing_binary_returns_nil() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_spawn_missing_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_spawn_missing_binary.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_spawn_missing_binary.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
 // ----- AOT host / cross build + multi-file (from main) -----
 
 #[test]
@@ -506,6 +581,26 @@ fn aot_build_produces_working_binary() {
 
 fn zig_available() -> bool {
     Command::new("zig").arg("version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[test]
+fn verb_process_cpp_cross_compiles_for_windows() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let obj = std::env::temp_dir().join("verb_process_windows_syntax_check.o");
+    let status = Command::new("zig")
+        .args([
+            "c++", "-target", "x86_64-windows-gnu",
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_process.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke zig c++ to cross-compile runtime/verb_process.cpp");
+    assert!(status.success(), "runtime/verb_process.cpp failed to cross-compile for Windows");
+    let _ = std::fs::remove_file(&obj);
 }
 
 #[test]

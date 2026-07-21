@@ -1,0 +1,9 @@
+import std process;
+
+assign d cwd();
+assign e exe_path();
+check d differs nil begin
+  check e differs nil begin
+    print("both ok");
+  end
+end
