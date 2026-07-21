@@ -70,6 +70,11 @@ fn assert_no_leaks(fixture: &str) {
 fn literals() { run_ok("literals"); }
 
 #[test]
+fn get_pid_works_under_jit_with_no_import() {
+    run_ok("core_builtins_get_pid");
+}
+
+#[test]
 fn array_literal_prints() { run_ok("arrays_literal"); }
 
 #[test]
@@ -449,6 +454,21 @@ fn verb_env_cpp_compiles_standalone() {
         .status()
         .expect("failed to invoke c++ to compile runtime/verb_env.cpp");
     assert!(status.success(), "runtime/verb_env.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
+#[test]
+fn verb_builtins_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_builtins_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_builtins.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_builtins.cpp");
+    assert!(status.success(), "runtime/verb_builtins.cpp failed to compile");
     let _ = std::fs::remove_file(&obj);
 }
 
