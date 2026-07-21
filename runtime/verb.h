@@ -49,4 +49,109 @@ static inline const char* verb_as_string(VerbValue v) {
 }
 static inline int verb_as_bool(VerbValue v) { return v.payload != 0; }
 
+#ifdef __cplusplus
+#include <tuple>
+#include <utility>
+#include <type_traits>
+
+// VERB_EXPORT(name, arity, callable) generates an `extern "C" VerbValue
+// name(...)` wrapper around `callable`, deducing and type-checking its
+// real signature at compile time instead of requiring a hand-written
+// VerbValue-typed wrapper. See docs/superpowers/specs/
+// 2026-07-20-verb-export-macro-design.md for the full design.
+namespace verb_detail {
+
+template <typename T> T unwrap(VerbValue v);
+template <> inline int64_t     unwrap<int64_t>(VerbValue v)     { return verb_as_int(v); }
+template <> inline double      unwrap<double>(VerbValue v)      { return verb_as_float(v); }
+template <> inline const char* unwrap<const char*>(VerbValue v) { return verb_as_string(v); }
+template <> inline int         unwrap<int>(VerbValue v)         { return verb_as_bool(v); }
+
+template <typename T> VerbValue wrap(T v);
+template <> inline VerbValue wrap<int64_t>(int64_t v)         { return verb_int(v); }
+template <> inline VerbValue wrap<double>(double v)           { return verb_float(v); }
+template <> inline VerbValue wrap<const char*>(const char* v) { return verb_string(v); }
+template <> inline VerbValue wrap<int>(int v)                 { return verb_bool(v); }
+
+inline VerbValue wrap_void() { return verb_nil(); }
+
+template <typename F> struct function_traits;
+
+template <typename R, typename... Args>
+struct function_traits<R(Args...)> {
+    using return_type = R;
+    static constexpr size_t arity = sizeof...(Args);
+    template <size_t I> using arg_type = std::tuple_element_t<I, std::tuple<Args...>>;
+};
+
+template <typename R, typename... Args>
+struct function_traits<R(*)(Args...)> : function_traits<R(Args...)> {};
+
+template <typename T> struct is_supported_type : std::false_type {};
+template <> struct is_supported_type<int64_t> : std::true_type {};
+template <> struct is_supported_type<double> : std::true_type {};
+template <> struct is_supported_type<const char*> : std::true_type {};
+template <> struct is_supported_type<int> : std::true_type {};
+
+template <typename T> struct is_supported_return : is_supported_type<T> {};
+template <> struct is_supported_return<void> : std::true_type {};
+
+template <typename Traits, size_t... I>
+constexpr bool all_args_supported(std::index_sequence<I...>) {
+    bool results[] = { is_supported_type<typename Traits::template arg_type<I>>::value..., true };
+    for (bool b : results) if (!b) return false;
+    return true;
+}
+
+template <auto Fn, typename Traits, typename Tuple, size_t... I>
+VerbValue invoke_call(Tuple& args, std::index_sequence<I...>) {
+    if constexpr (std::is_void_v<typename Traits::return_type>) {
+        Fn(unwrap<typename Traits::template arg_type<I>>(std::get<I>(args))...);
+        return wrap_void();
+    } else {
+        return wrap<typename Traits::return_type>(
+            Fn(unwrap<typename Traits::template arg_type<I>>(std::get<I>(args))...));
+    }
+}
+
+template <auto Fn, typename... As>
+VerbValue invoke(As... as) {
+    using traits = function_traits<decltype(Fn)>;
+    static_assert(traits::arity == sizeof...(As),
+        "VERB_EXPORT arity does not match callable's parameter count");
+    if constexpr (traits::arity == sizeof...(As)) {
+        static_assert(all_args_supported<traits>(std::make_index_sequence<traits::arity>{}),
+            "VERB_EXPORT: unsupported parameter type");
+        static_assert(is_supported_return<typename traits::return_type>::value,
+            "VERB_EXPORT: unsupported return type");
+        std::tuple<As...> args(as...);
+        return invoke_call<Fn, traits>(args, std::make_index_sequence<sizeof...(As)>{});
+    } else {
+        return VerbValue{};
+    }
+}
+
+} // namespace verb_detail
+
+#define VERB_EXPORT_IMPL_0(name, fn) \
+    extern "C" VerbValue name() { return ::verb_detail::invoke<fn>(); }
+#define VERB_EXPORT_IMPL_1(name, fn) \
+    extern "C" VerbValue name(VerbValue a0) { return ::verb_detail::invoke<fn>(a0); }
+#define VERB_EXPORT_IMPL_2(name, fn) \
+    extern "C" VerbValue name(VerbValue a0, VerbValue a1) { return ::verb_detail::invoke<fn>(a0, a1); }
+#define VERB_EXPORT_IMPL_3(name, fn) \
+    extern "C" VerbValue name(VerbValue a0, VerbValue a1, VerbValue a2) { return ::verb_detail::invoke<fn>(a0, a1, a2); }
+#define VERB_EXPORT_IMPL_4(name, fn) \
+    extern "C" VerbValue name(VerbValue a0, VerbValue a1, VerbValue a2, VerbValue a3) { return ::verb_detail::invoke<fn>(a0, a1, a2, a3); }
+#define VERB_EXPORT_IMPL_5(name, fn) \
+    extern "C" VerbValue name(VerbValue a0, VerbValue a1, VerbValue a2, VerbValue a3, VerbValue a4) { return ::verb_detail::invoke<fn>(a0, a1, a2, a3, a4); }
+#define VERB_EXPORT_IMPL_6(name, fn) \
+    extern "C" VerbValue name(VerbValue a0, VerbValue a1, VerbValue a2, VerbValue a3, VerbValue a4, VerbValue a5) { return ::verb_detail::invoke<fn>(a0, a1, a2, a3, a4, a5); }
+
+#define VERB_EXPORT_CONCAT_(a, b) a##b
+#define VERB_EXPORT_CONCAT(a, b) VERB_EXPORT_CONCAT_(a, b)
+#define VERB_EXPORT(name, arity, fn) VERB_EXPORT_CONCAT(VERB_EXPORT_IMPL_, arity)(name, fn)
+
+#endif // __cplusplus
+
 #endif // VERB_H

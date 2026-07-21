@@ -3,3 +3,6 @@ import mod mathlib;
 print(c_sqrt(9.0));
 print(c_add_int(2, 3));
 print(c_shout("hi"));
+c_hello();
+print(c_is_positive(5));
+print(c_is_positive(neg 5));
