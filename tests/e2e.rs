@@ -549,6 +549,26 @@ fn zig_available() -> bool {
 }
 
 #[test]
+fn verb_process_cpp_cross_compiles_for_windows() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let obj = std::env::temp_dir().join("verb_process_windows_syntax_check.o");
+    let status = Command::new("zig")
+        .args([
+            "c++", "-target", "x86_64-windows-gnu",
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_process.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke zig c++ to cross-compile runtime/verb_process.cpp");
+    assert!(status.success(), "runtime/verb_process.cpp failed to cross-compile for Windows");
+    let _ = std::fs::remove_file(&obj);
+}
+
+#[test]
 fn aot_cross_build_produces_binary_for_each_target() {
     if !zig_available() {
         eprintln!("skipping: zig not on PATH");
