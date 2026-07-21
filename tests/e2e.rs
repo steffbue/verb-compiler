@@ -88,6 +88,24 @@ fn array_pop_empty_aborts() {
 }
 
 #[test]
+fn array_of_arrays() { run_ok("arrays_of_arrays"); }
+
+#[test]
+fn array_of_closures() { run_ok("arrays_of_closures"); }
+
+#[test]
+fn array_literal_emits_malloc_and_store_in_ir() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/arrays_literal.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("call ptr @malloc"), "no malloc call in IR:\n{ir}");
+    assert!(ir.contains("@verb_print_value"), "no verb_print_value in IR:\n{ir}");
+}
+
+#[test]
 fn arith() { run_ok("arith"); }
 
 #[test]

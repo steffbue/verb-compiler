@@ -118,6 +118,34 @@ returns `nil` on failure — check with `check x eq nil`.
 See `docs/superpowers/specs/2026-07-20-std-io-import-design.md` for
 the full design.
 
+## Arrays
+
+Growable arrays use a `list` literal and `get`/`set`/`push`/`pop`/`len`
+built-in functions — no `[...]` bracket syntax:
+
+    assign a list 10, 20, 30;
+    print(get(a, 0));      %% 10
+    set(a, 0, 99);
+    push(a, 40);
+    print(a);                %% [99, 20, 30, 40]
+    print(len(a));           %% 4
+    assign x pop(a);
+    print(x);                 %% 40
+
+`list e1, e2, ...` has no closing delimiter — it greedily consumes every
+comma-separated expression that follows, so it can't be followed by a
+sibling argument in a call, and a `list` literal nested as a non-final
+element of another `list` gets swallowed by the inner one. Build nested
+arrays via variables instead:
+
+    assign inner list 1, 2;
+    assign outer list inner, inner;   %% [[1, 2], [1, 2]]
+
+Out-of-bounds `get`/`set`, a `pop` on an empty array, or a non-array
+argument to any of these functions is a runtime error, same as other
+type/bounds errors in Verb. `eqeq`/`neq` on two arrays compares them by
+reference (same underlying array), not by contents.
+
 ## Language
 
 See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
@@ -133,7 +161,7 @@ See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
 ## Known v1 limitations
 
 - No GC — heap allocations are never freed
-- No arrays/maps, no `break`/`continue`, no anonymous functions
+- No maps, no `break`/`continue`, no anonymous functions
 - No closures — a nested `make` cannot reference any variable from its
   enclosing function's scope (not even ones declared before it); it can
   only see its own parameters/locals and top-level globals

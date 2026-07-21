@@ -1,0 +1,9 @@
+make sq(n) begin
+  return n times n;
+end
+make cube(n) begin
+  return n times n times n;
+end
+assign fns list sq, cube;
+print(get(fns, 0)(4));
+print(get(fns, 1)(3));
