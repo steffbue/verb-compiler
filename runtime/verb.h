@@ -6,6 +6,10 @@
 //
 // Tag 5 (closure) never crosses this boundary: Verb closures aren't
 // representable in C++ and extern fns can't receive or return one.
+// Tag 6 (map) crosses fine as an opaque payload -- extern fns that don't
+// need to interpret a map's contents (e.g. storing one as another map's
+// value) can pass it through untouched; only runtime/verb_map.cpp itself
+// dereferences the pointer.
 #ifndef VERB_H
 #define VERB_H
 
@@ -20,6 +24,7 @@ enum {
     VERB_INT = 2,
     VERB_FLOAT = 3,
     VERB_STRING = 4,
+    VERB_MAP = 6,
 };
 
 static inline VerbValue verb_nil(void) {
@@ -37,6 +42,9 @@ static inline VerbValue verb_float(double d) {
 static inline VerbValue verb_string(const char* s) {
     VerbValue v; v.tag = VERB_STRING; memcpy(&v.payload, &s, sizeof(s)); return v;
 }
+static inline VerbValue verb_map(void* p) {
+    VerbValue v; v.tag = VERB_MAP; memcpy(&v.payload, &p, sizeof(p)); return v;
+}
 
 static inline int verb_is(VerbValue v, int tag) { return v.tag == tag; }
 
@@ -46,6 +54,9 @@ static inline double verb_as_float(VerbValue v) {
 }
 static inline const char* verb_as_string(VerbValue v) {
     const char* s; memcpy(&s, &v.payload, sizeof(s)); return s;
+}
+static inline void* verb_as_map(VerbValue v) {
+    void* p; memcpy(&p, &v.payload, sizeof(p)); return p;
 }
 static inline int verb_as_bool(VerbValue v) { return v.payload != 0; }
 

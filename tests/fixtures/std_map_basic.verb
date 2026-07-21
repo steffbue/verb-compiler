@@ -1,0 +1,15 @@
+import std map;
+
+assign m map_new();
+map_set(m, "a", 1);
+map_set(m, "b", 2);
+print(map_get(m, "a"));
+print(map_get(m, "z"));
+print(map_has(m, "b"));
+print(map_has(m, "z"));
+assign removed map_remove(m, "a");
+print(removed);
+print(map_len(m));
+map_set(m, 1, "int-key");
+print(map_get(m, 1.0));
+print(map_len(m));

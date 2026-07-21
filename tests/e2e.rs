@@ -295,6 +295,21 @@ fn verb_std_io_cpp_compiles_standalone() {
     let _ = std::fs::remove_file(&obj);
 }
 
+#[test]
+fn verb_map_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_map_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_map.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_map.cpp");
+    assert!(status.success(), "runtime/verb_map.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
 // ----- AOT host / cross build + multi-file (from main) -----
 
 #[test]
@@ -587,4 +602,65 @@ fn windows_cross_target_rejects_std_io_import() {
         stderr.contains("not supported when cross-compiling to a Windows target"),
         "stderr: {stderr}"
     );
+}
+
+// ----- std map -----
+
+#[test]
+fn run_rejects_programs_with_std_map_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_map_basic.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std map"), "stderr: {stderr}");
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_map() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_map_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_map_basic.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_map_basic.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn cross_build_links_a_program_using_std_map_for_a_non_host_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    // Unlike std io, std map has no Windows restriction (no POSIX-only
+    // deps), so this also covers a Windows target rather than needing a
+    // separate rejection test.
+    let label = if cfg!(target_arch = "x86_64") { "linux-arm64" } else { "linux-x86_64" };
+    let dir = std::env::temp_dir().join("verb_std_map_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join(format!("std_map_basic_{label}"));
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_map_basic.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", label,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "target {label} failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for {label}");
 }
