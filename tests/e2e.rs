@@ -998,3 +998,73 @@ fn build_mathlib_for_target(label: &str, zig_triple: &str) -> std::path::PathBuf
     let _ = std::fs::remove_file(&obj_path);
     dir
 }
+
+/// Cross-compiles the FFI-importing integration example (D-01) for all 6
+/// supported OS/arch targets: `examples/integration_all.verb` (full, with
+/// std io) for the 4 non-Windows targets, `examples/integration_all_windows.verb`
+/// (std-io-less) for the 2 Windows targets (D-06). Each target links a
+/// target-matched libmathlib built via `build_mathlib_for_target` so the
+/// `import mod mathlib;` FFI import resolves at cross-link time -- this is
+/// exactly the failure mode a host-built libmathlib would hit (T-08-06).
+///
+/// Build-only (D-05): asserts each target's output artifact exists and is
+/// non-empty; never executes a foreign-target binary. Skips cleanly when
+/// zig is unavailable, matching `aot_cross_build_produces_binary_for_each_target`.
+#[test]
+fn integration_example_cross_builds_all_targets() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_e2e_integration_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // (label, zig_triple) pairs matching src/targets.rs::ALL and Target::zig_triple().
+    let targets: [(&str, &str); 6] = [
+        ("linux-x86_64", "x86_64-linux-gnu"),
+        ("linux-arm64", "aarch64-linux-gnu"),
+        ("macos-x86_64", "x86_64-macos-none"),
+        ("macos-arm64", "aarch64-macos-none"),
+        ("windows-x86_64", "x86_64-windows-gnu"),
+        ("windows-arm64", "aarch64-windows-gnu"),
+    ];
+
+    for (label, zig_triple) in targets {
+        let is_windows = label.starts_with("windows");
+        let source = if is_windows {
+            "examples/integration_all_windows.verb"
+        } else {
+            "examples/integration_all.verb"
+        };
+
+        let lib_dir = build_mathlib_for_target(label, zig_triple);
+        let bin = dir.join(format!("integration_cross_{label}"));
+
+        let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+            .args([
+                "build",
+                source,
+                "-o", bin.to_str().unwrap(),
+                "--target", label,
+                &format!("-L{}", lib_dir.display()),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "target {label} failed to build {source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Build-only: never invoke the produced artifact -- it targets a
+        // foreign OS/arch and cannot run on this host (D-05).
+        let expected_path = if is_windows {
+            dir.join(format!("integration_cross_{label}.exe"))
+        } else {
+            bin
+        };
+        let meta = std::fs::metadata(&expected_path)
+            .unwrap_or_else(|e| panic!("missing output for {label} at {expected_path:?}: {e}"));
+        assert!(meta.len() > 0, "empty output for {label}");
+    }
+}
