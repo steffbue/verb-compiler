@@ -812,6 +812,12 @@ fn run_executes_std_map_import() {
 }
 
 #[test]
+fn run_executes_std_map_import_with_nested_containers() {
+    run_ok("gc_run_nested_map");
+    assert_no_leaks_under_run("gc_run_nested_map");
+}
+
+#[test]
 fn build_links_and_runs_a_program_using_std_map() {
     let out_path = std::env::temp_dir().join("verb_e2e_std_map_bin");
     let build = Command::new(env!("CARGO_BIN_EXE_verb"))

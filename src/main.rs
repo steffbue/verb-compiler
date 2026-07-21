@@ -218,7 +218,7 @@ fn die(e: CompileError, sources: &[(String, String)]) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
+    eprintln!("usage: verb run <file.verb>... [-L<dir>]... [--emit-llvm]");
     eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]");
     eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]  (alias for build)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
@@ -230,6 +230,14 @@ fn usage() -> ! {
 /// (macOS) / `lib<name>.so` (Linux); if none exists on disk, returns the bare
 /// filename so the OS loader can search its default paths. Static `.a`
 /// archives are intentionally unsupported under `verb run` — use `verb build`.
+///
+/// Side effect: in the fallback branch, "resolving" the bare filename probes
+/// for its existence by calling `load_library_permanently` on it, which — if
+/// the library is found — permanently loads it into this process for the
+/// remainder of its lifetime. This is idempotent (loading an already-loaded
+/// library again is a no-op), and the `run` arm loads the resolved path again
+/// for real afterward, so the extra load here is harmless, just a side effect
+/// worth knowing about when reasoning about process state.
 fn resolve_mod_lib(name: &str, lib_dirs: &[String]) -> Result<PathBuf, String> {
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
     let filename = format!("lib{name}.{ext}");
@@ -323,6 +331,16 @@ fn main() {
             // Point the host verb_alloc/retain/release thunks at the module's
             // JIT-compiled definitions. Only read at runtime (during main), so
             // it is fine that get_function_address finalizes the module here.
+            //
+            // Load-bearing invariant: codegen (src/codegen.rs build_alloc_fn /
+            // build_retain_value_fn / build_release_value_fn) MUST emit a real
+            // *body* for each of these three functions into every module, not
+            // just a declaration. If codegen ever emitted only a declaration,
+            // get_function_address would resolve the symbol back to this very
+            // host thunk (since the thunk itself is exported under the same
+            // name for AOT builds), and the thunk would call itself forever —
+            // infinite recursion, stack overflow, with no diagnostic pointing
+            // at the real cause.
             for (name, slot) in [
                 ("verb_alloc", &VERB_ALLOC_ADDR),
                 ("verb_retain_value", &VERB_RETAIN_ADDR),
