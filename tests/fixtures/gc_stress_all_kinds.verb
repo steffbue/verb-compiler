@@ -1,0 +1,14 @@
+import std map;
+
+assign total 0;
+loop assign i 0; i trails 500; i be i add 1 begin
+  declare s;
+  s be "iter" join "-done";
+  assign arr list s, i;
+  assign m map_new();
+  map_set(m, "k", get(arr, 0));
+  check map_get(m, "k") equals "iter-done" begin
+    total be total add 1;
+  end
+end
+print(total);
