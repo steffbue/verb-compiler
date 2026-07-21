@@ -83,6 +83,19 @@ fn functions() { run_ok("functions"); }
 fn call_non_function_aborts() { run_err("err_call_nonfn", "can only call functions, got int"); }
 
 #[test]
+fn nested_make_sees_own_scope_and_top_level_globals() { run_ok("closures"); }
+
+#[test]
+fn nested_make_cannot_capture_enclosing_local() {
+    compile_err("err_closure_no_capture", &["undefined variable 'local'"]);
+}
+
+#[test]
+fn nested_make_cannot_capture_enclosing_param() {
+    compile_err("err_closure_no_capture_param", &["undefined variable 'a'"]);
+}
+
+#[test]
 fn wrong_arity_aborts() {
     run_err("err_arity", "wrong number of arguments: expected 1, got 2");
 }
