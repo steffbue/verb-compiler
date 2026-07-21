@@ -75,6 +75,19 @@ fn array_get_bounds_error_aborts() {
 }
 
 #[test]
+fn array_push_pop_grows() { run_ok("arrays_push_pop"); }
+
+#[test]
+fn array_push_type_error_aborts() {
+    run_err("err_array_push_type", "'push' needs an array, got int");
+}
+
+#[test]
+fn array_pop_empty_aborts() {
+    run_err("err_array_pop_empty", "pop from empty array");
+}
+
+#[test]
 fn arith() { run_ok("arith"); }
 
 #[test]
