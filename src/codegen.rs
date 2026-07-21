@@ -1974,6 +1974,16 @@ impl<'ctx> Codegen<'ctx> {
                     return self.gen_std_io_call(name, arity, args, line, col);
                 }
             }
+            if !is_bound && self.std_imports.iter().any(|m| m == "env") {
+                if let Some(arity) = env_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, line, col);
+                }
+            }
+            if !is_bound && self.std_imports.iter().any(|m| m == "process") {
+                if let Some(arity) = process_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, line, col);
+                }
+            }
             if !is_bound && !self.imports.is_empty() {
                 return self.gen_extern_call(name, args, line, col);
             }
@@ -2143,6 +2153,31 @@ fn map_func_arity(name: &str) -> Option<usize> {
     MAP_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
+/// Fixed name -> arity table for the `env` module's built-in functions
+/// (see runtime/verb_env.cpp and the design spec). See `IO_FUNCS`.
+const ENV_FUNCS: &[(&str, usize)] = &[
+    ("getenv", 1),
+    ("setenv", 2),
+    ("unsetenv", 1),
+];
+
+fn env_func_arity(name: &str) -> Option<usize> {
+    ENV_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
+/// Fixed name -> arity table for the `process` module's built-in functions
+/// (see runtime/verb_process.cpp and the design spec). See `IO_FUNCS`.
+const PROCESS_FUNCS: &[(&str, usize)] = &[
+    ("cwd", 0),
+    ("exe_path", 0),
+    ("spawn", 2),
+    ("wait", 1),
+];
+
+fn process_func_arity(name: &str) -> Option<usize> {
+    PROCESS_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
 fn levenshtein(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -2265,6 +2300,66 @@ mod tests {
             .unwrap_err();
         assert!(err.msg.contains("map_get"), "{}", err.msg);
         assert!(err.msg.contains("takes 2 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_env_call_with_correct_arity_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("getenv".to_string(), 1, 1)),
+            args: vec![Expr::Str("HOME".to_string())],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["env".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_env_arity_mismatch_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("getenv".to_string(), 1, 1)),
+            args: vec![Expr::Str("A".to_string()), Expr::Str("B".to_string())],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["env".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("getenv"), "{}", err.msg);
+        assert!(err.msg.contains("takes 1 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_process_call_with_correct_arity_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("cwd".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["process".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_process_arity_mismatch_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("wait".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["process".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("wait"), "{}", err.msg);
+        assert!(err.msg.contains("takes 1 argument"), "{}", err.msg);
     }
 
     #[test]
