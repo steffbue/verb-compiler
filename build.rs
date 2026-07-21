@@ -22,8 +22,10 @@ fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let runtime = manifest.join("runtime");
     let map_cpp = runtime.join("verb_map.cpp");
+    let builtins_cpp = runtime.join("verb_builtins.cpp");
 
     println!("cargo:rerun-if-changed={}", map_cpp.display());
+    println!("cargo:rerun-if-changed={}", builtins_cpp.display());
     println!("cargo:rerun-if-changed={}", runtime.join("verb.h").display());
 
     cc::Build::new()
@@ -31,5 +33,6 @@ fn main() {
         .std("c++17")
         .include(&runtime)
         .file(&map_cpp)
+        .file(&builtins_cpp)
         .compile("verb_runtime");
 }

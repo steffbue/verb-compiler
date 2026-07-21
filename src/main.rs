@@ -23,6 +23,7 @@ use verb::targets;
 // C++ ABI mirror of `VerbValue` (`{ i8, i64 }`) — see runtime/verb.h. Only
 // used to give the host stubs below a matching signature; never populated.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct VerbValueAbi {
     pub tag: i8,
     pub payload: i64,
@@ -31,6 +32,10 @@ pub struct VerbValueAbi {
 extern "C" {
     /// Defined in `runtime/verb_map.cpp`, compiled into this binary by build.rs.
     fn verb_map_destroy_contents(payload: *mut std::ffi::c_void);
+    /// Defined in `runtime/verb_builtins.cpp`, compiled into this binary by build.rs.
+    fn builtin_exit(code: VerbValueAbi) -> VerbValueAbi;
+    fn builtin_abort() -> VerbValueAbi;
+    fn builtin_get_pid() -> VerbValueAbi;
 }
 
 // `runtime/verb_map.cpp` (linked into this binary) references these three
@@ -65,8 +70,12 @@ fn register_jit_runtime_symbols<'ctx>(
     ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
     module: &inkwell::module::Module<'ctx>,
 ) {
-    let symbols: [(&str, usize); 1] =
-        [("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize)];
+    let symbols: [(&str, usize); 4] = [
+        ("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize),
+        ("builtin_exit", builtin_exit as *const () as usize),
+        ("builtin_abort", builtin_abort as *const () as usize),
+        ("builtin_get_pid", builtin_get_pid as *const () as usize),
+    ];
     for (name, addr) in symbols {
         if let Some(f) = module.get_function(name) {
             ee.add_global_mapping(&f, addr);

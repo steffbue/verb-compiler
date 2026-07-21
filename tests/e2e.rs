@@ -70,6 +70,11 @@ fn assert_no_leaks(fixture: &str) {
 fn literals() { run_ok("literals"); }
 
 #[test]
+fn get_pid_works_under_jit_with_no_import() {
+    run_ok("core_builtins_get_pid");
+}
+
+#[test]
 fn array_literal_prints() { run_ok("arrays_literal"); }
 
 #[test]
