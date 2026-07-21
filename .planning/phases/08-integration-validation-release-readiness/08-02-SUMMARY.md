@@ -149,3 +149,11 @@ None beyond what the plan's own `<threat_model>` already anticipated (T-08-03 FF
 ---
 *Phase: 08-integration-validation-release-readiness*
 *Completed: 2026-07-21*
+
+## Self-Check: PASSED
+
+- FOUND: examples/integration_all.verb
+- FOUND: examples/integration_all_windows.verb
+- FOUND: .planning/phases/08-integration-validation-release-readiness/08-02-SUMMARY.md
+- FOUND: integration_example_zero_leaks() in tests/e2e.rs
+- FOUND commits: 7f7208c, 0b94680, d9232d2, b7b9a28 (all present in `git log`)
