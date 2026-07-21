@@ -1,0 +1,3 @@
+print("before");
+exit(3);
+print("after");

@@ -1,1 +1,1 @@
-nil as expected
+exec failure surfaced as exit code 127

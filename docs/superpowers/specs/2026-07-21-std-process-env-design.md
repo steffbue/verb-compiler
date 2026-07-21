@@ -90,8 +90,21 @@ names — the only Verb-facing calls are `spawn`/`wait`/`get_pid`.
   `args` is a Verb array of strings (extra argv entries, **not**
   including `argv[0]`). No shell is invoked to parse anything — avoids
   shell-injection risk entirely. Returns the child's pid (int) on
-  success, `nil` if the child could not be started (exec failure,
-  `CreateProcess` failure).
+  success, `nil` if `cmd`/`args` are the wrong Verb types or the OS
+  couldn't create a process at all (`fork()` failure on POSIX,
+  `CreateProcess` failure on Windows). **Asymmetry, by design, not a
+  bug:** on Windows, `CreateProcess` validates the target executable
+  exists before returning, so a missing binary makes `spawn()` itself
+  return `nil`. On POSIX, `fork()` always succeeds regardless of
+  whether `cmd` exists — the child only discovers the binary is
+  missing when it calls `execvp`, by which point it's a separate
+  process that can't hand a `VerbValue` back to `spawn()`'s caller. So
+  on POSIX, a missing binary makes `spawn()` return a valid pid, and
+  the failure surfaces later as `wait(pid)` returning exit code 127
+  (the same convention a POSIX shell uses for "command not found").
+  Detecting this synchronously would require a self-pipe between
+  parent and child to relay `execvp`'s `errno` before the child exits
+  — deliberately out of scope for v1 (see Out of scope).
 - `wait(pid)` — blocks until the given pid exits, returns its exit code
   (int). Returns `nil` if `pid` doesn't correspond to a live child of
   this process (bad `waitpid`/`WaitForSingleObject` result). No stdout/
@@ -282,7 +295,11 @@ Captured stdout/stderr from `spawn`ed children; signals (`kill`,
 custom handlers); non-blocking `wait` (`waitpid(WNOHANG)`/
 polling); environment as a bulk snapshot (`environ` iteration —
 `env_get`/`env_set`/`env_unset` are per-key only); process groups/
-sessions; raw fork/execve/CreateProcess exposed directly to Verb code.
+sessions; raw fork/execve/CreateProcess exposed directly to Verb code;
+a self-pipe (or `posix_spawn`-based) mechanism to make `spawn()` itself
+detect a missing POSIX executable synchronously — v1 accepts that this
+surfaces via `wait()`'s exit code 127 instead (see spawn/wait API
+shape).
 A `spawn`ed pid that's never passed to `wait()` leaks a zombie entry
 (POSIX) or an open process handle (Windows) — accepted v1 limitation,
 same class as the existing unbounded-but-accepted cyclic-array leak.

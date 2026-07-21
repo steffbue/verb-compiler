@@ -1198,3 +1198,126 @@ fn integration_example_cross_builds_all_targets() {
         assert!(meta.len() > 0, "empty output for {label}");
     }
 }
+
+// ----- std env -----
+
+#[test]
+fn build_links_and_runs_a_program_using_std_env() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_env_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_env_roundtrip.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_env_roundtrip.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn run_rejects_programs_with_std_env_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_env_roundtrip.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std env"), "stderr: {stderr}");
+}
+
+// ----- std process (AOT integration) -----
+
+#[test]
+fn build_links_and_runs_std_process_cwd_exe() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_cwd_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_cwd_exe.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_cwd_exe.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_std_process_spawn_wait() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_spawn_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_spawn_wait.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_spawn_wait.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_std_process_spawn_missing_binary() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_spawn_missing_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_spawn_missing_binary.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_spawn_missing_binary.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn run_rejects_programs_with_std_process_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_process_cwd_exe.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std process"), "stderr: {stderr}");
+}
+
+// ----- core builtins: exit skips cleanup -----
+
+#[test]
+fn exit_stops_execution_and_sets_exit_code() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/core_builtins_exit_skips_trailing_code.verb"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let expected = std::fs::read_to_string(
+        "tests/fixtures/core_builtins_exit_skips_trailing_code.expected",
+    ).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
