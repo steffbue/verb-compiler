@@ -1,0 +1,4 @@
+assign a list 1, 2, 3;
+print(a);
+assign b list 42;
+print(b);

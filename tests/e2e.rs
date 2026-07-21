@@ -46,6 +46,9 @@ fn run_err(name: &str, msg: &str) {
 fn literals() { run_ok("literals"); }
 
 #[test]
+fn array_literal_prints() { run_ok("arrays_literal"); }
+
+#[test]
 fn arith() { run_ok("arith"); }
 
 #[test]
