@@ -64,6 +64,10 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_array_set_fn();
         cg.build_array_push_fn();
         cg.build_array_pop_fn();
+        cg.build_retain_value_fn();
+        cg.build_release_value_fn();
+        cg.build_retain_cell_fn();
+        cg.build_release_cell_fn();
         cg
     }
 
@@ -82,6 +86,8 @@ impl<'ctx> Codegen<'ctx> {
         self.module.add_function("strcmp", i32t.fn_type(&[pt.into(), pt.into()], false), None);
         self.module.add_function("free", self.ctx.void_type().fn_type(&[pt.into()], false), None);
         self.module.add_function("getenv", pt.fn_type(&[pt.into()], false), None);
+        self.module.add_function(
+            "verb_map_destroy_contents", self.ctx.void_type().fn_type(&[pt.into()], false), None);
     }
 
     fn declare_gc_globals(&self) {
@@ -95,6 +101,26 @@ impl<'ctx> Codegen<'ctx> {
         let g = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
         let cur = self.builder.build_load(i64t, g, "gc_live").unwrap().into_int_value();
         let next = self.builder.build_int_add(cur, i64t.const_int(1, false), "gc_live1").unwrap();
+        self.builder.build_store(g, next).unwrap();
+    }
+
+    /// Given a payload pointer (what a `VerbValue` or a cell already
+    /// points at), returns a pointer to its 8-byte refcount header,
+    /// living immediately before it. Valid for every string, closure,
+    /// array, map, and cell pointer Verb ever produces.
+    fn header_ptr(&self, payload: PointerValue<'ctx>) -> PointerValue<'ctx> {
+        let i64t = self.ctx.i64_type();
+        unsafe {
+            self.builder.build_in_bounds_gep(
+                self.ctx.i8_type(), payload, &[i64t.const_int((-8i64) as u64, true)], "hdr")
+        }.unwrap()
+    }
+
+    fn dec_live_counter(&self) {
+        let i64t = self.ctx.i64_type();
+        let g = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
+        let cur = self.builder.build_load(i64t, g, "gc_live").unwrap().into_int_value();
+        let next = self.builder.build_int_sub(cur, i64t.const_int(1, false), "gc_live1").unwrap();
         self.builder.build_store(g, next).unwrap();
     }
 
@@ -1046,6 +1072,273 @@ impl<'ctx> Codegen<'ctx> {
         let v = self.builder.build_load(self.value_ty, slot, "v").unwrap().into_struct_value();
         self.builder.build_store(lenp, newlen).unwrap();
         self.builder.build_return(Some(&v)).unwrap();
+    }
+
+    /// Runtime helper: verb_retain_value(VerbValue v) -> void. No-op
+    /// unless v is a heap-identity tag (string, closure, array, map).
+    /// Static string literals (sentinel header) are skipped -- immortal,
+    /// count never moves.
+    fn build_retain_value_fn(&self) {
+        use inkwell::IntPredicate::*;
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.value_ty.into()], false);
+        let f = self.module.add_function("verb_retain_value", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let str_bb = self.ctx.append_basic_block(f, "str");
+        let str_bump_bb = self.ctx.append_basic_block(f, "str.bump");
+        let heap_check_bb = self.ctx.append_basic_block(f, "heap.check");
+        let heap_bump_bb = self.ctx.append_basic_block(f, "heap.bump");
+        let done_bb = self.ctx.append_basic_block(f, "done");
+
+        self.builder.position_at_end(entry);
+        let v = f.get_nth_param(0).unwrap().into_struct_value();
+        let (t, p) = (self.tag_of(v), self.payload_of(v));
+        let is_str = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STR, false), "is_str").unwrap();
+        self.builder.build_conditional_branch(is_str, str_bb, heap_check_bb).unwrap();
+
+        self.builder.position_at_end(str_bb);
+        let sp = self.builder.build_int_to_ptr(p, self.ptr_ty, "sp").unwrap();
+        let shdr = self.header_ptr(sp);
+        let scur = self.builder.build_load(i64t, shdr, "scur").unwrap().into_int_value();
+        let is_static = self.builder.build_int_compare(
+            EQ, scur, i64t.const_int(GC_STATIC_SENTINEL as u64, true), "is_static").unwrap();
+        self.builder.build_conditional_branch(is_static, done_bb, str_bump_bb).unwrap();
+
+        self.builder.position_at_end(str_bump_bb);
+        let snext = self.builder.build_int_add(scur, i64t.const_int(1, false), "snext").unwrap();
+        self.builder.build_store(shdr, snext).unwrap();
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // closure/array/map all share the same "always heap, always just
+        // bump the header" behavior for retain -- only release (Step 4)
+        // needs different cascade logic per tag.
+        self.builder.position_at_end(heap_check_bb);
+        let is_clos = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_CLOSURE, false), "is_clos").unwrap();
+        let is_arr = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ARRAY, false), "is_arr").unwrap();
+        let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
+        let is_clos_or_arr = self.builder.build_or(is_clos, is_arr, "is_clos_or_arr").unwrap();
+        let is_heap = self.builder.build_or(is_clos_or_arr, is_map, "is_heap").unwrap();
+        self.builder.build_conditional_branch(is_heap, heap_bump_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(heap_bump_bb);
+        let hp = self.builder.build_int_to_ptr(p, self.ptr_ty, "hp").unwrap();
+        let hhdr = self.header_ptr(hp);
+        let hcur = self.builder.build_load(i64t, hhdr, "hcur").unwrap().into_int_value();
+        let hnext = self.builder.build_int_add(hcur, i64t.const_int(1, false), "hnext").unwrap();
+        self.builder.build_store(hhdr, hnext).unwrap();
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+        self.builder.build_return(None).unwrap();
+    }
+
+    /// Runtime helper: verb_release_value(VerbValue v) -> void. No-op
+    /// unless v is a heap-identity tag; on those, decrements the header
+    /// and, at zero, cascades per-tag before freeing:
+    /// - STR: no cascade, just free (skip entirely if static sentinel).
+    /// - CLOSURE: no cascade (`env` is always null), just free.
+    /// - ARRAY: release every element 0..len (cascading into any
+    ///   heap-owned element), free `elems`, free the header.
+    /// - MAP: call `verb_map_destroy_contents` (defined in
+    ///   runtime/verb_map.cpp) to cascade-release every key/value and run
+    ///   the map's C++ destructor, then free the header here (the one
+    ///   place every heap kind's header actually gets `free`d).
+    fn build_release_value_fn(&self) {
+        use inkwell::IntPredicate::*;
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.value_ty.into()], false);
+        let f = self.module.add_function("verb_release_value", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let str_bb = self.ctx.append_basic_block(f, "str");
+        let str_live_bb = self.ctx.append_basic_block(f, "str.live");
+        let str_free_bb = self.ctx.append_basic_block(f, "str.free");
+        let clos_check_bb = self.ctx.append_basic_block(f, "clos.check");
+        let clos_bb = self.ctx.append_basic_block(f, "clos");
+        let clos_dec_bb = self.ctx.append_basic_block(f, "clos.dec");
+        let clos_free_bb = self.ctx.append_basic_block(f, "clos.free");
+        let arr_check_bb = self.ctx.append_basic_block(f, "arr.check");
+        let arr_bb = self.ctx.append_basic_block(f, "arr");
+        let arr_dec_bb = self.ctx.append_basic_block(f, "arr.dec");
+        let arr_free_bb = self.ctx.append_basic_block(f, "arr.free");
+        let arr_loop_cond_bb = self.ctx.append_basic_block(f, "arr.loop.cond");
+        let arr_loop_body_bb = self.ctx.append_basic_block(f, "arr.loop.body");
+        let arr_loop_end_bb = self.ctx.append_basic_block(f, "arr.loop.end");
+        let map_check_bb = self.ctx.append_basic_block(f, "map.check");
+        let map_bb = self.ctx.append_basic_block(f, "map");
+        let map_dec_bb = self.ctx.append_basic_block(f, "map.dec");
+        let map_free_bb = self.ctx.append_basic_block(f, "map.free");
+        let done_bb = self.ctx.append_basic_block(f, "done");
+
+        self.builder.position_at_end(entry);
+        let v = f.get_nth_param(0).unwrap().into_struct_value();
+        let (t, p) = (self.tag_of(v), self.payload_of(v));
+        let is_str = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STR, false), "is_str").unwrap();
+        self.builder.build_conditional_branch(is_str, str_bb, clos_check_bb).unwrap();
+
+        // ----- string -----
+        self.builder.position_at_end(str_bb);
+        let sp = self.builder.build_int_to_ptr(p, self.ptr_ty, "sp").unwrap();
+        let shdr = self.header_ptr(sp);
+        let scur = self.builder.build_load(i64t, shdr, "scur").unwrap().into_int_value();
+        let is_static = self.builder.build_int_compare(
+            EQ, scur, i64t.const_int(GC_STATIC_SENTINEL as u64, true), "is_static").unwrap();
+        self.builder.build_conditional_branch(is_static, done_bb, str_live_bb).unwrap();
+
+        self.builder.position_at_end(str_live_bb);
+        let snext = self.builder.build_int_sub(scur, i64t.const_int(1, false), "snext").unwrap();
+        self.builder.build_store(shdr, snext).unwrap();
+        let szero = self.builder.build_int_compare(EQ, snext, i64t.const_zero(), "szero").unwrap();
+        self.builder.build_conditional_branch(szero, str_free_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(str_free_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[shdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- closure (env always null: no cascade) -----
+        self.builder.position_at_end(clos_check_bb);
+        let is_clos = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_CLOSURE, false), "is_clos").unwrap();
+        self.builder.build_conditional_branch(is_clos, clos_bb, arr_check_bb).unwrap();
+
+        self.builder.position_at_end(clos_bb);
+        let cp = self.builder.build_int_to_ptr(p, self.ptr_ty, "cp").unwrap();
+        let chdr = self.header_ptr(cp);
+        let ccur = self.builder.build_load(i64t, chdr, "ccur").unwrap().into_int_value();
+        let cnext = self.builder.build_int_sub(ccur, i64t.const_int(1, false), "cnext").unwrap();
+        self.builder.build_store(chdr, cnext).unwrap();
+        let czero = self.builder.build_int_compare(EQ, cnext, i64t.const_zero(), "czero").unwrap();
+        self.builder.build_conditional_branch(czero, clos_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(clos_dec_bb);
+        self.builder.build_unconditional_branch(clos_free_bb).unwrap();
+
+        self.builder.position_at_end(clos_free_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[chdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- array: cascade into every element, then free elems + header -----
+        self.builder.position_at_end(arr_check_bb);
+        let is_arr = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ARRAY, false), "is_arr").unwrap();
+        self.builder.build_conditional_branch(is_arr, arr_bb, map_check_bb).unwrap();
+
+        self.builder.position_at_end(arr_bb);
+        let ap = self.builder.build_int_to_ptr(p, self.ptr_ty, "ap").unwrap();
+        let ahdr = self.header_ptr(ap);
+        let acur = self.builder.build_load(i64t, ahdr, "acur").unwrap().into_int_value();
+        let anext = self.builder.build_int_sub(acur, i64t.const_int(1, false), "anext").unwrap();
+        self.builder.build_store(ahdr, anext).unwrap();
+        let azero = self.builder.build_int_compare(EQ, anext, i64t.const_zero(), "azero").unwrap();
+        self.builder.build_conditional_branch(azero, arr_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(arr_dec_bb);
+        self.builder.build_unconditional_branch(arr_free_bb).unwrap();
+
+        self.builder.position_at_end(arr_free_bb);
+        let lenp = self.builder.build_struct_gep(self.array_ty, ap, 0, "lenp").unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, ap, 2, "elemsp").unwrap();
+        let len = self.builder.build_load(i64t, lenp, "len").unwrap().into_int_value();
+        let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
+        let idxp = self.entry_alloca(i64t.into(), "relidx");
+        self.builder.build_store(idxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(arr_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(arr_loop_cond_bb);
+        let i = self.builder.build_load(i64t, idxp, "i").unwrap().into_int_value();
+        let more = self.builder.build_int_compare(
+            inkwell::IntPredicate::SLT, i, len, "more").unwrap();
+        self.builder.build_conditional_branch(more, arr_loop_body_bb, arr_loop_end_bb).unwrap();
+
+        self.builder.position_at_end(arr_loop_body_bb);
+        let slot = unsafe {
+            self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot")
+        }.unwrap();
+        let elemv = self.builder.build_load(self.value_ty, slot, "elemv").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[elemv.into()]);
+        let inext = self.builder.build_int_add(i, i64t.const_int(1, false), "inext").unwrap();
+        self.builder.build_store(idxp, inext).unwrap();
+        self.builder.build_unconditional_branch(arr_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(arr_loop_end_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[elems.into()]);
+        self.call_named("free", &[ahdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- map: cascade via runtime/verb_map.cpp, then free header -----
+        self.builder.position_at_end(map_check_bb);
+        let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
+        self.builder.build_conditional_branch(is_map, map_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(map_bb);
+        let mp = self.builder.build_int_to_ptr(p, self.ptr_ty, "mp").unwrap();
+        let mhdr = self.header_ptr(mp);
+        let mcur = self.builder.build_load(i64t, mhdr, "mcur").unwrap().into_int_value();
+        let mnext = self.builder.build_int_sub(mcur, i64t.const_int(1, false), "mnext").unwrap();
+        self.builder.build_store(mhdr, mnext).unwrap();
+        let mzero = self.builder.build_int_compare(EQ, mnext, i64t.const_zero(), "mzero").unwrap();
+        self.builder.build_conditional_branch(mzero, map_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(map_dec_bb);
+        self.builder.build_unconditional_branch(map_free_bb).unwrap();
+
+        self.builder.position_at_end(map_free_bb);
+        self.call_named("verb_map_destroy_contents", &[mp.into()]);
+        self.dec_live_counter();
+        self.call_named("free", &[mhdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+        self.builder.build_return(None).unwrap();
+    }
+
+    /// Runtime helper: verb_retain_cell(ptr cell) -> void. Cells are
+    /// always heap-owned (never static like a string literal can be), so
+    /// this always bumps the header at cell-8, no tag/sentinel check.
+    fn build_retain_cell_fn(&self) {
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.ptr_ty.into()], false);
+        let f = self.module.add_function("verb_retain_cell", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let cell = f.get_nth_param(0).unwrap().into_pointer_value();
+        let hdr = self.header_ptr(cell);
+        let cur = self.builder.build_load(i64t, hdr, "cur").unwrap().into_int_value();
+        let next = self.builder.build_int_add(cur, i64t.const_int(1, false), "next").unwrap();
+        self.builder.build_store(hdr, next).unwrap();
+        self.builder.build_return(None).unwrap();
+    }
+
+    /// Runtime helper: verb_release_cell(ptr cell) -> void. Decrements
+    /// the header at cell-8; at zero, releases the `VerbValue` stored
+    /// inside (cascading into a heap-owned string/closure/array/map if
+    /// that's what the cell holds) and frees the cell block itself.
+    fn build_release_cell_fn(&self) {
+        use inkwell::IntPredicate::*;
+        let i64t = self.ctx.i64_type();
+        let fnty = self.ctx.void_type().fn_type(&[self.ptr_ty.into()], false);
+        let f = self.module.add_function("verb_release_cell", fnty, None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let free_bb = self.ctx.append_basic_block(f, "free");
+        let done_bb = self.ctx.append_basic_block(f, "done");
+
+        self.builder.position_at_end(entry);
+        let cell = f.get_nth_param(0).unwrap().into_pointer_value();
+        let hdr = self.header_ptr(cell);
+        let cur = self.builder.build_load(i64t, hdr, "cur").unwrap().into_int_value();
+        let next = self.builder.build_int_sub(cur, i64t.const_int(1, false), "next").unwrap();
+        self.builder.build_store(hdr, next).unwrap();
+        let zero = self.builder.build_int_compare(EQ, next, i64t.const_zero(), "zero").unwrap();
+        self.builder.build_conditional_branch(zero, free_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(free_bb);
+        let inner = self.builder.build_load(self.value_ty, cell, "inner").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[inner.into()]);
+        self.dec_live_counter();
+        self.call_named("free", &[hdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+        self.builder.build_return(None).unwrap();
     }
 
     /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.

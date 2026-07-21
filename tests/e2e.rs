@@ -241,6 +241,20 @@ fn string_literals_carry_a_static_gc_sentinel_header() {
         "string literal global isn't private/unnamed_addr:\n{ir}");
 }
 
+#[test]
+fn gc_retain_release_functions_are_emitted() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/strings.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    for sym in ["@verb_retain_value", "@verb_release_value", "@verb_retain_cell", "@verb_release_cell"] {
+        assert!(ir.contains(sym), "missing {sym} in IR:\n{ir}");
+    }
+    assert!(ir.contains("declare void @verb_map_destroy_contents"),
+        "verb_map_destroy_contents not declared:\n{ir}");
+}
+
 // ----- C++ import / extern (from cpp-import) -----
 
 #[test]
@@ -728,6 +742,26 @@ fn build_links_and_runs_a_program_using_std_map() {
     let run = Command::new(&out_path).output().unwrap();
     assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
     let expected = std::fs::read_to_string("tests/fixtures/std_map_basic.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn map_with_heap_valued_entries_retains_and_releases_correctly() {
+    let out_path = std::env::temp_dir().join("verb_e2e_gc_map_heap_values_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/gc_map_heap_values.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/gc_map_heap_values.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 
     let _ = std::fs::remove_file(&out_path);
