@@ -112,7 +112,10 @@ position. Phase 8 is the only phase with open work.
   1. Developer can point to a single `.verb` example program that uses a C++ import, `std io`, `std map`, and arrays together, and `verb build` produces a working binary with zero GC leaks
   2. Developer can cross-compile that same program for all supported targets via `verb build --target all` and get a clear pass/fail summary
   3. Developer reading the Arrays design spec sees `TAG_ARRAY = 7`, matching the shipped code, with no unresolved tag-collision note
-**Plans**: TBD
+**Plans**: 3 plans
+- [ ] 08-01-PLAN.md — Correct stale TAG_ARRAY=6→7 in the Arrays design spec + plan (HOUSEKEEP-01)
+- [ ] 08-02-PLAN.md — Integration example (FFI+std io+std map+arrays) + Windows variant + host build/run/zero-leaks test (INTEG-01)
+- [ ] 08-03-PLAN.md — Cross-compile build-only test across all 6 targets with per-target libmathlib (INTEG-02)
 
 ## Progress
 
@@ -128,4 +131,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 5. Cross-Platform Build & Distribution | Pre-GSD | Complete | 2026-07-20 |
 | 6. Reference-Counting Memory Management (GC v2) | Pre-GSD | Complete | 2026-07-21 |
 | 7. Developer Tooling (Formatter & VSCode Extension) | Pre-GSD | Complete | 2026-07-20 |
-| 8. Integration Validation & Release Readiness | 0/TBD | Not started | - |
+| 8. Integration Validation & Release Readiness | 0/3 | Planned | - |
