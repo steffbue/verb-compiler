@@ -271,6 +271,7 @@ fn hover(msg: &Value, docs: &HashMap<String, String>) -> Option<Value> {
 
     let text = keyword_doc(&word)
         .map(str::to_string)
+        .or_else(|| builtin_func_doc(&word).map(|(module, arity)| builtin_func_text(&word, module, arity)))
         .or_else(|| {
             let symbols = collect_symbols(src);
             symbols
@@ -323,7 +324,7 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
         "begin" => "opens a block (Verb has no `{ }`).",
         "end" => "closes a block opened by `begin`.",
         "import" => "`import mod <lib>;` / `import std <module>;` — must appear before any other top-level statement.",
-        "std" => "`import std io;` — built-in stdlib module (file/stdin/TCP I/O), no user-written C++ shim needed.",
+        "std" => "`import std <module>;` — built-in stdlib module, no user-written C++ shim needed. Four modules exist: `io` (file/stdin/TCP I/O), `map` (hash maps), `thread` (OS threads/mutex/channel), `time` (clocks/sleep).",
         "true" => "boolean literal `true`.",
         "false" => "boolean literal `false`.",
         "nil" => "the null / not-yet-initialized value.",
@@ -348,6 +349,73 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
     })
 }
 
+/// Fixed name -> (stdlib module, arity) table for every built-in stdlib
+/// function, mirroring the authoritative tables in `src/codegen.rs`
+/// (`IO_FUNCS`, `MAP_FUNCS`, `THREAD_FUNCS`, `TIME_FUNCS`) plus
+/// `thread_spawn`, which codegen dispatches through bespoke codegen
+/// (`gen_thread_spawn`) rather than a table lookup, since its closure
+/// argument can't cross the C++ boundary as a plain `VerbValue`. These
+/// are a distinct hover/completion category from both keywords
+/// (`keyword_doc`) and user-defined functions (`collect_symbols`):
+/// they're only meaningful once the matching `import std <module>;`
+/// is present, but are still worth surfacing unconditionally so a user
+/// typing `thread_join(...)` gets its arity and origin module on hover
+/// without having to go look at the runtime source.
+const BUILTIN_FUNCS: &[(&str, &str, usize)] = &[
+    // std io (see IO_FUNCS in src/codegen.rs)
+    ("read_line", "io", 0),
+    ("file_read", "io", 1),
+    ("file_write", "io", 2),
+    ("file_append", "io", 2),
+    ("tcp_connect", "io", 2),
+    ("tcp_listen", "io", 1),
+    ("tcp_accept", "io", 1),
+    ("send_line", "io", 2),
+    ("recv_line", "io", 1),
+    ("close_conn", "io", 1),
+    // std map (see MAP_FUNCS in src/codegen.rs)
+    ("map_new", "map", 0),
+    ("map_set", "map", 3),
+    ("map_get", "map", 2),
+    ("map_has", "map", 2),
+    ("map_remove", "map", 2),
+    ("map_len", "map", 1),
+    // std thread (see THREAD_FUNCS in src/codegen.rs; thread_spawn has no
+    // table entry there, but does have one here -- see doc comment above)
+    ("thread_spawn", "thread", 1),
+    ("thread_join", "thread", 1),
+    ("thread_sleep_ms", "thread", 1),
+    ("mutex_new", "thread", 0),
+    ("mutex_lock", "thread", 1),
+    ("mutex_unlock", "thread", 1),
+    ("channel_new", "thread", 0),
+    ("channel_send", "thread", 2),
+    ("channel_recv", "thread", 1),
+    // std time (see TIME_FUNCS in src/codegen.rs)
+    ("now_ms", "time", 0),
+    ("monotonic_ms", "time", 0),
+    ("sleep_ms", "time", 1),
+    ("clock_ms", "time", 0),
+    ("difftime_ms", "time", 2),
+    ("linux_clock_gettime_ns", "time", 1),
+    ("linux_nanosleep_ns", "time", 1),
+    ("win_filetime_100ns", "time", 0),
+    ("win_sleep_ms", "time", 1),
+];
+
+/// Looks up a stdlib builtin's `(module, arity)` by name, or `None` if
+/// `word` isn't one. See `BUILTIN_FUNCS`.
+fn builtin_func_doc(word: &str) -> Option<(&'static str, usize)> {
+    BUILTIN_FUNCS.iter().find(|(n, _, _)| *n == word).map(|(_, module, arity)| (*module, *arity))
+}
+
+/// Renders the shared hover/completion-detail text for a builtin, e.g.
+/// "built-in `std thread` function `thread_join` (1 parameter)."
+fn builtin_func_text(name: &str, module: &str, arity: usize) -> String {
+    let plural = if arity == 1 { "" } else { "s" };
+    format!("built-in `std {module}` function `{name}` ({arity} parameter{plural}).")
+}
+
 // ----- completion -----
 
 fn completion_items(src: &str) -> Value {
@@ -366,6 +434,14 @@ fn completion_items(src: &str) -> Value {
             "label": word,
             "kind": KEYWORD_KIND,
             "detail": keyword_doc(word).unwrap_or_default(),
+        }));
+    }
+
+    for (name, module, arity) in BUILTIN_FUNCS {
+        items.push(json!({
+            "label": name,
+            "kind": FUNCTION_KIND,
+            "detail": builtin_func_text(name, module, *arity),
         }));
     }
 
@@ -429,7 +505,7 @@ fn collect_symbols(src: &str) -> Symbols {
 fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
     for stmt in stmts {
         match stmt {
-            Stmt::Assign { name, .. } | Stmt::Declare { name } => {
+            Stmt::Assign { name, .. } | Stmt::Declare { name, .. } => {
                 if !out.vars.contains(name) {
                     out.vars.push(name.clone());
                 }
@@ -445,8 +521,148 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
                 }
             }
             Stmt::While { body, .. } => collect_from_stmts(body, out),
-            Stmt::Block(inner) => collect_from_stmts(inner, out),
-            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_) => {}
+            Stmt::Block(inner, ..) => collect_from_stmts(inner, out),
+            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(..) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hover_at(src: &str, line: u32, character: u32) -> Option<Value> {
+        let mut docs = HashMap::new();
+        docs.insert("test://doc".to_string(), src.to_string());
+        let msg = json!({
+            "params": {
+                "textDocument": { "uri": "test://doc" },
+                "position": { "line": line, "character": character },
+            },
+        });
+        hover(&msg, &docs)
+    }
+
+    /// Finds the 0-indexed (line, character) of the first occurrence of
+    /// `needle` in `src`, so tests don't hardcode brittle column offsets.
+    fn locate(src: &str, needle: &str) -> (u32, u32) {
+        for (i, line) in src.lines().enumerate() {
+            if let Some(col) = line.find(needle) {
+                return (i as u32, col as u32);
+            }
+        }
+        panic!("{needle:?} not found in fixture source");
+    }
+
+    #[test]
+    fn keyword_doc_std_mentions_all_four_modules() {
+        let text = keyword_doc("std").expect("`std` should have hover text");
+        for module in ["io", "map", "thread", "time"] {
+            assert!(text.contains(module), "expected \"{module}\" in std doc: {text}");
+        }
+    }
+
+    #[test]
+    fn hover_on_thread_join_reports_module_and_arity() {
+        let src = "import std thread;\nmake main() begin\n  thread_join(1);\nend\n";
+        let (line, col) = locate(src, "thread_join");
+        let result = hover_at(src, line, col + 1).expect("hover result for thread_join");
+        let text = result["contents"]["value"].as_str().expect("hover value is a string");
+        assert!(text.contains("thread"), "expected module name \"thread\" in: {text}");
+        assert!(text.contains("1 parameter"), "expected arity 1 in: {text}");
+        assert!(!text.contains("1 parameters"), "singular \"parameter\" expected in: {text}");
+    }
+
+    #[test]
+    fn hover_on_thread_spawn_reports_module_and_arity() {
+        // thread_spawn has bespoke codegen (gen_thread_spawn) and no entry
+        // in codegen.rs's THREAD_FUNCS table, but should still hover.
+        let src = "import std thread;\nmake worker() begin\nend\nmake main() begin\n  thread_spawn(worker);\nend\n";
+        let (line, col) = locate(src, "thread_spawn");
+        let result = hover_at(src, line, col + 1).expect("hover result for thread_spawn");
+        let text = result["contents"]["value"].as_str().expect("hover value is a string");
+        assert!(text.contains("thread"), "expected module name \"thread\" in: {text}");
+        assert!(text.contains("1 parameter"), "expected arity 1 in: {text}");
+    }
+
+    #[test]
+    fn hover_on_map_get_reports_module_and_arity() {
+        let src = "import std map;\nmake main() begin\n  map_get(m, k);\nend\n";
+        let (line, col) = locate(src, "map_get");
+        let result = hover_at(src, line, col + 1).expect("hover result for map_get");
+        let text = result["contents"]["value"].as_str().expect("hover value is a string");
+        assert!(text.contains("map"), "expected module name \"map\" in: {text}");
+        assert!(text.contains("2 parameters"), "expected arity 2 in: {text}");
+    }
+
+    #[test]
+    fn completion_includes_builtin_stdlib_functions_from_all_modules() {
+        let items = completion_items("");
+        let arr = items.as_array().expect("completion result is an array");
+        let label = |name: &str| {
+            arr.iter()
+                .find(|i| i["label"] == name)
+                .unwrap_or_else(|| panic!("completion missing builtin `{name}`"))
+        };
+
+        let thread_join = label("thread_join");
+        assert!(thread_join["detail"].as_str().unwrap().contains("thread"));
+
+        let thread_spawn = label("thread_spawn");
+        assert!(thread_spawn["detail"].as_str().unwrap().contains("thread"));
+
+        let now_ms = label("now_ms");
+        assert!(now_ms["detail"].as_str().unwrap().contains("time"));
+
+        let map_new = label("map_new");
+        assert!(map_new["detail"].as_str().unwrap().contains("map"));
+
+        let read_line = label("read_line");
+        assert!(read_line["detail"].as_str().unwrap().contains("io"));
+    }
+
+    #[test]
+    fn builtin_func_doc_matches_all_codegen_arities() {
+        // Sanity check against src/codegen.rs's authoritative tables
+        // (IO_FUNCS, MAP_FUNCS, THREAD_FUNCS, TIME_FUNCS) plus thread_spawn.
+        let expected: &[(&str, &str, usize)] = &[
+            ("read_line", "io", 0),
+            ("file_read", "io", 1),
+            ("file_write", "io", 2),
+            ("file_append", "io", 2),
+            ("tcp_connect", "io", 2),
+            ("tcp_listen", "io", 1),
+            ("tcp_accept", "io", 1),
+            ("send_line", "io", 2),
+            ("recv_line", "io", 1),
+            ("close_conn", "io", 1),
+            ("map_new", "map", 0),
+            ("map_set", "map", 3),
+            ("map_get", "map", 2),
+            ("map_has", "map", 2),
+            ("map_remove", "map", 2),
+            ("map_len", "map", 1),
+            ("thread_spawn", "thread", 1),
+            ("thread_join", "thread", 1),
+            ("thread_sleep_ms", "thread", 1),
+            ("mutex_new", "thread", 0),
+            ("mutex_lock", "thread", 1),
+            ("mutex_unlock", "thread", 1),
+            ("channel_new", "thread", 0),
+            ("channel_send", "thread", 2),
+            ("channel_recv", "thread", 1),
+            ("now_ms", "time", 0),
+            ("monotonic_ms", "time", 0),
+            ("sleep_ms", "time", 1),
+            ("clock_ms", "time", 0),
+            ("difftime_ms", "time", 2),
+            ("linux_clock_gettime_ns", "time", 1),
+            ("linux_nanosleep_ns", "time", 1),
+            ("win_filetime_100ns", "time", 0),
+            ("win_sleep_ms", "time", 1),
+        ];
+        for (name, module, arity) in expected {
+            assert_eq!(builtin_func_doc(name), Some((*module, *arity)), "mismatch for {name}");
         }
     }
 }
