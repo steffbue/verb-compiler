@@ -269,6 +269,11 @@ fn main() {
                 exit(1);
             });
             debugger::set_print_value_fn(print_value_addr);
+            // Matches `stmt_files`' entry for every top-level statement in
+            // the entry file verbatim (see `resolve::resolve`), so an
+            // unqualified `break <line>` resolves to this file -- see
+            // `DebuggerState::add_breakpoint`.
+            debugger::set_main_file(parsed.file.clone());
             debugger::run_pre_start_console();
             unsafe {
                 let main_fn = ee

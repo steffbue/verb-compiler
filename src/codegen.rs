@@ -95,7 +95,11 @@ impl<'ctx> Codegen<'ctx> {
         let pt = self.ptr_ty;
         self.module.add_function(
             "verb_debug_checkpoint",
-            void.fn_type(&[i32t.into(), pt.into(), i64t.into()], false),
+            // (file: ptr, line: i32, vars: ptr, n_vars: i64) -- `file` lets
+            // the debugger disambiguate a `break <line>` between two
+            // imported files that both happen to have a statement on that
+            // line (see `Command::Break` in src/debugger.rs).
+            void.fn_type(&[pt.into(), i32t.into(), pt.into(), i64t.into()], false),
             None,
         );
         self.module.add_function(
@@ -1604,8 +1608,8 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Emits `call void @verb_debug_checkpoint(line, vars_ptr, n_vars)` for
-    /// the statement about to execute, using every name currently bound in
+    /// Emits `call void @verb_debug_checkpoint(file_ptr, line, vars_ptr, n_vars)`
+    /// for the statement about to execute, using every name currently bound in
     /// `self.scopes` (locals + params visible at this point in *this*
     /// function — never globals, never an enclosing function's scope, since
     /// `self.scopes` is already reset per-function by `Stmt::Fn`).
@@ -1643,7 +1647,15 @@ impl<'ctx> Codegen<'ctx> {
         let i32t = self.ctx.i32_type();
         let line_c = i32t.const_int(line as u64, false);
         let n_c = self.ctx.i64_type().const_int(n as u64, false);
-        self.call_named("verb_debug_checkpoint", &[line_c.into(), arr.into(), n_c.into()]);
+        // `self.cur_file` is the originating file of the *top-level*
+        // statement currently being compiled (set once per iteration in
+        // `compile_program`), which stays correct for every checkpoint
+        // emitted while recursing into that statement's nested blocks/fn
+        // bodies -- those always come from the same source file as their
+        // enclosing top-level statement.
+        let file = self.cur_file.clone();
+        let file_ptr = self.cstr(&file);
+        self.call_named("verb_debug_checkpoint", &[file_ptr.into(), line_c.into(), arr.into(), n_c.into()]);
     }
 
     fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
