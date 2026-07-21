@@ -57,6 +57,24 @@ fn array_len_type_error_aborts() {
 }
 
 #[test]
+fn array_get_set() { run_ok("arrays_get_set"); }
+
+#[test]
+fn array_get_type_error_aborts() {
+    run_err("err_array_get_type", "'get' needs an array, got int");
+}
+
+#[test]
+fn array_get_index_type_error_aborts() {
+    run_err("err_array_get_index_type", "'get' needs an int index, got string");
+}
+
+#[test]
+fn array_get_bounds_error_aborts() {
+    run_err("err_array_get_bounds", "index 5 out of bounds for array of length 2");
+}
+
+#[test]
 fn arith() { run_ok("arith"); }
 
 #[test]
