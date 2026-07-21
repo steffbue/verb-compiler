@@ -468,6 +468,21 @@ fn verb_std_thread_cpp_compiles_standalone() {
     let _ = std::fs::remove_file(&obj);
 }
 
+#[test]
+fn verb_time_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_time_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_time.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_time.cpp");
+    assert!(status.success(), "runtime/verb_time.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
 // ----- AOT host / cross build + multi-file (from main) -----
 
 #[test]
@@ -567,15 +582,10 @@ fn no_files_given_shows_usage() {
     assert!(stderr.contains("usage:"), "stderr: {stderr}");
 }
 
-fn run_ok_multi(names: &[&str], expected_name: &str) {
-    let files: Vec<String> = names
-        .iter()
-        .map(|n| format!("tests/fixtures/{n}.verb"))
-        .collect();
-    let mut args = vec!["run".to_string()];
-    args.extend(files);
+#[test]
+fn verb_file_import_links_and_runs() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(&args)
+        .args(["run", "tests/fixtures/multifile_b.verb"])
         .output()
         .unwrap();
     assert!(
@@ -584,24 +594,14 @@ fn run_ok_multi(names: &[&str], expected_name: &str) {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = std::fs::read_to_string(format!("tests/fixtures/{expected_name}.expected")).unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
 #[test]
-fn multi_file_links_and_runs() {
-    run_ok_multi(&["multifile_a", "multifile_b"], "multifile");
-}
-
-#[test]
-fn multi_file_emits_single_merged_llvm_module() {
+fn verb_file_import_emits_a_single_merged_llvm_module() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "run",
-            "tests/fixtures/multifile_a.verb",
-            "tests/fixtures/multifile_b.verb",
-            "--emit-llvm",
-        ])
+        .args(["run", "tests/fixtures/multifile_b.verb", "--emit-llvm"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -610,13 +610,9 @@ fn multi_file_emits_single_merged_llvm_module() {
 }
 
 #[test]
-fn multi_file_error_names_the_correct_file() {
+fn verb_file_import_error_names_the_importing_file_not_the_imported_one() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "run",
-            "tests/fixtures/multifile_err_a.verb",
-            "tests/fixtures/multifile_err_b.verb",
-        ])
+        .args(["run", "tests/fixtures/multifile_err_b.verb"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -633,24 +629,67 @@ fn multi_file_error_names_the_correct_file() {
 }
 
 #[test]
-fn multi_file_build_path_accepts_multiple_files() {
-    let dir = std::env::temp_dir().join("verb_multifile_build_test");
+fn verb_file_import_build_path_links_and_runs() {
+    let dir = std::env::temp_dir().join("verb_import_build_test");
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("multifile_bin");
+    let bin = dir.join("verb_file_import_bin");
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "build",
-            "tests/fixtures/multifile_a.verb",
-            "tests/fixtures/multifile_b.verb",
-            "-o",
-            bin.to_str().unwrap(),
-        ])
+        .args(["build", "tests/fixtures/multifile_b.verb", "-o", bin.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
     let run = Command::new(&bin).output().unwrap();
     let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+}
+
+#[test]
+fn cli_rejects_more_than_one_entry_file() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/multifile_a.verb", "tests/fixtures/multifile_b.verb"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "stderr: {stderr}");
+}
+
+#[test]
+fn verb_file_import_dedups_a_diamond_dependency() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/diamond_entry.verb"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/diamond.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn verb_file_import_cycle_is_a_compile_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/cycle_a.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("import cycle"), "stderr: {stderr}");
+}
+
+#[test]
+fn verb_file_import_missing_file_is_a_clear_error() {
+    let dir = std::env::temp_dir().join("verb_missing_import_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("entry.verb");
+    std::fs::write(&entry, "import mod nope.verb;\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", entry.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nope.verb"), "stderr: {stderr}");
 }
 
 // ----- std io -----
@@ -1128,4 +1167,120 @@ fn cross_build_rejects_std_thread_import_for_windows_target() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("import std thread"), "stderr: {stderr}");
     assert!(stderr.contains("Windows"), "stderr: {stderr}");
+}
+
+// ----- std time -----
+
+#[test]
+fn run_rejects_programs_with_std_time_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_time_basic.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std time"), "stderr: {stderr}");
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_time() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_time_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_basic.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_time_basic.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn cross_build_links_a_program_using_std_time_for_a_non_host_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    // Like std map, std time has no Windows restriction (no POSIX-only
+    // deps -- <chrono>/<thread> are portable), so this also covers a
+    // Windows target rather than needing a separate rejection test.
+    let label = if cfg!(target_arch = "x86_64") { "linux-arm64" } else { "linux-x86_64" };
+    let dir = std::env::temp_dir().join("verb_std_time_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join(format!("std_time_basic_{label}"));
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_basic.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", label,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "target {label} failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for {label}");
+}
+
+// `linux_*`/`win_*` are only defined in runtime/verb_time.cpp under
+// __linux__/_WIN32 respectively (see TIME_FUNCS's doc comment in
+// src/codegen.rs) -- these two tests cross-build (via zig, whose clang
+// frontend sets the right predefined macros for -target regardless of
+// host OS) to confirm each platform's functions actually compile and
+// link for that platform. Not run, same as the other cross-build tests
+// (foreign arch/OS binaries can't execute on this host).
+
+#[test]
+fn cross_build_links_a_program_using_linux_only_time_functions() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_time_linux_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_time_linux_x86_64");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_linux.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "linux-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "linux-x86_64 build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for linux-x86_64");
+}
+
+#[test]
+fn cross_build_links_a_program_using_windows_only_time_functions() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_time_windows_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_time_windows_x86_64");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_windows.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "windows-x86_64 build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let expected_path = dir.join("std_time_windows_x86_64.exe");
+    let meta = std::fs::metadata(&expected_path)
+        .unwrap_or_else(|e| panic!("missing output at {expected_path:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for windows-x86_64");
 }

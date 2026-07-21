@@ -35,5 +35,6 @@ pub enum Stmt {
 pub struct Program {
     pub imports: Vec<String>,
     pub std_imports: Vec<String>,
+    pub verb_imports: Vec<String>,
     pub body: Vec<Stmt>,
 }

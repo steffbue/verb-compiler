@@ -4,7 +4,7 @@ use crate::lexer::{renamed_keyword, Token, TokenKind};
 
 pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
-    let (imports, std_imports) = p.imports()?;
+    let (imports, std_imports, verb_imports) = p.imports()?;
     let mut body = Vec::new();
     while !p.check(&TokenKind::Eof) {
         if p.check(&TokenKind::Import) {
@@ -12,7 +12,7 @@ pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
         }
         body.push(p.statement()?);
     }
-    Ok(Program { imports, std_imports, body })
+    Ok(Program { imports, std_imports, verb_imports, body })
 }
 
 /// Same grammar as `parse`, but doesn't stop at the first syntax error:
@@ -26,11 +26,13 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
     let mut imports = Vec::new();
     let mut std_imports = Vec::new();
+    let mut verb_imports = Vec::new();
     let mut errors = Vec::new();
     while p.check(&TokenKind::Import) {
         match p.import_stmt() {
             Ok(ImportStmt::Mod(name)) => dedup_push(&mut imports, name),
             Ok(ImportStmt::Std(name)) => dedup_push(&mut std_imports, name),
+            Ok(ImportStmt::VerbFile(name)) => dedup_push(&mut verb_imports, name),
             Err(e) => { errors.push(e); p.synchronize(); }
         }
     }
@@ -65,12 +67,13 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
             }
         }
     }
-    (Program { imports, std_imports, body }, errors)
+    (Program { imports, std_imports, verb_imports, body }, errors)
 }
 
 enum ImportStmt {
     Mod(String),
     Std(String),
+    VerbFile(String),
 }
 
 fn dedup_push(v: &mut Vec<String>, name: String) {
@@ -127,16 +130,18 @@ impl Parser {
         }
     }
 
-    fn imports(&mut self) -> Result<(Vec<String>, Vec<String>), CompileError> {
+    fn imports(&mut self) -> Result<(Vec<String>, Vec<String>, Vec<String>), CompileError> {
         let mut imports = Vec::new();
         let mut std_imports = Vec::new();
+        let mut verb_imports = Vec::new();
         while self.check(&TokenKind::Import) {
             match self.import_stmt()? {
                 ImportStmt::Mod(name) => dedup_push(&mut imports, name),
                 ImportStmt::Std(name) => dedup_push(&mut std_imports, name),
+                ImportStmt::VerbFile(name) => dedup_push(&mut verb_imports, name),
             }
         }
-        Ok((imports, std_imports))
+        Ok((imports, std_imports, verb_imports))
     }
 
     fn import_stmt(&mut self) -> Result<ImportStmt, CompileError> {
@@ -144,6 +149,9 @@ impl Parser {
         if self.matches(&TokenKind::Mod) {
             let (name, ..) = self.expect_ident("library name after 'mod'")?;
             self.expect(&TokenKind::Semi, "';'")?;
+            if name.ends_with(".verb") {
+                return Ok(ImportStmt::VerbFile(name));
+            }
             return Ok(ImportStmt::Mod(name));
         }
         self.expect(&TokenKind::Std, "'mod' or 'std'")?;
@@ -152,9 +160,9 @@ impl Parser {
         // time), `std` module names are first-party and fully known ahead
         // of time, so an unrecognized one is rejected here rather than at
         // link time.
-        if name != "io" && name != "map" && name != "thread" {
+        if name != "io" && name != "map" && name != "thread" && name != "time" {
             return Err(CompileError::new(
-                format!("unknown std module '{name}' (known std modules: io, map, thread)"),
+                format!("unknown std module '{name}' (known std modules: io, map, thread, time)"),
                 l, c,
             ));
         }
@@ -693,6 +701,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_std_time_import() {
+        let p = parse(lex("import std time;").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["time".to_string()]);
+        assert!(p.imports.is_empty());
+    }
+
+    #[test]
     fn dedups_repeated_std_import() {
         let p = parse(lex("import std io; import std io;").unwrap()).unwrap();
         assert_eq!(p.std_imports, vec!["io".to_string()]);
@@ -707,12 +722,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_verb_file_import() {
+        let p = parse(lex("import mod utils.verb;").unwrap()).unwrap();
+        assert_eq!(p.verb_imports, vec!["utils.verb".to_string()]);
+        assert!(p.imports.is_empty());
+        assert!(p.body.is_empty());
+    }
+
+    #[test]
+    fn dedups_repeated_verb_file_import() {
+        let p = parse(lex("import mod utils.verb; import mod utils.verb;").unwrap()).unwrap();
+        assert_eq!(p.verb_imports, vec!["utils.verb".to_string()]);
+    }
+
+    #[test]
+    fn verb_file_and_cpp_lib_imports_coexist() {
+        let p = parse(lex(
+            "import mod mathlib; import mod utils.verb; import std io; print(1);"
+        ).unwrap()).unwrap();
+        assert_eq!(p.imports, vec!["mathlib".to_string()]);
+        assert_eq!(p.verb_imports, vec!["utils.verb".to_string()]);
+        assert_eq!(p.std_imports, vec!["io".to_string()]);
+        assert_eq!(p.body.len(), 1);
+    }
+
+    #[test]
+    fn recovering_collects_verb_file_imports_too() {
+        let src = "import mod utils.verb; print(1);";
+        let (prog, errors) = parse_recovering(lex(src).unwrap());
+        assert!(errors.is_empty());
+        assert_eq!(prog.verb_imports, vec!["utils.verb".to_string()]);
+        assert_eq!(prog.body.len(), 1);
+    }
+
+    #[test]
     fn unknown_std_module_is_a_compile_error() {
         let err = parse(lex("import std vector;").unwrap()).unwrap_err();
         assert!(err.msg.contains("unknown std module 'vector'"), "{}", err.msg);
         assert!(err.msg.contains("io"), "{}", err.msg);
         assert!(err.msg.contains("map"), "{}", err.msg);
         assert!(err.msg.contains("thread"), "{}", err.msg);
+        assert!(err.msg.contains("time"), "{}", err.msg);
     }
 
     #[test]
