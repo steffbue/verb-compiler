@@ -1963,6 +1963,59 @@ impl<'ctx> Codegen<'ctx> {
                 self.call_named("verb_release_value", &[arr.into()]);
                 return Ok(rv);
             }
+            if name == "exit" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("exit takes exactly 1 argument", line, col));
+                }
+                let v = self.gen_expr(&args[0])?;
+                let fnv = match self.externs.get("builtin_exit").copied() {
+                    Some(fnv) => fnv,
+                    None => {
+                        let fnty = self.value_ty.fn_type(&[self.value_ty.into()], false);
+                        let fnv = self.module.add_function("builtin_exit", fnty, None);
+                        self.externs.insert("builtin_exit".to_string(), fnv);
+                        fnv
+                    }
+                };
+                let rv = self.builder.build_call(fnv, &[v.into()], "exit_call")
+                    .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[v.into()]);
+                return Ok(rv);
+            }
+            if name == "abort" {
+                if !args.is_empty() {
+                    return Err(CompileError::new("abort takes no arguments", line, col));
+                }
+                let fnv = match self.externs.get("builtin_abort").copied() {
+                    Some(fnv) => fnv,
+                    None => {
+                        let fnty = self.value_ty.fn_type(&[], false);
+                        let fnv = self.module.add_function("builtin_abort", fnty, None);
+                        self.externs.insert("builtin_abort".to_string(), fnv);
+                        fnv
+                    }
+                };
+                let rv = self.builder.build_call(fnv, &[], "abort_call")
+                    .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+                return Ok(rv);
+            }
+            if name == "get_pid" {
+                if !args.is_empty() {
+                    return Err(CompileError::new("get_pid takes no arguments", line, col));
+                }
+                let fnv = match self.externs.get("builtin_get_pid").copied() {
+                    Some(fnv) => fnv,
+                    None => {
+                        let fnty = self.value_ty.fn_type(&[], false);
+                        let fnv = self.module.add_function("builtin_get_pid", fnty, None);
+                        self.externs.insert("builtin_get_pid".to_string(), fnv);
+                        fnv
+                    }
+                };
+                let rv = self.builder.build_call(fnv, &[], "get_pid_call")
+                    .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+                return Ok(rv);
+            }
             let is_bound = self.lookup(name).is_some();
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {
                 if let Some(arity) = io_func_arity(name) {
@@ -2300,6 +2353,53 @@ mod tests {
             .unwrap_err();
         assert!(err.msg.contains("map_get"), "{}", err.msg);
         assert!(err.msg.contains("takes 2 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn exit_compiles_with_no_import() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("exit".to_string(), 1, 1)),
+            args: vec![Expr::Int(0)],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn abort_and_get_pid_compile_with_no_import() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![
+            Stmt::ExprStmt(Expr::Call {
+                callee: Box::new(Expr::Var("get_pid".to_string(), 1, 1)),
+                args: vec![],
+                line: 1, col: 1,
+            }),
+            Stmt::ExprStmt(Expr::Call {
+                callee: Box::new(Expr::Var("abort".to_string(), 2, 1)),
+                args: vec![],
+                line: 2, col: 1,
+            }),
+        ];
+        let stmt_files = vec!["a.verb".to_string(); 2];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn exit_wrong_arity_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("exit".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("exit takes exactly 1 argument"), "{}", err.msg);
     }
 
     #[test]
