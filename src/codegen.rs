@@ -1323,6 +1323,12 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_conditional_branch(elems_null, arr_skip_elems_bb, arr_free_elems_bb).unwrap();
 
         self.builder.position_at_end(arr_free_elems_bb);
+        // A non-empty array holds *two* separate verb_alloc blocks (the
+        // header and this elems buffer), so freeing both needs two
+        // decrements to balance the two increments `Expr::ArrayLit`
+        // caused -- the single decrement above (paired with `ahdr`'s
+        // free below) only accounts for the header.
+        self.dec_live_counter();
         let ehdr = self.header_ptr(elems);
         self.call_named("free", &[ehdr.into()]);
         self.builder.build_unconditional_branch(arr_skip_elems_bb).unwrap();
