@@ -2066,7 +2066,7 @@ impl<'ctx> Codegen<'ctx> {
     /// (verb.h: "Tag 5 (closure) never crosses this boundary"). Instead:
     /// arity-check the closure via the same `verb_check_call` runtime
     /// helper `gen_call`'s own closure-invocation fallback tail uses
-    /// (line ~1540), pull `fn_ptr`/`env` straight out of the closure
+    /// (line ~2010), pull `fn_ptr`/`env` straight out of the closure
     /// struct (same GEP indices `make_closure` writes), and hand those
     /// two raw pointers to `thread_spawn_raw` (runtime/verb_std_thread.cpp)
     /// -- which sidesteps the boundary rule entirely since it never
