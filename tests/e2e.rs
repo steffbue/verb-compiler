@@ -793,3 +793,6 @@ fn cross_build_links_a_program_using_std_map_for_a_non_host_target() {
         .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
     assert!(meta.len() > 0, "empty output for {label}");
 }
+
+#[test]
+fn reassign_and_short_circuit_release_correctly() { run_ok("gc_reassign_and_or"); }
