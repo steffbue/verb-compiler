@@ -1,0 +1,9 @@
+%% nested `make` must not see the enclosing function's locals
+make outer(a) begin
+  assign local 1;
+  make inner() begin
+    return local;
+  end
+  return inner();
+end
+print(outer(5));
