@@ -793,7 +793,10 @@ fn debug_breakpoint_and_print_variable() {
     let prog = "assign x 1;\nassign y 2;\nprint(x add y);\n";
     let out = run_debug_session(prog, "break 2\nrun\nprint x\ncontinue\nquit\n");
     assert!(out.contains("stopped at line 2"), "{out}");
-    assert!(out.contains('1'), "{out}"); // printed value of x
+    // "(vdb) 1" is the prompt immediately followed by `print x`'s output --
+    // a bare `out.contains('1')` would also pass on "line 1" and give no
+    // real signal that `print x` printed anything at all.
+    assert!(out.contains("(vdb) 1"), "{out}");
 }
 
 #[test]
