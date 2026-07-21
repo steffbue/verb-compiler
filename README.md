@@ -170,8 +170,8 @@ same as `std io`.
 - Like `import std io;`, `import std map;` must appear before any other
   top-level statement, and `verb run` (JIT) does not support it — use
   `verb build`/`compile`.
-- No arrays/lists in v1, so there's no `map_keys`/`map_values`/iteration —
-  deferred along with arrays.
+- No `map_keys`/`map_values`/iteration in v1 — maps don't yet return their
+  contents as arrays.
 
 See `docs/superpowers/specs/2026-07-21-maps-design.md` for the full design.
 
