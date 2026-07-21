@@ -25,14 +25,14 @@ that gets implemented.
 import std env;
 import std process;
 
-assign home getenv("HOME");
+assign home env_get("HOME");
 check home eq nil begin
   print("no HOME set");
 end
 
-setenv("FOO", "bar");
-print(getenv("FOO"));
-unsetenv("FOO");
+env_set("FOO", "bar");
+print(env_get("FOO"));
+env_unset("FOO");
 
 print(cwd());
 print(exe_path());
@@ -58,7 +58,11 @@ exit(0);
 
 ## Module split and gating
 
-- `std env`: `getenv`, `setenv`, `unsetenv`.
+- `std env`: `env_get`, `env_set`, `env_unset` (not `getenv`/`setenv`/
+  `unsetenv` — those names collide at C-linkage level with libc's own
+  functions of the same name, which `runtime/verb_env.cpp` also needs
+  to call; discovered during implementation, see that file's header
+  comment).
 - `std process`: `cwd`, `exe_path`, `spawn`, `wait`.
 - `exit`, `abort`, `get_pid`: core builtins, not gated behind any
   import — trivial libc calls (`exit`/`abort`) or a one-line OS-primitive
@@ -121,9 +125,9 @@ Two new static arity tables mirroring `IO_FUNCS`/`MAP_FUNCS`:
 
 ```rust
 const ENV_FUNCS: &[(&str, usize)] = &[
-    ("getenv", 1),
-    ("setenv", 2),
-    ("unsetenv", 1),
+    ("env_get", 1),
+    ("env_set", 2),
+    ("env_unset", 1),
 ];
 const PROCESS_FUNCS: &[(&str, usize)] = &[
     ("cwd", 0),
@@ -251,7 +255,7 @@ matching `verb_map.cpp`'s existing precedent exactly.
   - `get_pid()`/`exit`/`abort` work under `verb run` (JIT) with no
     import at all — proves D-02/D-03's "core builtin, not gated"
     distinction actually holds.
-  - `getenv`/`setenv`/`unsetenv` roundtrip.
+  - `env_get`/`env_set`/`env_unset` roundtrip.
   - `cwd()`/`exe_path()` return non-nil strings.
   - `spawn` + `wait` roundtrip: spawn a trivial child (e.g. the
     system's `true`/`false` or `cmd.exe /c exit <n>` equivalent) and
@@ -277,7 +281,7 @@ matching `verb_map.cpp`'s existing precedent exactly.
 Captured stdout/stderr from `spawn`ed children; signals (`kill`,
 custom handlers); non-blocking `wait` (`waitpid(WNOHANG)`/
 polling); environment as a bulk snapshot (`environ` iteration —
-`getenv`/`setenv`/`unsetenv` are per-key only); process groups/
+`env_get`/`env_set`/`env_unset` are per-key only); process groups/
 sessions; raw fork/execve/CreateProcess exposed directly to Verb code.
 A `spawn`ed pid that's never passed to `wait()` leaks a zombie entry
 (POSIX) or an open process handle (Windows) — accepted v1 limitation,

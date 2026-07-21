@@ -2207,11 +2207,15 @@ fn map_func_arity(name: &str) -> Option<usize> {
 }
 
 /// Fixed name -> arity table for the `env` module's built-in functions
-/// (see runtime/verb_env.cpp and the design spec). See `IO_FUNCS`.
+/// (see runtime/verb_env.cpp and the design spec). See `IO_FUNCS`. Named
+/// env_get/env_set/env_unset rather than getenv/setenv/unsetenv: those
+/// names are already taken by `declare_libc`'s raw C-ABI `getenv` extern
+/// (used internally, e.g. the VERB_GC_DEBUG check) and would also collide
+/// with libc's own symbols at the runtime/verb_env.cpp C-linkage level.
 const ENV_FUNCS: &[(&str, usize)] = &[
-    ("getenv", 1),
-    ("setenv", 2),
-    ("unsetenv", 1),
+    ("env_get", 1),
+    ("env_set", 2),
+    ("env_unset", 1),
 ];
 
 fn env_func_arity(name: &str) -> Option<usize> {
@@ -2407,7 +2411,7 @@ mod tests {
         let ctx = Context::create();
         let mut cg = Codegen::new(&ctx);
         let stmts = vec![Stmt::ExprStmt(Expr::Call {
-            callee: Box::new(Expr::Var("getenv".to_string(), 1, 1)),
+            callee: Box::new(Expr::Var("env_get".to_string(), 1, 1)),
             args: vec![Expr::Str("HOME".to_string())],
             line: 1, col: 1,
         })];
@@ -2420,7 +2424,7 @@ mod tests {
         let ctx = Context::create();
         let mut cg = Codegen::new(&ctx);
         let stmts = vec![Stmt::ExprStmt(Expr::Call {
-            callee: Box::new(Expr::Var("getenv".to_string(), 1, 1)),
+            callee: Box::new(Expr::Var("env_get".to_string(), 1, 1)),
             args: vec![Expr::Str("A".to_string()), Expr::Str("B".to_string())],
             line: 1, col: 1,
         })];
@@ -2428,7 +2432,7 @@ mod tests {
         let err = cg
             .compile_program(&stmts, &stmt_files, &[], &["env".to_string()])
             .unwrap_err();
-        assert!(err.msg.contains("getenv"), "{}", err.msg);
+        assert!(err.msg.contains("env_get"), "{}", err.msg);
         assert!(err.msg.contains("takes 1 argument"), "{}", err.msg);
     }
 
