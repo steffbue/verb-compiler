@@ -1,3 +1,9 @@
 import std thread;
 
-print("thread ok");
+assign counter 0;
+make bump() begin
+  assign counter counter add 1;
+end
+assign t thread_spawn(bump);
+thread_join(t);
+print(counter);

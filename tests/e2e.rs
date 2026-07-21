@@ -930,55 +930,55 @@ fn gc_cyclic_array_leak_is_confined_not_corrupting() {
 
 #[test]
 fn run_rejects_programs_with_std_thread_import() {
-	let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-		.args(["run", "tests/fixtures/std_thread_spawn_join.verb"])
-		.output()
-		.unwrap();
-	assert!(!out.status.success());
-	let stderr = String::from_utf8_lossy(&out.stderr);
-	assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
-	assert!(stderr.contains("std thread"), "stderr: {stderr}");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_thread_spawn_join.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std thread"), "stderr: {stderr}");
 }
 
 #[test]
 fn build_links_and_runs_a_program_using_std_thread_spawn_join() {
-	let out_path = std::env::temp_dir().join("verb_e2e_std_thread_spawn_join_bin");
-	let build = Command::new(env!("CARGO_BIN_EXE_verb"))
-		.args([
-			"build", "tests/fixtures/std_thread_spawn_join.verb",
-			"-o", out_path.to_str().unwrap(),
-		])
-		.output()
-		.unwrap();
-	assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+    let out_path = std::env::temp_dir().join("verb_e2e_std_thread_spawn_join_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_spawn_join.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
 
-	let run = Command::new(&out_path).output().unwrap();
-	assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
-	let expected = std::fs::read_to_string("tests/fixtures/std_thread_spawn_join.expected").unwrap();
-	assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_thread_spawn_join.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 
-	let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&out_path);
 }
 
 #[test]
 fn cross_build_rejects_std_thread_import_for_windows_target() {
-	if !zig_available() {
-		eprintln!("skipping: zig not on PATH");
-		return;
-	}
-	let dir = std::env::temp_dir().join("verb_std_thread_windows_reject_test");
-	std::fs::create_dir_all(&dir).unwrap();
-	let bin = dir.join("std_thread_windows");
-	let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-		.args([
-			"build", "tests/fixtures/std_thread_spawn_join.verb",
-			"-o", bin.to_str().unwrap(),
-			"--target", "windows-x86_64",
-		])
-		.output()
-		.unwrap();
-	assert!(!out.status.success());
-	let stderr = String::from_utf8_lossy(&out.stderr);
-	assert!(stderr.contains("import std thread"), "stderr: {stderr}");
-	assert!(stderr.contains("Windows"), "stderr: {stderr}");
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_thread_windows_reject_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_thread_windows");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_spawn_join.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("import std thread"), "stderr: {stderr}");
+    assert!(stderr.contains("Windows"), "stderr: {stderr}");
 }
