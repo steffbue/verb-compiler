@@ -250,6 +250,12 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap().into_pointer_value()
     }
 
+    fn release_scope(&self, scope: &HashMap<String, PointerValue<'ctx>>) {
+        for cell in scope.values() {
+            self.call_named("verb_release_cell", &[(*cell).into()]);
+        }
+    }
+
     // ----- generated runtime helper: verb_print(value) -----
 
     fn build_print_fn(&self) {
@@ -1003,7 +1009,11 @@ impl<'ctx> Codegen<'ctx> {
             Stmt::Block(stmts) => {
                 self.scopes.push(HashMap::new());
                 let r = self.gen_stmts(stmts);
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 r
             }
             Stmt::If { cond, then_body, else_body } => {
@@ -1019,7 +1029,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(then_bb);
                 self.scopes.push(HashMap::new());
                 self.gen_stmts(then_body)?;
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(merge).unwrap();
                 }
@@ -1028,7 +1042,11 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(eb) = else_body {
                     self.scopes.push(HashMap::new());
                     self.gen_stmts(eb)?;
-                    self.scopes.pop();
+                    if self.cur_block_open() {
+                        if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                    } else {
+                        self.scopes.pop();
+                    }
                 }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(merge).unwrap();
@@ -1052,7 +1070,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(body_bb);
                 self.scopes.push(HashMap::new());
                 self.gen_stmts(body)?;
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(cond_bb).unwrap();
                 }

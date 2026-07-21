@@ -640,3 +640,13 @@ fn gc_retain_release_calls_are_wired_into_expr_codegen() {
     assert!(ir.contains("call void @verb_retain_value"), "no retain call site in IR:\n{ir}");
     assert!(ir.contains("call void @verb_release_value"), "no release call site in IR:\n{ir}");
 }
+
+#[test]
+fn gc_releases_block_scope_cells() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/control.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("call void @verb_release_cell"), "no cell release in IR:\n{ir}");
+}
