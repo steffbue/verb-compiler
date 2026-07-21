@@ -107,14 +107,19 @@ back. None of those other branches are in scope for this roadmap.
 - **Tech stack**: Rust 2021 + inkwell 0.9 (`llvm20-1` feature) + LLVM 20.1 via
   Homebrew (`LLVM_SYS_201_PREFIX`) — required for building the compiler itself
 - **Tech stack**: C++17 runtime (`runtime/verb.h`, `verb_map.cpp`,
-  `verb_std_io.cpp`) compiled via `build.rs`/the `cc` crate and linked into
-  every generated binary
+  `verb_std_io.cpp`, `verb_env.cpp`, `verb_process.cpp`, `verb_builtins.cpp`)
+  compiled via `build.rs`/the `cc` crate and linked into every generated
+  binary
 - **Dependency**: `zig` must be on PATH only for `--target` cross-compilation;
   the default (no `--target`) host build path has no new dependency
 - **Compatibility**: `verb run` (JIT) rejects any program using `import mod`,
   `import std io`, or `import std map` — these are build-only (AOT) features
 - **Compatibility**: Windows cross-compile targets don't support `import std io`
   (POSIX socket dependency in `verb_std_io.cpp`)
+- **Memory model**: `exit()`/`abort()` (core builtins, `runtime/verb_builtins.cpp`)
+  call libc `exit`/`abort` directly and skip refcount cleanup entirely — matches
+  C's own `exit`/`abort` semantics exactly, and is excluded from the zero-leak
+  (GC) guarantee below by design, not by omission
 - **Architecture**: single-threaded compiler and JIT; inkwell/MCJIT are not
   thread-safe for concurrent compilation
 - **Memory model**: reference-counting GC has no cycle collector yet;
