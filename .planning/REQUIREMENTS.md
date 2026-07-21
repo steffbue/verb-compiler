@@ -101,7 +101,7 @@ Requirements for the current milestone. Each maps to a roadmap phase.
   corrected to state `TAG_ARRAY = 7` (matching shipped `src/value.rs`/
   `runtime/verb.h`), resolving the stale tag-6 collision with the Maps spec
 
-- [ ] **INTEG-01**: A single nontrivial Verb program combining a C++ import,
+- [x] **INTEG-01**: A single nontrivial Verb program combining a C++ import,
   `import std io`, `import std map`, and arrays compiles and runs correctly
   end-to-end via `verb build`, producing zero GC leaks (`verb_gc_live=0`)
 
@@ -179,7 +179,7 @@ Which phases cover which requirements.
 | TOOL-01 | Phase 7 | Complete |
 | TOOL-02 | Phase 7 | Complete |
 | HOUSEKEEP-01 | Phase 8 | Complete |
-| INTEG-01 | Phase 8 | Pending |
+| INTEG-01 | Phase 8 | Complete |
 | INTEG-02 | Phase 8 | Pending |
 
 **Coverage:**

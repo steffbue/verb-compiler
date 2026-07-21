@@ -910,3 +910,44 @@ fn gc_cyclic_array_leak_is_confined_not_corrupting() {
     assert!((1..=2).contains(&live_n), "expected a small, bounded leak count, got {live_n}:\n{stdout}");
     let _ = std::fs::remove_file(&out_path);
 }
+
+/// Builds and runs `examples/integration_all.verb` in place (D-02: no
+/// tests/fixtures/ duplicate) and asserts both zero GC leaks and the
+/// program's own deterministic summary line -- folding D-03's output
+/// check and D-04's leak check into one standalone, cross-cutting test
+/// rather than appending to gc_no_leaks_across_all_heap_kinds.
+#[test]
+fn integration_example_zero_leaks() {
+    let lib_dir = build_mathlib_fixture();
+    let out_path = std::env::temp_dir().join("verb_test_integration_all");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "examples/integration_all.verb",
+            "-o", out_path.to_str().unwrap(),
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path)
+        .env("VERB_GC_DEBUG", "1")
+        .env("DYLD_LIBRARY_PATH", &lib_dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("no verb_gc_live line in stdout:\n{stdout}"));
+    assert_eq!(live_line, "verb_gc_live=0", "leaked heap objects:\n{stdout}");
+
+    assert!(
+        stdout.contains("integration_summary: ok"),
+        "missing expected deterministic summary line in stdout:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file("verb_integration_demo.tmp");
+}
