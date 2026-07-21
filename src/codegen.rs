@@ -1455,6 +1455,11 @@ impl<'ctx> Codegen<'ctx> {
                     return self.gen_std_io_call(name, arity, args, line, col);
                 }
             }
+            if !is_bound && self.std_imports.iter().any(|m| m == "time") {
+                if let Some(arity) = time_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, line, col);
+                }
+            }
             if !is_bound && !self.imports.is_empty() {
                 return self.gen_extern_call(name, args, line, col);
             }
@@ -1615,6 +1620,18 @@ fn map_func_arity(name: &str) -> Option<usize> {
     MAP_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
+/// Fixed name -> arity table for the `time` module's built-in functions
+/// (see runtime/verb_time.cpp and the design spec). See `IO_FUNCS`.
+const TIME_FUNCS: &[(&str, usize)] = &[
+    ("now_ms", 0),
+    ("monotonic_ms", 0),
+    ("sleep_ms", 1),
+];
+
+fn time_func_arity(name: &str) -> Option<usize> {
+    TIME_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
 fn levenshtein(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -1745,6 +1762,50 @@ mod tests {
         let mut cg = Codegen::new(&ctx);
         let stmts = vec![Stmt::ExprStmt(Expr::Call {
             callee: Box::new(Expr::Var("map_new".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("undefined variable"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_time_call_with_correct_arity_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("now_ms".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["time".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_time_arity_mismatch_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("sleep_ms".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["time".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("sleep_ms"), "{}", err.msg);
+        assert!(err.msg.contains("takes 1 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_time_name_ignored_without_import_std_time() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("now_ms".to_string(), 1, 1)),
             args: vec![],
             line: 1, col: 1,
         })];
