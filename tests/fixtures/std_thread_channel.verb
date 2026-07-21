@@ -1,0 +1,11 @@
+import std thread;
+
+assign ch channel_new();
+
+make producer() begin
+  channel_send(ch, 42);
+end
+
+assign t thread_spawn(producer);
+print(channel_recv(ch));
+thread_join(t);
