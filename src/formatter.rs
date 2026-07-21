@@ -261,6 +261,14 @@ mod tests {
     }
 
     #[test]
+    fn formats_verb_file_import_statement() {
+        assert_eq!(
+            fmt("import   mod   utils.verb  ;\nprint(1);"),
+            "import mod utils.verb;\nprint(1);\n"
+        );
+    }
+
+    #[test]
     fn formats_reassign_and_operators() {
         assert_eq!(fmt("x be x add 5;"), "x be x add 5;\n");
         assert_eq!(fmt("print(x mod 4);"), "print(x mod 4);\n");
