@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/steffen/Desktop/Projekte/compiler/docs/superpowers/plans/2026-07-21-refcounting-gc.md",
+  "type": "DOC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Reference-Counting GC Implementation Plan",
+  "summary": "Task-by-task implementation plan to add refcounted heap allocations (strings, closures) to Verb's codegen with zero new syntax.",
+  "scope": ["reference counting", "garbage collection", "codegen.rs", "verb_alloc", "LLVM IR", "runtime/verb_std_io.cpp"],
+  "cross_refs": ["docs/superpowers/specs/2026-07-21-refcounting-gc-design.md", "tests/e2e.rs", "tests/formatter_roundtrip.rs", "tests/parser_recovery_fuzz.rs"],
+  "locked": false,
+  "precedence": null,
+  "notes": "This is an execution plan (task/step checklist with code diffs), not an ADR/PRD/SPEC per taxonomy definitions. It implements a separate design spec (linked in cross_refs) rather than making the architectural decision itself. Classified as DOC (supporting/process document) since it contains no user stories/acceptance criteria (not PRD), no API/schema contract of its own (not SPEC), and no Context/Decision/Consequences structure (not ADR)."
+}

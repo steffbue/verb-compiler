@@ -1,0 +1,20 @@
+{
+  "source_path": "/Users/steffen/Desktop/Projekte/compiler/docs/superpowers/plans/2026-07-20-verb-export-macro.md",
+  "type": "DOC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "`VERB_EXPORT` Macro Implementation Plan",
+  "summary": "Step-by-step task plan to implement a C++17 VERB_EXPORT macro in runtime/verb.h for exposing C++ functions to Verb imports.",
+  "scope": ["VERB_EXPORT macro", "runtime/verb.h", "C++ import wrapper", "mathlib.cpp fixture", "e2e tests"],
+  "cross_refs": [
+    "docs/superpowers/specs/2026-07-20-verb-export-macro-design.md",
+    "tests/e2e.rs",
+    "tests/verb_export_macro.rs",
+    "tests/fixtures/cpp/mathlib.cpp",
+    "tests/fixtures/import_mathlib.verb",
+    "tests/fixtures/import_mathlib.expected"
+  ],
+  "locked": false,
+  "precedence": null,
+  "notes": "This is a task-by-task implementation plan (checkbox steps, code diffs, commit instructions) rather than a pure ADR/PRD/SPEC. It contains technical-constraint-like content (supported types, arity limits, header-only rule) similar to a SPEC, but its dominant structure is an execution plan referencing a separate design/spec doc ('Full design rationale: docs/superpowers/specs/2026-07-20-verb-export-macro-design.md'). Classified as DOC (context/plan) since the authoritative technical spec lives elsewhere; synthesizer may want to treat the 'Global Constraints' section as technical-constraint context to cross-check against the linked design spec."
+}

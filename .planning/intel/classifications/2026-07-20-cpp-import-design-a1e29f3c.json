@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/steffen/Desktop/Projekte/compiler/docs/superpowers/specs/2026-07-20-cpp-import-design.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "C++ Import — Design Spec (v1)",
+  "summary": "Technical spec for calling C++ libraries via C-ABI FFI in Verb, covering language surface, ABI, codegen, and AOT build.",
+  "scope": ["C++ import", "FFI", "C-ABI", "VerbValue struct", "codegen", "verb build", "linker", "extern C functions"],
+  "cross_refs": [],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

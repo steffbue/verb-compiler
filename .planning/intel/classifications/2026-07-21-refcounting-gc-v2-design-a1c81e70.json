@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/steffen/Desktop/Projekte/compiler/docs/superpowers/specs/2026-07-21-refcounting-gc-v2-design.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Reference-counting GC v2: strings, closures, arrays, maps",
+  "summary": "Technical spec extending refcounting GC to arrays, maps, closures, and globals with runtime API and cascade semantics.",
+  "scope": ["refcounting GC", "strings", "closures", "arrays", "maps", "globals", "verb_alloc", "verb_release_value", "cycle detection"],
+  "cross_refs": ["docs/superpowers/specs/2026-07-21-refcounting-gc-design.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}

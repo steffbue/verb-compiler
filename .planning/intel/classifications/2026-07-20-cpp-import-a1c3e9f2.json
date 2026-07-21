@@ -1,0 +1,13 @@
+{
+  "source_path": "docs/superpowers/plans/2026-07-20-cpp-import.md",
+  "type": "DOC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "C++ Import Implementation Plan",
+  "summary": "Task-by-task implementation plan for letting Verb programs import and call extern C++ library functions via a shared VerbValue ABI struct.",
+  "scope": ["import mod statement", "extern C++ calls", "codegen", "verb build AOT", "runtime/verb.h ABI", "lexer/parser", "verb-lsp"],
+  "cross_refs": ["docs/superpowers/specs/2026-07-20-cpp-import-design.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": "Structured as an implementation plan (waves, tasks, TDD steps) rather than a decision record, requirements doc, or technical contract spec, so it falls under DOC (context/process document). It references a companion SPEC doc which should be classified separately and likely holds the actual locked design decisions."
+}

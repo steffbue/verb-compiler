@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/steffen/Desktop/Projekte/compiler/docs/superpowers/plans/2026-07-21-refcounting-gc-v2.md",
+  "type": "DOC",
+  "confidence": "medium",
+  "manifest_override": false,
+  "title": "Reference-Counting GC v2 Implementation Plan",
+  "summary": "Task-by-task implementation plan for adding refcounting GC to Verb's heap allocations, implementing a separate design spec.",
+  "scope": ["reference counting", "garbage collection", "codegen.rs", "verb_map.cpp", "verb_std_io.cpp", "heap allocator", "retain/release dispatch"],
+  "cross_refs": ["docs/superpowers/specs/2026-07-21-refcounting-gc-v2-design.md"],
+  "locked": false,
+  "precedence": null,
+  "notes": "Not a decision record, PRD, or standalone spec; it is a checklist-style implementation plan that executes an already-referenced design spec. Contains no 'Status: Accepted' or Context/Decision/Consequences structure (no ADR signal), no user stories/acceptance criteria (no PRD signal), and while it has technical detail it explicitly defers the authoritative contract to a separate SPEC file. Classified as DOC/plan; synthesizer may wish to treat the referenced design spec as the SPEC-type source instead."
+}
