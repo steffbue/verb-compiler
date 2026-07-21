@@ -20,7 +20,7 @@ pub struct Codegen<'ctx> {
     array_ty: StructType<'ctx>,
     ptr_ty: PointerType<'ctx>,
     scopes: Vec<HashMap<String, PointerValue<'ctx>>>,
-    functions: HashMap<String, (FunctionValue<'ctx>, usize)>,
+    globals: HashMap<String, PointerValue<'ctx>>,
     externs: HashMap<String, FunctionValue<'ctx>>,
     imports: Vec<String>,
     std_imports: Vec<String>,
@@ -41,7 +41,7 @@ impl<'ctx> Codegen<'ctx> {
             ctx.struct_type(&[ctx.i64_type().into(), ctx.i64_type().into(), ptr_ty.into()], false);
         let cg = Self {
             ctx, module, builder, value_ty, closure_ty, array_ty, ptr_ty,
-            scopes: Vec::new(), functions: HashMap::new(), externs: HashMap::new(),
+            scopes: Vec::new(), globals: HashMap::new(), externs: HashMap::new(),
             imports: Vec::new(), std_imports: Vec::new(), fn_depth: 0, fn_counter: 0,
             cur_file: String::new(),
         };
@@ -142,7 +142,7 @@ impl<'ctx> Codegen<'ctx> {
         let mut cases = Vec::new();
         for (t, name) in [(TAG_NIL, "nil"), (TAG_BOOL, "bool"), (TAG_INT, "int"),
                           (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn"),
-                          (TAG_ARRAY, "array")] {
+                          (TAG_ARRAY, "array"), (TAG_MAP, "map")] {
             let bb = self.ctx.append_basic_block(f, name);
             self.builder.position_at_end(bb);
             let s = self.cstr(name);
@@ -185,6 +185,7 @@ impl<'ctx> Codegen<'ctx> {
         let str_bb = self.ctx.append_basic_block(f, "string");
         let clos_bb = self.ctx.append_basic_block(f, "closure");
         let arr_bb = self.ctx.append_basic_block(f, "array");
+        let map_bb = self.ctx.append_basic_block(f, "map");
         let done = self.ctx.append_basic_block(f, "done");
 
         let i8t = self.ctx.i8_type();
@@ -196,6 +197,7 @@ impl<'ctx> Codegen<'ctx> {
             (i8t.const_int(TAG_STR, false), str_bb),
             (i8t.const_int(TAG_CLOSURE, false), clos_bb),
             (i8t.const_int(TAG_ARRAY, false), arr_bb),
+            (i8t.const_int(TAG_MAP, false), map_bb),
         ]).unwrap();
 
         self.builder.position_at_end(nil_bb);
@@ -272,6 +274,10 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(end_bb);
         self.call_named("printf", &[self.cstr("]").into()]);
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        self.builder.position_at_end(map_bb);
+        self.call_named("printf", &[self.cstr("<map>\n").into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(done);
@@ -1003,7 +1009,6 @@ impl<'ctx> Codegen<'ctx> {
         let main = self.module.add_function("main", main_ty, None);
         let entry = self.ctx.append_basic_block(main, "entry");
         self.builder.position_at_end(entry);
-        self.scopes.push(HashMap::new());
         for (i, s) in stmts.iter().enumerate() {
             self.cur_file = stmt_files[i].clone();
             if let Err(mut e) = self.gen_stmt(s) {
@@ -1016,7 +1021,6 @@ impl<'ctx> Codegen<'ctx> {
                 break; // dead code after return/abort
             }
         }
-        self.scopes.pop();
         if self.cur_block_open() {
             self.builder.build_return(Some(&self.ctx.i32_type().const_zero())).unwrap();
         }
@@ -1035,8 +1039,44 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
+    /// Own params/locals (and those of enclosing blocks in the *same* function),
+    /// falling back to top-level globals. A nested `make` never sees an
+    /// enclosing function's scope — its `self.scopes` is reset to empty before
+    /// its body is compiled (see `Stmt::Fn`), so this can only ever reach back
+    /// as far as the function's own frames, then straight to `globals`.
     fn lookup(&self, name: &str) -> Option<PointerValue<'ctx>> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+            .or_else(|| self.globals.get(name).copied())
+    }
+
+    /// Address of the module-level global variable backing top-level name
+    /// `name`, creating it on first use. Unlike a heap cell from
+    /// `malloc_bytes` (whose pointer is an SSA value scoped to the function
+    /// that computed it), a global variable's address is a module-wide
+    /// constant valid in every function's IR — required for a nested `make`
+    /// to read/write it.
+    fn global_slot(&mut self, name: &str) -> PointerValue<'ctx> {
+        if let Some(&p) = self.globals.get(name) {
+            return p;
+        }
+        let g = self.module.add_global(self.value_ty, None, &format!("g.{name}"));
+        g.set_initializer(&self.value_ty.const_zero());
+        let p = g.as_pointer_value();
+        self.globals.insert(name.to_string(), p);
+        p
+    }
+
+    /// Bind in the innermost active scope, or as a top-level global when not
+    /// inside any function/block (`self.scopes` is empty).
+    fn bind(&mut self, name: &str, value: StructValue<'ctx>) {
+        if self.scopes.is_empty() {
+            let slot = self.global_slot(name);
+            self.builder.build_store(slot, value).unwrap();
+        } else {
+            let cell = self.malloc_bytes(16);
+            self.builder.build_store(cell, value).unwrap();
+            self.scopes.last_mut().unwrap().insert(name.to_string(), cell);
+        }
     }
 
     /// Hint for an unresolved name: keyword rename, else closest known name.
@@ -1045,7 +1085,7 @@ impl<'ctx> Codegen<'ctx> {
             return Some(format!("'{name}' was renamed to '{new}'"));
         }
         let best = self.scopes.iter().flat_map(|s| s.keys())
-            .chain(self.functions.keys())
+            .chain(self.globals.keys())
             .map(|cand| (levenshtein(name, cand), cand))
             .min()?;
         (best.0 <= 2 && best.0 < name.len())
@@ -1065,15 +1105,12 @@ impl<'ctx> Codegen<'ctx> {
             Stmt::ExprStmt(e) => { self.gen_expr(e)?; Ok(()) }
             Stmt::Assign { name, value } => {
                 let v = self.gen_expr(value)?;
-                let cell = self.malloc_bytes(16);
-                self.builder.build_store(cell, v).unwrap();
-                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                self.bind(name, v);
                 Ok(())
             }
             Stmt::Declare { name } => {
-                let cell = self.malloc_bytes(16);
-                self.builder.build_store(cell, self.nil_val()).unwrap();
-                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                let nil = self.nil_val();
+                self.bind(name, nil);
                 Ok(())
             }
             Stmt::Reassign { name, value, line, col } => {
@@ -1147,22 +1184,35 @@ impl<'ctx> Codegen<'ctx> {
                 let llname = format!("fn.{}.{}", name, self.fn_counter);
                 let fnty = self.value_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
                 let fnv = self.module.add_function(&llname, fnty, None);
-                // register before compiling the body so recursion resolves
-                self.functions.insert(name.clone(), (fnv, params.len()));
-                // bind the name as a first-class closure value in the current scope
+                // bind the name as a first-class closure value in the enclosing
+                // scope (globals, if at top level) so callers can reference it
                 let clos = self.make_closure(fnv, params.len());
-                let cell = self.malloc_bytes(16);
-                self.builder.build_store(cell, clos).unwrap();
-                self.scopes.last_mut().unwrap().insert(name.clone(), cell);
+                self.bind(name, clos);
 
                 let saved_bb = self.builder.get_insert_block().unwrap();
+                // A nested `make` sees only its own params/locals and top-level
+                // globals -- never the enclosing function's scope, not even
+                // names declared before it. Wiping `scopes` (rather than just
+                // pushing a new frame) enforces that: `lookup` can only walk
+                // back to frames pushed for *this* function, then falls through
+                // to `globals`.
                 let saved_scopes = std::mem::take(&mut self.scopes);
                 self.fn_depth += 1;
 
                 let entry = self.ctx.append_basic_block(fnv, "entry");
                 self.builder.position_at_end(entry);
+                // own name, bound locally too, so self-recursion resolves
+                // without leaking the name into the enclosing/global scope.
+                // Must be built fresh here (not the closure bound above) since
+                // a malloc'd heap cell's pointer is an SSA value scoped to the
+                // function that computed it -- the outer function's, in this
+                // case -- and can't be reused inside this new function's IR.
+                let self_clos = self.make_closure(fnv, params.len());
+                let self_cell = self.malloc_bytes(16);
+                self.builder.build_store(self_cell, self_clos).unwrap();
                 let argv = fnv.get_nth_param(1).unwrap().into_pointer_value();
                 let mut scope = HashMap::new();
+                scope.insert(name.clone(), self_cell);
                 for (i, p) in params.iter().enumerate() {
                     let ap = unsafe {
                         self.builder.build_in_bounds_gep(
@@ -1220,11 +1270,6 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(cell) = self.lookup(name) {
                     return Ok(self.builder.build_load(self.value_ty, cell, name)
                         .unwrap().into_struct_value());
-                }
-                // function names resolve even where their closure cell is out of scope
-                // (e.g. recursion — the defining function's locals are not captured)
-                if let Some((fnv, arity)) = self.functions.get(name).copied() {
-                    return Ok(self.make_closure(fnv, arity));
                 }
                 Err(self.undefined_var(name, *line, *col))
             }
@@ -1399,9 +1444,14 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap().into_struct_value();
                 return Ok(rv);
             }
-            let is_bound = self.lookup(name).is_some() || self.functions.contains_key(name);
+            let is_bound = self.lookup(name).is_some();
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {
                 if let Some(arity) = io_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, line, col);
+                }
+            }
+            if !is_bound && self.std_imports.iter().any(|m| m == "map") {
+                if let Some(arity) = map_func_arity(name) {
                     return self.gen_std_io_call(name, arity, args, line, col);
                 }
             }
@@ -1439,13 +1489,15 @@ impl<'ctx> Codegen<'ctx> {
         Ok(out.try_as_basic_value().basic().unwrap().into_struct_value())
     }
 
-    /// A call to one of the `io` module's built-in functions (see
-    /// runtime/verb_std_io.cpp), reachable only when `import std io;` is
-    /// present. Arity is checked against the function's fixed, known
-    /// signature (`IO_FUNCS`) on every call site — including the first —
-    /// unlike `gen_extern_call`, whose arity is only checked against a
-    /// prior call site of the same name, because generic `import mod`
-    /// externs have no statically known signature to check against.
+    /// A call to one of a first-party `std` module's built-in functions
+    /// (`io`'s, see runtime/verb_std_io.cpp, or `map`'s, see
+    /// runtime/verb_map.cpp), reachable only when the corresponding
+    /// `import std <module>;` is present. Arity is checked against the
+    /// function's fixed, known signature (`IO_FUNCS`/`MAP_FUNCS`) on every
+    /// call site — including the first — unlike `gen_extern_call`, whose
+    /// arity is only checked against a prior call site of the same name,
+    /// because generic `import mod` externs have no statically known
+    /// signature to check against.
     fn gen_std_io_call(&mut self, name: &str, expected_arity: usize, args: &[Expr], line: u32, col: u32)
         -> Result<StructValue<'ctx>, CompileError>
     {
@@ -1548,6 +1600,21 @@ fn io_func_arity(name: &str) -> Option<usize> {
     IO_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
+/// Fixed name -> arity table for the `map` module's built-in functions
+/// (see runtime/verb_map.cpp and the design spec). See `IO_FUNCS`.
+const MAP_FUNCS: &[(&str, usize)] = &[
+    ("map_new", 0),
+    ("map_set", 3),
+    ("map_get", 2),
+    ("map_has", 2),
+    ("map_remove", 2),
+    ("map_len", 1),
+];
+
+fn map_func_arity(name: &str) -> Option<usize> {
+    MAP_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
 fn levenshtein(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -1634,6 +1701,50 @@ mod tests {
         let mut cg = Codegen::new(&ctx);
         let stmts = vec![Stmt::ExprStmt(Expr::Call {
             callee: Box::new(Expr::Var("read_line".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        assert!(err.msg.contains("undefined variable"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_map_call_with_correct_arity_compiles_ok() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("map_new".to_string(), 1, 1)),
+            args: vec![],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["map".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn std_map_arity_mismatch_is_a_compile_error() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("map_get".to_string(), 1, 1)),
+            args: vec![Expr::Int(1)],
+            line: 1, col: 1,
+        })];
+        let stmt_files = vec!["a.verb".to_string()];
+        let err = cg
+            .compile_program(&stmts, &stmt_files, &[], &["map".to_string()])
+            .unwrap_err();
+        assert!(err.msg.contains("map_get"), "{}", err.msg);
+        assert!(err.msg.contains("takes 2 argument"), "{}", err.msg);
+    }
+
+    #[test]
+    fn std_map_name_ignored_without_import_std_map() {
+        let ctx = Context::create();
+        let mut cg = Codegen::new(&ctx);
+        let stmts = vec![Stmt::ExprStmt(Expr::Call {
+            callee: Box::new(Expr::Var("map_new".to_string(), 1, 1)),
             args: vec![],
             line: 1, col: 1,
         })];

@@ -105,8 +105,8 @@ Available functions: `read_line()`, `file_read(path)`,
 `send_line(fd, s)`, `recv_line(fd)`, `close_conn(fd)`. Every function
 returns `nil` on failure — check with `check x eq nil`.
 
-- Only the `io` module exists in v1 (`import std io;`); an unrecognized
-  module name after `std` is a compile error.
+- Only `io` and `map` modules exist in v1 (`import std io;` / `import std
+  map;`); an unrecognized module name after `std` is a compile error.
 - Like `import mod`, `import std io;` must appear before any other
   top-level statement, and `verb run` (JIT) does not support it — use
   `verb build`/`compile`.
@@ -146,6 +146,35 @@ argument to any of these functions is a runtime error, same as other
 type/bounds errors in Verb. `eqeq`/`neq` on two arrays compares them by
 reference (same underlying array), not by contents.
 
+## Standard library maps (`import std map`)
+
+`import std map;` gives Verb programs a hash-map (dictionary) type,
+compiled and linked in the same way `import std io;` is.
+
+    import std map;
+
+    assign m map_new();
+    map_set(m, "name", "compiler");
+    print(map_get(m, "name"));   %% compiler
+    print(map_has(m, "missing")); %% false
+
+Available functions: `map_new()`, `map_set(m, k, v)` (returns `m`),
+`map_get(m, k)`, `map_has(m, k)`, `map_remove(m, k)`, `map_len(m)`. Map
+values may be any Verb value. Map keys are restricted to nil, bool, int,
+float, or string — int and float keys that are numerically equal (`1` and
+`1.0`) refer to the same entry, matching the `equals` operator's own
+cross-type numeric equality. Invalid usage (a non-map `m`, or an
+unsupported key type) returns `nil`/`false`/`0` rather than aborting,
+same as `std io`.
+
+- Like `import std io;`, `import std map;` must appear before any other
+  top-level statement, and `verb run` (JIT) does not support it — use
+  `verb build`/`compile`.
+- No arrays/lists in v1, so there's no `map_keys`/`map_values`/iteration —
+  deferred along with arrays.
+
+See `docs/superpowers/specs/2026-07-21-maps-design.md` for the full design.
+
 ## Language
 
 See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
@@ -161,7 +190,7 @@ See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
 ## Known v1 limitations
 
 - No GC — heap allocations are never freed
-- No maps, no `break`/`continue`, no anonymous functions
+- No `break`/`continue`, no anonymous functions
 - No closures — a nested `make` cannot reference any variable from its
   enclosing function's scope (not even ones declared before it); it can
   only see its own parameters/locals and top-level globals

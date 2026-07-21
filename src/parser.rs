@@ -152,9 +152,9 @@ impl Parser {
         // time), `std` module names are first-party and fully known ahead
         // of time, so an unrecognized one is rejected here rather than at
         // link time.
-        if name != "io" {
+        if name != "io" && name != "map" {
             return Err(CompileError::new(
-                format!("unknown std module '{name}' (known std modules: io)"),
+                format!("unknown std module '{name}' (known std modules: io, map)"),
                 l, c,
             ));
         }
@@ -680,6 +680,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_std_map_import() {
+        let p = parse(lex("import std map;").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["map".to_string()]);
+        assert!(p.imports.is_empty());
+    }
+
+    #[test]
     fn dedups_repeated_std_import() {
         let p = parse(lex("import std io; import std io;").unwrap()).unwrap();
         assert_eq!(p.std_imports, vec!["io".to_string()]);
@@ -698,6 +705,7 @@ mod tests {
         let err = parse(lex("import std vector;").unwrap()).unwrap_err();
         assert!(err.msg.contains("unknown std module 'vector'"), "{}", err.msg);
         assert!(err.msg.contains("io"), "{}", err.msg);
+        assert!(err.msg.contains("map"), "{}", err.msg);
     }
 
     #[test]

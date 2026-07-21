@@ -1,0 +1,13 @@
+%% a nested `make` sees only its own params/locals and top-level globals --
+%% never the enclosing function's scope, not even names declared before it
+assign g 100;
+
+make outer(a) begin
+  assign local 1;
+  make inner(b) begin
+    return b add g;
+  end
+  return inner(a) add local;
+end
+
+print(outer(5));
