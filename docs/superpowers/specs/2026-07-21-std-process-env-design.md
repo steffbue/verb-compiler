@@ -169,10 +169,13 @@ same file. Failure (`unsetenv`/`setenv` of a malformed name) returns
   NUL-terminated `argv[]` (`cmd` as `argv[0]`, each array element —
   must be `VERB_STRING`, else `spawn` fails and returns `nil` — as
   `argv[1..]`), then:
-  - **POSIX**: `fork()` + `execve()` in the child (`environ` passed
-    through unchanged), `waitpid`-free in the parent (parent just
-    returns the child pid immediately — blocking happens in `wait()`,
-    not `spawn()`).
+  - **POSIX**: `fork()` + `execvp()` in the child (`execve` plus a
+    `PATH` search, so `spawn("sh", ...)` resolves without a hardcoded
+    absolute path — every other constraint above still holds: no
+    shell is invoked to parse anything, `execvp` just locates the
+    binary the same way a shell's own bare-word lookup would),
+    `waitpid`-free in the parent (parent just returns the child pid
+    immediately — blocking happens in `wait()`, not `spawn()`).
   - **Windows**: `CreateProcess()` with a quoted/escaped command line
     built from `argv[]`, returns `dwProcessId` on success. The
     `PROCESS_INFORMATION.hProcess` handle is stashed (see below) so a
