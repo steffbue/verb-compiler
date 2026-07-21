@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::{exit, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use verb::codegen;
 use verb::error::CompileError;
@@ -31,30 +32,53 @@ pub struct VerbValueAbi {
 extern "C" {
     /// Defined in `runtime/verb_map.cpp`, compiled into this binary by build.rs.
     fn verb_map_destroy_contents(payload: *mut std::ffi::c_void);
+    fn map_new() -> VerbValueAbi;
+    fn map_set(m: VerbValueAbi, k: VerbValueAbi, v: VerbValueAbi) -> VerbValueAbi;
+    fn map_get(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
+    fn map_has(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
+    fn map_remove(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
+    fn map_len(m: VerbValueAbi) -> VerbValueAbi;
 }
 
-// `runtime/verb_map.cpp` (linked into this binary) references these three
-// symbols, but they are emitted into each *JIT module* by codegen, not the
-// host — so the host linker has nothing to resolve them against. These
-// definitions satisfy the link. They are never reached at runtime under
-// `verb run`, which rejects imports (so no map value can exist, so
-// `verb_map_destroy_contents` — the only host code that would call them —
-// never runs). They abort loudly rather than silently corrupt state if that
-// invariant is ever broken.
+// Under `verb run` the program module (src/codegen.rs) emits the real
+// verb_alloc/verb_retain_value/verb_release_value bodies. The C++ runtime
+// units linked into this binary (verb_map.cpp, verb_std_io.cpp) call these
+// symbols, and those calls bind here at host link time — so we forward them
+// to the module's JIT-compiled definitions, whose addresses are stored below
+// at JIT init (see the `run` arm) before `main` is ever called. This keeps a
+// single source of truth for the value runtime and keeps `verb_gc_live`
+// consistent regardless of whether an alloc/release originates in module code
+// or in host C++.
+static VERB_ALLOC_ADDR: AtomicUsize = AtomicUsize::new(0);
+static VERB_RETAIN_ADDR: AtomicUsize = AtomicUsize::new(0);
+static VERB_RELEASE_ADDR: AtomicUsize = AtomicUsize::new(0);
+
+fn thunk_target(slot: &AtomicUsize, name: &str) -> usize {
+    let a = slot.load(Ordering::Relaxed);
+    if a == 0 {
+        eprintln!("internal error: host {name} thunk called before JIT init");
+        std::process::abort();
+    }
+    a
+}
+
 #[no_mangle]
-pub extern "C" fn verb_alloc(_n: i64) -> *mut std::ffi::c_void {
-    eprintln!("internal error: host verb_alloc stub called (verb run cannot use maps)");
-    std::process::abort();
+pub extern "C" fn verb_alloc(n: i64) -> *mut std::ffi::c_void {
+    let f: extern "C" fn(i64) -> *mut std::ffi::c_void =
+        unsafe { std::mem::transmute(thunk_target(&VERB_ALLOC_ADDR, "verb_alloc")) };
+    f(n)
 }
 #[no_mangle]
-pub extern "C" fn verb_retain_value(_v: VerbValueAbi) {
-    eprintln!("internal error: host verb_retain_value stub called (verb run cannot use maps)");
-    std::process::abort();
+pub extern "C" fn verb_retain_value(v: VerbValueAbi) {
+    let f: extern "C" fn(VerbValueAbi) =
+        unsafe { std::mem::transmute(thunk_target(&VERB_RETAIN_ADDR, "verb_retain_value")) };
+    f(v)
 }
 #[no_mangle]
-pub extern "C" fn verb_release_value(_v: VerbValueAbi) {
-    eprintln!("internal error: host verb_release_value stub called (verb run cannot use maps)");
-    std::process::abort();
+pub extern "C" fn verb_release_value(v: VerbValueAbi) {
+    let f: extern "C" fn(VerbValueAbi) =
+        unsafe { std::mem::transmute(thunk_target(&VERB_RELEASE_ADDR, "verb_release_value")) };
+    f(v)
 }
 
 /// Registers runtime symbols that codegen references unconditionally but whose
@@ -65,8 +89,15 @@ fn register_jit_runtime_symbols<'ctx>(
     ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
     module: &inkwell::module::Module<'ctx>,
 ) {
-    let symbols: [(&str, usize); 1] =
-        [("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize)];
+    let symbols: [(&str, usize); 7] = [
+        ("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize),
+        ("map_new", map_new as *const () as usize),
+        ("map_set", map_set as *const () as usize),
+        ("map_get", map_get as *const () as usize),
+        ("map_has", map_has as *const () as usize),
+        ("map_remove", map_remove as *const () as usize),
+        ("map_len", map_len as *const () as usize),
+    ];
     for (name, addr) in symbols {
         if let Some(f) = module.get_function(name) {
             ee.add_global_mapping(&f, addr);
@@ -217,15 +248,6 @@ fn main() {
 
     match parsed.cmd.as_str() {
         "run" => {
-            if !imports.is_empty() || !std_imports.is_empty() {
-                let mut names = imports.clone();
-                names.extend(std_imports.iter().map(|m| format!("std {m}")));
-                eprintln!(
-                    "error: 'verb run' does not support imports ({}); use 'verb build' instead",
-                    names.join(", ")
-                );
-                exit(1);
-            }
             let ee = cg
                 .module()
                 .create_jit_execution_engine(inkwell::OptimizationLevel::None)
@@ -233,7 +255,23 @@ fn main() {
                     eprintln!("JIT error: {e}");
                     exit(1);
                 });
+            // Map/io entry points must be wired before the module is finalized
+            // (finalization happens on the first get_function_address below).
             register_jit_runtime_symbols(&ee, cg.module());
+            // Point the host verb_alloc/retain/release thunks at the module's
+            // JIT-compiled definitions. Only read at runtime (during main), so
+            // it is fine that get_function_address finalizes the module here.
+            for (name, slot) in [
+                ("verb_alloc", &VERB_ALLOC_ADDR),
+                ("verb_retain_value", &VERB_RETAIN_ADDR),
+                ("verb_release_value", &VERB_RELEASE_ADDR),
+            ] {
+                let addr = ee.get_function_address(name).unwrap_or_else(|e| {
+                    eprintln!("JIT error: cannot resolve {name}: {e:?}");
+                    exit(1);
+                });
+                slot.store(addr, Ordering::Relaxed);
+            }
             unsafe {
                 let main_fn = ee
                     .get_function::<unsafe extern "C" fn() -> i32>("main")

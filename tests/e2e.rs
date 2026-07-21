@@ -66,6 +66,23 @@ fn assert_no_leaks(fixture: &str) {
     let _ = std::fs::remove_file(&out_path);
 }
 
+/// Like `assert_no_leaks`, but exercises the JIT `run` path instead of AOT.
+/// Runs the fixture under `verb run` with `VERB_GC_DEBUG=1` and asserts the
+/// program reports `verb_gc_live=0` at exit — proving the host alloc/retain/
+/// release thunks forward to the module's counter-touching implementations.
+fn assert_no_leaks_under_run(fixture: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", &format!("tests/fixtures/{fixture}.verb")])
+        .env("VERB_GC_DEBUG", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{fixture}: run failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("{fixture}: no verb_gc_live line in stdout:\n{stdout}"));
+    assert_eq!(live_line, "verb_gc_live=0", "{fixture}: leaked under run:\n{stdout}");
+}
+
 #[test]
 fn literals() { run_ok("literals"); }
 
@@ -777,15 +794,9 @@ fn windows_cross_target_rejects_std_io_import() {
 // ----- std map -----
 
 #[test]
-fn run_rejects_programs_with_std_map_import() {
-    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(["run", "tests/fixtures/std_map_basic.verb"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
-    assert!(stderr.contains("std map"), "stderr: {stderr}");
+fn run_executes_std_map_import() {
+    run_ok("std_map_basic");
+    assert_no_leaks_under_run("std_map_basic");
 }
 
 #[test]
