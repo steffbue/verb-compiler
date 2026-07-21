@@ -1284,3 +1284,286 @@ fn cross_build_links_a_program_using_windows_only_time_functions() {
         .unwrap_or_else(|e| panic!("missing output at {expected_path:?}: {e}"));
     assert!(meta.len() > 0, "empty output for windows-x86_64");
 }
+
+// ----- pre-existing integration example coverage + this branch's std env/process/builtins additions -----
+
+/// Builds and runs `examples/integration_all.verb` in place (D-02: no
+/// tests/fixtures/ duplicate) and asserts both zero GC leaks and the
+/// program's own deterministic summary line -- folding D-03's output
+/// check and D-04's leak check into one standalone, cross-cutting test
+/// rather than appending to gc_no_leaks_across_all_heap_kinds.
+#[test]
+fn integration_example_zero_leaks() {
+    let lib_dir = build_mathlib_fixture();
+    let out_path = std::env::temp_dir().join("verb_test_integration_all");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "examples/integration_all.verb",
+            "-o", out_path.to_str().unwrap(),
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path)
+        .env("VERB_GC_DEBUG", "1")
+        .env("DYLD_LIBRARY_PATH", &lib_dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("no verb_gc_live line in stdout:\n{stdout}"));
+    assert_eq!(live_line, "verb_gc_live=0", "leaked heap objects:\n{stdout}");
+
+    assert!(
+        stdout.contains("integration_summary: ok"),
+        "missing expected deterministic summary line in stdout:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file("verb_integration_demo.tmp");
+}
+
+/// Compiles tests/fixtures/cpp/mathlib.cpp for a specific cross-compile
+/// target via `zig c++ -target <triple>` and archives the resulting object
+/// into a static `libmathlib.a` in a per-target directory (for `-L<dir>`).
+///
+/// A host-built libmathlib (see `build_mathlib_fixture`, which produces a
+/// host `.dylib`) cannot link into a foreign-target binary -- see the
+/// comment on `build_aot_cross` in src/main.rs. Each target needs its own
+/// libmathlib built with the same zig triple used for the program link.
+/// Callers must guard with `zig_available()` before invoking this.
+fn build_mathlib_for_target(label: &str, zig_triple: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("verb_e2e_cross_libs_{label}"));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let obj_path = dir.join("mathlib.o");
+    let compile = Command::new("zig")
+        .args([
+            "c++",
+            "-target", zig_triple,
+            "-std=c++17",
+            "-Iruntime",
+            "-c",
+            "tests/fixtures/cpp/mathlib.cpp",
+            "-o", obj_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to invoke zig c++ to cross-compile the mathlib test fixture");
+    assert!(
+        compile.status.success(),
+        "zig c++ failed to compile mathlib.cpp for target {label} ({zig_triple}): {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let lib_path = dir.join("libmathlib.a");
+    let archive = Command::new("zig")
+        .args(["ar", "rcs", lib_path.to_str().unwrap(), obj_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke zig ar to archive libmathlib.a");
+    assert!(
+        archive.status.success(),
+        "zig ar failed to archive libmathlib.a for target {label}: {}",
+        String::from_utf8_lossy(&archive.stderr)
+    );
+
+    let _ = std::fs::remove_file(&obj_path);
+    dir
+}
+
+/// Cross-compiles the FFI-importing integration example (D-01) for all 6
+/// supported OS/arch targets: `examples/integration_all.verb` (full, with
+/// std io) for the 4 non-Windows targets, `examples/integration_all_windows.verb`
+/// (std-io-less) for the 2 Windows targets (D-06). Each target links a
+/// target-matched libmathlib built via `build_mathlib_for_target` so the
+/// `import mod mathlib;` FFI import resolves at cross-link time -- this is
+/// exactly the failure mode a host-built libmathlib would hit (T-08-06).
+///
+/// Build-only (D-05): asserts each target's output artifact exists and is
+/// non-empty; never executes a foreign-target binary. Skips cleanly when
+/// zig is unavailable, matching `aot_cross_build_produces_binary_for_each_target`.
+#[test]
+fn integration_example_cross_builds_all_targets() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_e2e_integration_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // (label, zig_triple) pairs matching src/targets.rs::ALL and Target::zig_triple().
+    let targets: [(&str, &str); 6] = [
+        ("linux-x86_64", "x86_64-linux-gnu"),
+        ("linux-arm64", "aarch64-linux-gnu"),
+        ("macos-x86_64", "x86_64-macos-none"),
+        ("macos-arm64", "aarch64-macos-none"),
+        ("windows-x86_64", "x86_64-windows-gnu"),
+        ("windows-arm64", "aarch64-windows-gnu"),
+    ];
+
+    for (label, zig_triple) in targets {
+        let is_windows = label.starts_with("windows");
+        let source = if is_windows {
+            "examples/integration_all_windows.verb"
+        } else {
+            "examples/integration_all.verb"
+        };
+
+        let lib_dir = build_mathlib_for_target(label, zig_triple);
+        let bin = dir.join(format!("integration_cross_{label}"));
+
+        let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+            .args([
+                "build",
+                source,
+                "-o", bin.to_str().unwrap(),
+                "--target", label,
+                &format!("-L{}", lib_dir.display()),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "target {label} failed to build {source}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Build-only: never invoke the produced artifact -- it targets a
+        // foreign OS/arch and cannot run on this host (D-05).
+        let expected_path = if is_windows {
+            dir.join(format!("integration_cross_{label}.exe"))
+        } else {
+            bin
+        };
+        let meta = std::fs::metadata(&expected_path)
+            .unwrap_or_else(|e| panic!("missing output for {label} at {expected_path:?}: {e}"));
+        assert!(meta.len() > 0, "empty output for {label}");
+    }
+}
+
+// ----- std env -----
+
+#[test]
+fn build_links_and_runs_a_program_using_std_env() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_env_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_env_roundtrip.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_env_roundtrip.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn run_rejects_programs_with_std_env_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_env_roundtrip.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std env"), "stderr: {stderr}");
+}
+
+// ----- std process (AOT integration) -----
+
+#[test]
+fn build_links_and_runs_std_process_cwd_exe() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_cwd_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_cwd_exe.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_cwd_exe.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_std_process_spawn_wait() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_spawn_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_spawn_wait.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_spawn_wait.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_std_process_spawn_missing_binary() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_process_spawn_missing_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_process_spawn_missing_binary.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_process_spawn_missing_binary.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn run_rejects_programs_with_std_process_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_process_cwd_exe.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std process"), "stderr: {stderr}");
+}
+
+// ----- core builtins: exit skips cleanup -----
+
+#[test]
+fn exit_stops_execution_and_sets_exit_code() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/core_builtins_exit_skips_trailing_code.verb"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let expected = std::fs::read_to_string(
+        "tests/fixtures/core_builtins_exit_skips_trailing_code.expected",
+    ).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}

@@ -1,0 +1,29 @@
+%% integration_all_windows.verb — FFI + std map + arrays (no std io; Windows-cross-safe)
+!?!
+  Build (imports need `verb build`, not `verb run` — see README.md)
+  and run:
+
+    verb build examples/integration_all_windows.verb -o integration_demo_windows -Lpath/to/mathlib/libs --target windows-x86_64
+    ./integration_demo_windows.exe
+!?!
+
+import mod mathlib;
+import std map;
+
+assign sum c_add_int(2, 3);
+
+assign results list sum, sum;
+assign first get(results, 0);
+
+assign m map_new();
+map_set(m, "calls", 1);
+map_set(m, "calls", first);
+assign calls map_get(m, "calls");
+
+print(calls);
+
+check calls equals first begin
+  print("integration_summary: ok");
+end orelse begin
+  print("integration_summary: fail");
+end

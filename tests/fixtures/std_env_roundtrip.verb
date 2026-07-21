@@ -1,0 +1,9 @@
+import std env;
+
+env_set("VERB_E2E_TEST_VAR", "hello");
+print(env_get("VERB_E2E_TEST_VAR"));
+env_unset("VERB_E2E_TEST_VAR");
+assign gone env_get("VERB_E2E_TEST_VAR");
+check gone equals nil begin
+  print("gone");
+end

@@ -72,9 +72,9 @@ New tag:
 
 | Tag | Type | Payload |
 |---|---|---|
-| 6 | Array | ptr to heap `{ i64 len, i64 cap, ptr elems }` |
+| 7 | Array | ptr to heap `{ i64 len, i64 cap, ptr elems }` |
 
-Add `TAG_ARRAY: u64 = 6` to `src/value.rs`.
+Add `TAG_ARRAY: u64 = 7` to `src/value.rs`.
 
 `elems` is a `malloc`'d buffer of `%verb.value` structs (16 bytes each,
 tag + i64 payload — same struct arrays store internally). The array

@@ -1,0 +1,13 @@
+{
+  "source_path": "/Users/steffen/Desktop/Projekte/compiler/docs/superpowers/specs/2026-07-21-refcounting-gc-design.md",
+  "type": "SPEC",
+  "confidence": "high",
+  "manifest_override": false,
+  "title": "Reference-counting garbage collector",
+  "summary": "Technical spec for adding a precise refcounting GC to the Verb compiler, covering heap header layout, runtime API, and codegen insertion rules.",
+  "scope": ["reference counting", "garbage collector", "heap object header", "verb_alloc", "verb_retain_value", "verb_release_value", "verb_retain_cell", "verb_release_cell", "codegen insertion", "extern/std io contract", "closures", "cells", "string buffers"],
+  "cross_refs": ["compiler_design_plan.md", "docs/superpowers/specs/2026-07-20-cpp-import-design.md", "runtime/verb.h", "runtime/verb_std_io.cpp", "runtime/verb_gc.c"],
+  "locked": false,
+  "precedence": null,
+  "notes": ""
+}
