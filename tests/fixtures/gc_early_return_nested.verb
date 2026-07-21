@@ -1,0 +1,17 @@
+make classify(n) begin
+  loop assign i 0; i trails 3; i be i add 1 begin
+    check n equals i begin
+      return "matched" join "!";
+    end
+  end
+  check n trails 0 begin
+    return "negative";
+  end orelse begin
+    print(n);
+    return "non-negative";
+  end
+end
+
+print(classify(neg 5));
+print(classify(5));
+print(classify(1));

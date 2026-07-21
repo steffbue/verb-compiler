@@ -262,6 +262,53 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap().into_pointer_value()
     }
 
+    fn release_scope(&self, scope: &HashMap<String, PointerValue<'ctx>>) {
+        for cell in scope.values() {
+            self.call_named("verb_release_cell", &[(*cell).into()]);
+        }
+    }
+
+    /// Releases every cell in every currently-open scope (this function's
+    /// own scope stack -- already isolated per-function via the
+    /// `saved_scopes` swap in `Stmt::Fn`), innermost first. Read-only over
+    /// `self.scopes`: never pops. Must run immediately before *every*
+    /// path that can leave a function or the top-level program -- an
+    /// explicit `return`, or an implicit end-of-body/end-of-program
+    /// return -- since Step 2's scope-pop cleanup only fires on normal
+    /// block fall-through and is skipped once a block is already
+    /// terminated.
+    fn release_all_open_scopes(&self) {
+        for scope in self.scopes.iter().rev() {
+            self.release_scope(scope);
+        }
+    }
+
+    /// If `VERB_GC_DEBUG` is set in the environment, prints
+    /// `verb_gc_live=<n>` to stdout, where `<n>` is the number of
+    /// outstanding `verb_alloc` blocks (strings/closures/arrays/maps/cells)
+    /// at program exit. Purely a test/debugging hook -- silent otherwise,
+    /// and never affects a program's own output.
+    fn emit_gc_debug_dump(&self, main: FunctionValue<'ctx>) {
+        let i64t = self.ctx.i64_type();
+        let env_name = self.cstr("VERB_GC_DEBUG");
+        let flag = self.call_named("getenv", &[env_name.into()]).unwrap().into_pointer_value();
+        let flag_int = self.builder.build_ptr_to_int(flag, i64t, "flagi").unwrap();
+        let is_set = self.builder.build_int_compare(
+            inkwell::IntPredicate::NE, flag_int, i64t.const_zero(), "gc_debug").unwrap();
+        let dbg_bb = self.ctx.append_basic_block(main, "gc.debug");
+        let cont_bb = self.ctx.append_basic_block(main, "gc.cont");
+        self.builder.build_conditional_branch(is_set, dbg_bb, cont_bb).unwrap();
+
+        self.builder.position_at_end(dbg_bb);
+        let live_ptr = self.module.get_global("verb_gc_live").unwrap().as_pointer_value();
+        let live = self.builder.build_load(i64t, live_ptr, "live").unwrap();
+        let fmt = self.cstr("verb_gc_live=%lld\n");
+        self.call_named("printf", &[fmt.into(), live.into()]);
+        self.builder.build_unconditional_branch(cont_bb).unwrap();
+
+        self.builder.position_at_end(cont_bb);
+    }
+
     /// Like `malloc_bytes`, but the size is a runtime value (used when an
     /// array buffer's size depends on its element count, not a fixed layout).
     fn malloc_bytes_dyn(&self, n: IntValue<'ctx>) -> PointerValue<'ctx> {
@@ -1165,6 +1212,8 @@ impl<'ctx> Codegen<'ctx> {
         let arr_loop_cond_bb = self.ctx.append_basic_block(f, "arr.loop.cond");
         let arr_loop_body_bb = self.ctx.append_basic_block(f, "arr.loop.body");
         let arr_loop_end_bb = self.ctx.append_basic_block(f, "arr.loop.end");
+        let arr_free_elems_bb = self.ctx.append_basic_block(f, "arr.free_elems");
+        let arr_skip_elems_bb = self.ctx.append_basic_block(f, "arr.skip_elems");
         let map_check_bb = self.ctx.append_basic_block(f, "map.check");
         let map_bb = self.ctx.append_basic_block(f, "map");
         let map_dec_bb = self.ctx.append_basic_block(f, "map.dec");
@@ -1261,7 +1310,24 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(arr_loop_end_bb);
         self.dec_live_counter();
-        self.call_named("free", &[elems.into()]);
+        // `elems` (when non-null) was itself obtained via `malloc_bytes`/
+        // `verb_alloc`, so -- like every other heap-owned pointer here --
+        // its *actual* malloc'd address is `header_ptr(elems)` (elems-8),
+        // not `elems` itself; freeing `elems` directly corrupts the heap.
+        // A zero-length array's `elems` is a plain null (never routed
+        // through `verb_alloc` at all, see `Expr::ArrayLit`), so guard on
+        // that before computing/freeing the header.
+        let elems_addr = self.builder.build_ptr_to_int(elems, i64t, "elems_addr").unwrap();
+        let elems_null = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ, elems_addr, i64t.const_zero(), "elems_null").unwrap();
+        self.builder.build_conditional_branch(elems_null, arr_skip_elems_bb, arr_free_elems_bb).unwrap();
+
+        self.builder.position_at_end(arr_free_elems_bb);
+        let ehdr = self.header_ptr(elems);
+        self.call_named("free", &[ehdr.into()]);
+        self.builder.build_unconditional_branch(arr_skip_elems_bb).unwrap();
+
+        self.builder.position_at_end(arr_skip_elems_bb);
         self.call_named("free", &[ahdr.into()]);
         self.builder.build_unconditional_branch(done_bb).unwrap();
 
@@ -1390,6 +1456,11 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         if self.cur_block_open() {
+            for slot in self.globals.values() {
+                let v = self.builder.build_load(self.value_ty, *slot, "gval").unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[v.into()]);
+            }
+            self.emit_gc_debug_dump(main);
             self.builder.build_return(Some(&self.ctx.i32_type().const_zero())).unwrap();
         }
         Ok(())
@@ -1439,11 +1510,15 @@ impl<'ctx> Codegen<'ctx> {
     fn bind(&mut self, name: &str, value: StructValue<'ctx>) {
         if self.scopes.is_empty() {
             let slot = self.global_slot(name);
+            let old = self.builder.build_load(self.value_ty, slot, "old_global").unwrap().into_struct_value();
+            self.call_named("verb_release_value", &[old.into()]);
             self.builder.build_store(slot, value).unwrap();
         } else {
             let cell = self.malloc_bytes(16);
             self.builder.build_store(cell, value).unwrap();
-            self.scopes.last_mut().unwrap().insert(name.to_string(), cell);
+            if let Some(old_cell) = self.scopes.last_mut().unwrap().insert(name.to_string(), cell) {
+                self.call_named("verb_release_cell", &[old_cell.into()]);
+            }
         }
     }
 
@@ -1493,7 +1568,11 @@ impl<'ctx> Codegen<'ctx> {
             Stmt::Block(stmts) => {
                 self.scopes.push(HashMap::new());
                 let r = self.gen_stmts(stmts);
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 r
             }
             Stmt::If { cond, then_body, else_body } => {
@@ -1508,7 +1587,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(then_bb);
                 self.scopes.push(HashMap::new());
                 self.gen_stmts(then_body)?;
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(merge).unwrap();
                 }
@@ -1517,7 +1600,11 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(eb) = else_body {
                     self.scopes.push(HashMap::new());
                     self.gen_stmts(eb)?;
-                    self.scopes.pop();
+                    if self.cur_block_open() {
+                        if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                    } else {
+                        self.scopes.pop();
+                    }
                 }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(merge).unwrap();
@@ -1540,7 +1627,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(body_bb);
                 self.scopes.push(HashMap::new());
                 self.gen_stmts(body)?;
-                self.scopes.pop();
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
                 if self.cur_block_open() {
                     self.builder.build_unconditional_branch(cond_bb).unwrap();
                 }
@@ -1595,6 +1686,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.scopes.push(scope);
                 let r = self.gen_stmts(body);
                 if self.cur_block_open() {
+                    self.release_all_open_scopes();
                     self.builder.build_return(Some(&self.nil_val())).unwrap();
                 }
                 self.scopes.pop();
@@ -1612,6 +1704,7 @@ impl<'ctx> Codegen<'ctx> {
                     Some(e) => self.gen_expr(e)?,
                     None => self.nil_val(),
                 };
+                self.release_all_open_scopes();
                 self.builder.build_return(Some(&v)).unwrap();
                 Ok(())
             }

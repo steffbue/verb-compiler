@@ -793,3 +793,9 @@ fn cross_build_links_a_program_using_std_map_for_a_non_host_target() {
         .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
     assert!(meta.len() > 0, "empty output for {label}");
 }
+
+#[test]
+fn global_reassignment_releases_previous_value() { run_ok("gc_global_reassign"); }
+
+#[test]
+fn early_return_from_nested_loop_and_if_else_leaves_scopes_intact() { run_ok("gc_early_return_nested"); }
