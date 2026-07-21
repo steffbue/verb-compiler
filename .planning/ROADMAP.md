@@ -32,6 +32,7 @@ position. Phase 8 is the only phase with open work.
 - [x] **Phase 6: Reference-Counting Memory Management (GC v2)** - Every heap allocation across all value kinds is automatically retained/released with zero leaks (acyclic case)
 - [x] **Phase 7: Developer Tooling (Formatter & VSCode Extension)** - Verb has a working formatter and a VSCode extension with LSP + syntax highlighting
 - [ ] **Phase 8: Integration Validation & Release Readiness** - A single real program proves imports+stdlib+arrays+maps+GC+cross-compile work together, and the stale Arrays doc is fixed
+- [ ] **Phase 9: Standard Library: Process & Environment** - Verb programs read/write env vars, query cwd/exe path, exit/abort, and spawn/wait on child processes via `import std process`/`import std env`
 
 ## Phase Details
 
@@ -150,7 +151,7 @@ position. Phase 8 is the only phase with open work.
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -162,3 +163,22 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 | 6. Reference-Counting Memory Management (GC v2) | Pre-GSD | Complete | 2026-07-21 |
 | 7. Developer Tooling (Formatter & VSCode Extension) | Pre-GSD | Complete | 2026-07-20 |
 | 8. Integration Validation & Release Readiness | 1/3 | In Progress|  |
+| 9. Standard Library: Process & Environment | 0/0 | Not Started | |
+
+### Phase 9: Standard Library: Process & Environment
+
+**Goal:** Developers can read/modify environment variables, query the current working directory and executable path, terminate the process, and spawn/wait on child processes from Verb code, via a curated `std process` / `std env` module with OS-specific primitives underneath (Linux: fork/execve/waitpid; Windows: CreateProcess)
+**Requirements**: TBD
+**Depends on:** Phase 8
+**Plans:** 0 plans
+
+Scope (to be finalized during /gsd-plan-phase 9):
+- Environment: getenv, setenv, unsetenv
+- Process info: current working directory, executable path, get pid
+- Process control: exit, abort
+- Child processes: spawn, wait
+- Platform primitives — Linux: fork, execve, waitpid; Windows: CreateProcess
+
+Plans:
+
+- [ ] TBD (run /gsd-plan-phase 9 to break down)

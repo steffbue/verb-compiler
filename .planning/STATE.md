@@ -72,6 +72,10 @@ Recent decisions affecting current work:
 - Phase 4: Shipped code resolves the Arrays/Maps tag-6 collision as `TAG_MAP=6`/`TAG_ARRAY=7`; the design docs are stale on this point (Phase 8 housekeeping item)
 - [Phase ?]: HOUSEKEEP-01: corrected Arrays design docs' stale TAG_ARRAY=6 to TAG_ARRAY=7, matching shipped src/value.rs and resolving the Maps tag-6 collision note
 
+### Roadmap Evolution
+
+- Phase 9 added: Standard Library: Process & Environment — std process/env module (getenv/setenv/unsetenv, cwd, executable path, exit, abort, spawn/wait/pid) plus platform primitives (Linux: fork/execve/waitpid; Windows: CreateProcess)
+
 ### Pending Todos
 
 None yet.
