@@ -81,8 +81,9 @@ Verb programs can call `extern "C"` functions from a native library:
 
       verb build examples/uses_mathlib.verb -o out -Lpath/to/libs
 
-- `verb run` (JIT) does not support imports — programs using `import mod`
-  must be built with `verb build`/`compile`, not run.
+- `verb run` (JIT) executes `import mod` programs in-process too, but the
+  library must be a **shared** library findable via `-L`/default loader
+  paths — static `.a` archives still require `verb build`/`compile`.
 
 See `docs/superpowers/specs/2026-07-20-cpp-import-design.md` for the full
 design.
@@ -108,7 +109,7 @@ returns `nil` on failure — check with `check x eq nil`.
 - Only `io` and `map` modules exist in v1 (`import std io;` / `import std
   map;`); an unrecognized module name after `std` is a compile error.
 - Like `import mod`, `import std io;` must appear before any other
-  top-level statement, and `verb run` (JIT) does not support it — use
+  top-level statement. `verb run` (JIT) executes it in-process, same as
   `verb build`/`compile`.
 - Cross-compiling to a Windows target (`--target windows-x86_64` /
   `windows-arm64`) with `import std io;` is not supported in v1 — the
@@ -168,7 +169,7 @@ unsupported key type) returns `nil`/`false`/`0` rather than aborting,
 same as `std io`.
 
 - Like `import std io;`, `import std map;` must appear before any other
-  top-level statement, and `verb run` (JIT) does not support it — use
+  top-level statement. `verb run` (JIT) executes it in-process, same as
   `verb build`/`compile`.
 - No `map_keys`/`map_values`/iteration in v1 — maps don't yet return their
   contents as arrays.
