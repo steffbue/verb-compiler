@@ -1,0 +1,38 @@
+%% integration_all.verb — FFI + std io + std map + arrays in one program
+!?!
+  Build (imports need `verb build`, not `verb run` — see README.md)
+  and run:
+
+    verb build examples/integration_all.verb -o integration_demo -Lpath/to/mathlib/libs
+    ./integration_demo
+!?!
+
+import mod mathlib;
+import std io;
+import std map;
+
+assign sum c_add_int(2, 3);
+
+assign results list sum, sum;
+assign first get(results, 0);
+
+assign m map_new();
+map_set(m, "calls", 1);
+map_set(m, "calls", first);
+assign calls map_get(m, "calls");
+
+assign path "verb_integration_demo.tmp";
+file_write(path, "integration demo output");
+
+assign contents file_read(path);
+check contents equals nil begin
+  print("integration_demo: read failed");
+end orelse begin
+  print(contents);
+end
+
+check calls equals first begin
+  print("integration_summary: ok");
+end orelse begin
+  print("integration_summary: fail");
+end
