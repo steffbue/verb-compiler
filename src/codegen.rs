@@ -2091,6 +2091,15 @@ impl<'ctx> Codegen<'ctx> {
         let fp = self.builder.build_load(self.ptr_ty, fpp, "fp").unwrap();
         let epp = self.builder.build_struct_gep(self.closure_ty, clos_ptr, 2, "epp").unwrap();
         let env = self.builder.build_load(self.ptr_ty, epp, "env").unwrap();
+        // fp/env are plain pointers copied out of the closure struct above;
+        // nothing -- not this function, not thread_spawn_raw's trampoline,
+        // not the spawned thread -- ever dereferences the closure struct
+        // itself again. Releasing cv's temporary retain-on-load here is
+        // exactly as safe as gen_call's own closure-invocation fallback tail
+        // releasing it before its indirect call: the struct's fate past this
+        // point is irrelevant, only fp (a static code pointer) and env
+        // (always null -- closures never capture) are used from here on.
+        self.call_named("verb_release_value", &[cv.into()]);
 
         let fnv = match self.externs.get("thread_spawn_raw").copied() {
             Some(fnv) => fnv,

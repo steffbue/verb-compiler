@@ -886,7 +886,7 @@ fn gc_no_leaks_across_all_heap_kinds() {
         "arrays_of_arrays", "arrays_of_closures", "std_map_basic",
         "gc_reassign_and_or", "gc_global_reassign", "gc_early_return_nested",
         "gc_arrays_nested", "gc_arrays_of_closures", "gc_arrays_regrow",
-        "gc_map_heap_values", "gc_std_io_file_roundtrip",
+        "gc_map_heap_values", "gc_std_io_file_roundtrip", "std_thread_spawn_join",
     ] {
         assert_no_leaks(fixture);
     }
