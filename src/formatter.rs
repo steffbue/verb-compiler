@@ -200,6 +200,7 @@ fn token_text(tok: &Token) -> String {
         Import => "import".into(),
         Mod => "mod".into(),
         Std => "std".into(),
+        List => "list".into(),
         Add => "add".into(),
         Sub => "sub".into(),
         Neg => "neg".into(),

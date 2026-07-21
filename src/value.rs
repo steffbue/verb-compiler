@@ -5,3 +5,4 @@ pub const TAG_INT: u64 = 2;
 pub const TAG_FLOAT: u64 = 3; // payload = f64 bits
 pub const TAG_STR: u64 = 4;   // payload = ptr to NUL-terminated bytes
 pub const TAG_CLOSURE: u64 = 5; // payload = ptr to { fn_ptr, i64 arity, env_ptr }
+pub const TAG_ARRAY: u64 = 6;   // payload = ptr to { i64 len, i64 cap, ptr elems }
