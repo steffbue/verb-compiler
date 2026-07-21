@@ -608,3 +608,15 @@ fn string_literals_carry_a_static_gc_sentinel_header() {
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("-9223372036854775808"), "no GC static sentinel in IR:\n{ir}");
 }
+
+#[test]
+fn gc_retain_release_functions_are_emitted() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/strings.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    for sym in ["@verb_retain_value", "@verb_release_value", "@verb_retain_cell", "@verb_release_cell"] {
+        assert!(ir.contains(sym), "missing {sym} in IR:\n{ir}");
+    }
+}
