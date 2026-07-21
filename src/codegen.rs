@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::Module;
+use inkwell::module::{Linkage, Module};
 use inkwell::types::{PointerType, StructType};
 use inkwell::values::{FunctionValue, IntValue, PointerValue, StructValue};
 use inkwell::AddressSpace;
@@ -134,6 +134,8 @@ impl<'ctx> Codegen<'ctx> {
         let g = self.module.add_global(struct_ty, None, "verb.strlit");
         g.set_initializer(&init);
         g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        g.set_unnamed_addr(true);
         unsafe {
             self.builder.build_in_bounds_gep(
                 struct_ty, g.as_pointer_value(),
