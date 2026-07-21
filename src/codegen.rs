@@ -113,6 +113,36 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_global_string_ptr(s, "str").unwrap().as_pointer_value()
     }
 
+    /// Builds a global for a Verb string *literal*: an i64 sentinel header
+    /// immediately followed by the NUL-terminated bytes, laid out
+    /// identically to a heap `verb_alloc` block (header at payload-8) so
+    /// `verb_retain_value`/`verb_release_value` can treat every string
+    /// pointer the same way. Returns a pointer to the byte data (not the
+    /// header) -- exactly what `Expr::Str` needs.
+    fn static_string_ptr(&self, s: &str) -> PointerValue<'ctx> {
+        let i8t = self.ctx.i8_type();
+        let i32t = self.ctx.i32_type();
+        let i64t = self.ctx.i64_type();
+        let mut data: Vec<u8> = s.as_bytes().to_vec();
+        data.push(0);
+        let arr_ty = i8t.array_type(data.len() as u32);
+        let struct_ty = self.ctx.struct_type(&[i64t.into(), arr_ty.into()], false);
+        let hdr = i64t.const_int(GC_STATIC_SENTINEL as u64, true);
+        let arr_vals: Vec<_> = data.iter().map(|b| i8t.const_int(*b as u64, false)).collect();
+        let arr = i8t.const_array(&arr_vals);
+        let init = struct_ty.const_named_struct(&[hdr.into(), arr.into()]);
+        let g = self.module.add_global(struct_ty, None, "verb.strlit");
+        g.set_initializer(&init);
+        g.set_constant(true);
+        unsafe {
+            self.builder.build_in_bounds_gep(
+                struct_ty, g.as_pointer_value(),
+                &[i32t.const_zero(), i32t.const_int(1, false), i32t.const_zero()],
+                "strdata",
+            )
+        }.unwrap()
+    }
+
     fn call_named(&self, name: &str, args: &[inkwell::values::BasicMetadataValueEnum<'ctx>])
         -> Option<inkwell::values::BasicValueEnum<'ctx>>
     {
@@ -893,7 +923,7 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(self.make_val(TAG_FLOAT, bits))
             }
             Expr::Str(s) => {
-                let p = self.cstr(s);
+                let p = self.static_string_ptr(s);
                 let bits = self.builder.build_ptr_to_int(p, self.ctx.i64_type(), "sbits").unwrap();
                 Ok(self.make_val(TAG_STR, bits))
             }

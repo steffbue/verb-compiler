@@ -598,3 +598,13 @@ fn windows_cross_target_rejects_std_io_import() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn string_literals_carry_a_static_gc_sentinel_header() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/strings.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("-9223372036854775808"), "no GC static sentinel in IR:\n{ir}");
+}
