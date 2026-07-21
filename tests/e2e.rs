@@ -620,3 +620,20 @@ fn gc_retain_release_functions_are_emitted() {
         assert!(ir.contains(sym), "missing {sym} in IR:\n{ir}");
     }
 }
+
+#[test]
+fn gc_retain_release_calls_are_wired_into_expr_codegen() {
+    // NOTE: deviates from the task brief, which named tests/fixtures/strings.verb
+    // here. strings.verb has no variable reads, so it can never produce a
+    // verb_retain_value call site (Step 1 only retains on Expr::Var). vars.verb
+    // is an existing, already-valid fixture (see the `vars` test above) that
+    // reads variables, so it actually exercises both the retain (Step 1) and
+    // release (Steps 2/5) call sites this test is meant to check for.
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/vars.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("call void @verb_retain_value"), "no retain call site in IR:\n{ir}");
+    assert!(ir.contains("call void @verb_release_value"), "no release call site in IR:\n{ir}");
+}
