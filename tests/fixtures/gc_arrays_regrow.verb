@@ -1,0 +1,7 @@
+assign a list 0;
+pop(a);
+loop assign i 0; i trails 50; i be i add 1 begin
+  push(a, i);
+end
+print(len(a));
+print(get(a, 49));

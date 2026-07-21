@@ -9,6 +9,9 @@
 // existing VERB_INT tag (a POSIX fd is already an integer).
 #include "verb.h"
 
+// Defined by Verb's own generated LLVM module (src/codegen.rs).
+extern "C" void* verb_alloc(int64_t n);
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,7 +22,7 @@
 #include <unistd.h>
 
 static VerbValue verb_string_from(const std::string& s) {
-    char* out = static_cast<char*>(std::malloc(s.size() + 1));
+    char* out = static_cast<char*>(verb_alloc(static_cast<int64_t>(s.size() + 1)));
     if (!out) return verb_nil();
     std::memcpy(out, s.data(), s.size());
     out[s.size()] = '\0';
@@ -44,7 +47,7 @@ extern "C" VerbValue file_read(VerbValue path) {
     long size = std::ftell(f);
     if (size < 0) { std::fclose(f); return verb_nil(); }
     std::fseek(f, 0, SEEK_SET);
-    char* buf = static_cast<char*>(std::malloc(static_cast<size_t>(size) + 1));
+    char* buf = static_cast<char*>(verb_alloc(static_cast<int64_t>(size) + 1));
     if (!buf) { std::fclose(f); return verb_nil(); }
     size_t got = std::fread(buf, 1, static_cast<size_t>(size), f);
     std::fclose(f);

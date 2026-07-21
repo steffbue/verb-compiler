@@ -429,7 +429,7 @@ fn collect_symbols(src: &str) -> Symbols {
 fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
     for stmt in stmts {
         match stmt {
-            Stmt::Assign { name, .. } | Stmt::Declare { name } => {
+            Stmt::Assign { name, .. } | Stmt::Declare { name, .. } => {
                 if !out.vars.contains(name) {
                     out.vars.push(name.clone());
                 }
@@ -445,8 +445,8 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
                 }
             }
             Stmt::While { body, .. } => collect_from_stmts(body, out),
-            Stmt::Block(inner) => collect_from_stmts(inner, out),
-            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_) => {}
+            Stmt::Block(inner, ..) => collect_from_stmts(inner, out),
+            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(..) => {}
         }
     }
 }

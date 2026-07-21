@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod codegen;
+pub mod debugger;
 pub mod error;
 pub mod formatter;
 pub mod lexer;
