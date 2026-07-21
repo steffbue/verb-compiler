@@ -60,12 +60,16 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_check_call_fn();
         cg.build_array_len_fn();
         cg.build_array_check_fn();
+        // verb_retain_value/verb_release_value must be declared before
+        // build_array_get_fn/build_array_set_fn, which now call_named
+        // "verb_retain_value" while building their bodies (call_named
+        // requires the callee to already exist in the module).
+        cg.build_retain_value_fn();
+        cg.build_release_value_fn();
         cg.build_array_get_fn();
         cg.build_array_set_fn();
         cg.build_array_push_fn();
         cg.build_array_pop_fn();
-        cg.build_retain_value_fn();
-        cg.build_release_value_fn();
         cg.build_retain_cell_fn();
         cg.build_release_cell_fn();
         cg
@@ -956,6 +960,9 @@ impl<'ctx> Codegen<'ctx> {
         let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
         let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot") }.unwrap();
         let v = self.builder.build_load(self.value_ty, slot, "v").unwrap().into_struct_value();
+        // The array's own slot keeps its reference; `get` hands back an
+        // independent copy, mirroring Expr::Var's retain-on-load.
+        self.call_named("verb_retain_value", &[v.into()]);
         self.builder.build_return(Some(&v)).unwrap();
     }
 
@@ -984,6 +991,12 @@ impl<'ctx> Codegen<'ctx> {
         let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
         let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
         let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems, &[i], "slot") }.unwrap();
+        // `v` (the caller's owned temporary) is about to have two homes --
+        // the array slot and the returned value -- where before it had
+        // one. One retain covers the second home; the slot's copy is the
+        // transfer of `v`'s original ownership (no separate op needed for
+        // that half).
+        self.call_named("verb_retain_value", &[v.into()]);
         self.builder.build_store(slot, v).unwrap();
         self.builder.build_return(Some(&v)).unwrap();
     }
@@ -1059,6 +1072,19 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(cp_cond).unwrap();
 
         self.builder.position_at_end(cp_end);
+        let old_elems_addr = self.builder.build_ptr_to_int(elems, i64t, "old_elems_addr").unwrap();
+        let old_elems_null = self.builder.build_int_compare(
+            EQ, old_elems_addr, i64t.const_zero(), "old_elems_null").unwrap();
+        let free_old_bb = self.ctx.append_basic_block(f, "free_old_elems");
+        let skip_free_old_bb = self.ctx.append_basic_block(f, "skip_free_old_elems");
+        self.builder.build_conditional_branch(old_elems_null, skip_free_old_bb, free_old_bb).unwrap();
+
+        self.builder.position_at_end(free_old_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[self.header_ptr(elems).into()]);
+        self.builder.build_unconditional_branch(skip_free_old_bb).unwrap();
+
+        self.builder.position_at_end(skip_free_old_bb);
         self.builder.build_store(capp, new_cap).unwrap();
         self.builder.build_store(elemsp, new_elems).unwrap();
         self.builder.build_unconditional_branch(after_grow_bb).unwrap();
@@ -1884,6 +1910,7 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_len", &[v.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[v.into()]);
                 return Ok(rv);
             }
             if name == "get" {
@@ -1895,6 +1922,8 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_get", &[arr.into(), idx.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
+                self.call_named("verb_release_value", &[idx.into()]);
                 return Ok(rv);
             }
             if name == "set" {
@@ -1907,6 +1936,8 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_set", &[arr.into(), idx.into(), v.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
+                self.call_named("verb_release_value", &[idx.into()]);
                 return Ok(rv);
             }
             if name == "push" {
@@ -1918,6 +1949,7 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_push", &[arr.into(), v.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
                 return Ok(rv);
             }
             if name == "pop" {
@@ -1928,6 +1960,7 @@ impl<'ctx> Codegen<'ctx> {
                 let (lc, cc) = self.loc_consts(line, col);
                 let rv = self.call_named("verb_array_pop", &[arr.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[arr.into()]);
                 return Ok(rv);
             }
             let is_bound = self.lookup(name).is_some();

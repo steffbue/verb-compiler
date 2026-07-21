@@ -94,6 +94,15 @@ fn array_of_arrays() { run_ok("arrays_of_arrays"); }
 fn array_of_closures() { run_ok("arrays_of_closures"); }
 
 #[test]
+fn nested_arrays_retain_and_release_correctly() { run_ok("gc_arrays_nested"); }
+
+#[test]
+fn arrays_of_closures_retain_and_release_correctly() { run_ok("gc_arrays_of_closures"); }
+
+#[test]
+fn array_push_regrowth_frees_old_buffers() { run_ok("gc_arrays_regrow"); }
+
+#[test]
 fn array_literal_emits_malloc_and_store_in_ir() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run", "tests/fixtures/arrays_literal.verb", "--emit-llvm"])

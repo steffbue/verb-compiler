@@ -1,0 +1,9 @@
+make double(x) begin
+  return x add x;
+end
+make triple(x) begin
+  return x add x add x;
+end
+assign fns list double, triple;
+print(get(fns, 0)(10));
+print(get(fns, 1)(10));
