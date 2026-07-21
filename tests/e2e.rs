@@ -653,3 +653,6 @@ fn gc_releases_block_scope_cells() {
 
 #[test]
 fn early_return_from_nested_block_releases_open_scopes() { run_ok("early_return_releases"); }
+
+#[test]
+fn early_return_in_if_then_leaves_scopes_intact_for_else_branch() { run_ok("early_return_if_else_outer_var"); }

@@ -1,0 +1,11 @@
+make classify(n) begin
+  check n trails 0 begin
+    return "negative";
+  end orelse begin
+    print(n);
+    return "non-negative";
+  end
+end
+
+print(classify(neg 5));
+print(classify(5));
