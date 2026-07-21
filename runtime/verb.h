@@ -34,6 +34,12 @@ enum {
     VERB_FLOAT = 3,
     VERB_STRING = 4,
     VERB_MAP = 6,
+    // Matches src/value.rs's TAG_ARRAY. Payload points at
+    // { int64_t len, cap; VerbValue* elems } (src/codegen.rs's
+    // Expr::ArrayLit codegen) -- runtime/verb_process.cpp's spawn() is
+    // the first C++ unit that needs to recognize this tag, to unpack a
+    // Verb array of argv strings.
+    VERB_ARRAY = 7,
 };
 
 static inline VerbValue verb_nil(void) {

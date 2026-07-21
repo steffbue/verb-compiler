@@ -1,0 +1,6 @@
+assign pid get_pid();
+check pid beats 0 begin
+  print("pid ok");
+end orelse begin
+  print("pid bad");
+end

@@ -1,0 +1,8 @@
+import std process;
+
+assign pid spawn("sh", list "-c", "exit 7");
+check pid equals nil begin
+  print("spawn failed");
+end orelse begin
+  print(wait(pid));
+end

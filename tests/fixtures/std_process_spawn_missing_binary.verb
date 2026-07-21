@@ -1,0 +1,11 @@
+import std process;
+
+assign pid spawn("verb-e2e-definitely-not-a-real-binary", list "x");
+check pid equals nil begin
+  print("spawn itself returned nil");
+end orelse begin
+  assign code wait(pid);
+  check code equals 127 begin
+    print("exec failure surfaced as exit code 127");
+  end
+end

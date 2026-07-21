@@ -1,3 +1,6 @@
-%% second file: line 2 references an undefined variable
+%% second file: imports a valid library, but this file itself
+%% references an undefined variable
+import mod multifile_err_a.verb;
+
 assign y 2;
 print(zz);
