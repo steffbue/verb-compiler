@@ -1821,9 +1821,15 @@ running the fixture first:
 Create `tests/fixtures/gc_arrays_regrow.verb` (the array's own buffer
 reallocates on every capacity doubling regardless of what's stored in
 it, so plain ints are enough to exercise the Step 3 grow-path fix — no
-need for heap-allocated elements here):
+need for heap-allocated elements here).
+
+**Correction (found during implementation):** the grammar has no
+zero-element list literal — `list;` doesn't parse. Seed the array with
+one throwaway element and `pop` it back off before the loop instead;
+output is unaffected and the regrowth path is exercised identically:
 ```
-assign a list;
+assign a list 0;
+pop(a);
 loop assign i 0; i trails 50; i be i add 1 begin
   push(a, i);
 end
