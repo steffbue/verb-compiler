@@ -1622,10 +1622,23 @@ fn map_func_arity(name: &str) -> Option<usize> {
 
 /// Fixed name -> arity table for the `time` module's built-in functions
 /// (see runtime/verb_time.cpp and the design spec). See `IO_FUNCS`.
+/// Names past `difftime_ms` are platform-specific -- `runtime/verb_time.cpp`
+/// only defines `linux_*` under `__linux__` and `win_*` under `_WIN32`
+/// (compiled per-target even in a cross build, since zig's c++ frontend
+/// sets the right predefined macros for `-target`). Calling one for the
+/// wrong target is a link error, same accepted tradeoff `import mod`
+/// externs already have for unresolved names -- this table only checks
+/// arity, never platform/existence, matching every other std-module name.
 const TIME_FUNCS: &[(&str, usize)] = &[
     ("now_ms", 0),
     ("monotonic_ms", 0),
     ("sleep_ms", 1),
+    ("clock_ms", 0),
+    ("difftime_ms", 2),
+    ("linux_clock_gettime_ns", 1),
+    ("linux_nanosleep_ns", 1),
+    ("win_filetime_100ns", 0),
+    ("win_sleep_ms", 1),
 ];
 
 fn time_func_arity(name: &str) -> Option<usize> {

@@ -813,3 +813,58 @@ fn cross_build_links_a_program_using_std_time_for_a_non_host_target() {
         .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
     assert!(meta.len() > 0, "empty output for {label}");
 }
+
+// `linux_*`/`win_*` are only defined in runtime/verb_time.cpp under
+// __linux__/_WIN32 respectively (see TIME_FUNCS's doc comment in
+// src/codegen.rs) -- these two tests cross-build (via zig, whose clang
+// frontend sets the right predefined macros for -target regardless of
+// host OS) to confirm each platform's functions actually compile and
+// link for that platform. Not run, same as the other cross-build tests
+// (foreign arch/OS binaries can't execute on this host).
+
+#[test]
+fn cross_build_links_a_program_using_linux_only_time_functions() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_time_linux_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_time_linux_x86_64");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_linux.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "linux-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "linux-x86_64 build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for linux-x86_64");
+}
+
+#[test]
+fn cross_build_links_a_program_using_windows_only_time_functions() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_time_windows_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_time_windows_x86_64");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_windows.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "windows-x86_64 build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let expected_path = dir.join("std_time_windows_x86_64.exe");
+    let meta = std::fs::metadata(&expected_path)
+        .unwrap_or_else(|e| panic!("missing output at {expected_path:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for windows-x86_64");
+}

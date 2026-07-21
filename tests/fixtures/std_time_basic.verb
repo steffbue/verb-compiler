@@ -10,3 +10,10 @@ print(wall beats 0);
 
 assign wall2 now_ms();
 print(wall2 atleast wall);
+
+print(difftime_ms(monotonic_ms(), start) atleast 20);
+
+assign cpu1 clock_ms();
+assign cpu2 clock_ms();
+print(cpu1 atleast 0);
+print(cpu2 atleast cpu1);

@@ -1,0 +1,7 @@
+import std time;
+
+assign start win_filetime_100ns();
+win_sleep_ms(1);
+assign elapsed win_filetime_100ns() sub start;
+print(elapsed atleast 0);
+print(start beats 0);
