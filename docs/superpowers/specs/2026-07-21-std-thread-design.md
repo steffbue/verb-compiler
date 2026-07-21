@@ -31,6 +31,85 @@ wanted it to. The only way a spawned thread touches shared state is
 top-level globals (module-level LLVM globals, `self.globals`), which is
 exactly what `mutex_*` exists to protect.
 
+**Correction (post-implementation, final review):** the paragraph above
+is only half true, and the "which is exactly what `mutex_*` exists to
+protect" framing overstates what's actually enforced. `mutex_*` protects
+whatever critical section the *user* wraps in `mutex_lock`/
+`mutex_unlock` — nothing in this design stops a spawned thread from
+reading or mutating a **heap-typed** global (a global holding a
+`STRING`/`ARRAY`/`MAP`/`CLOSURE`) with no lock at all, since only
+`thread_spawn`'s 0-arity closure argument and `channel_send`'s payload
+are checked. A global array is a live counter-example:
+
+```
+assign shared list 1, 2, 3;   // global ARRAY (heap)
+make worker() begin
+  push(shared, 4);            // spawned thread mutates the shared heap array
+end
+assign t thread_spawn(worker);
+push(shared, 5);              // main thread mutates it concurrently -- no lock
+thread_join(t);
+```
+
+Both threads call `verb_array_push` on the same header/buffer
+concurrently: non-atomic refcount and length/capacity updates, possible
+concurrent `realloc` — real heap corruption, not just a wrong answer.
+This *is* a heap value crossing the thread boundary, just implicitly,
+through a global rather than through `thread_spawn`'s argument or a
+channel — and it's the documented way to get data into a thread (see
+Non-goals below), so it's easy to hit by following this spec's own
+advice.
+
+**The actual, narrower guarantee this design provides:** only
+`NIL`/`BOOL`/`INT`/`FLOAT` are safe to share via a global read or
+written by a spawned thread. A **heap-typed global must never be read
+or mutated from inside a spawned closure's body, at all, mutex or not**
+— a mutex only serializes the operations the user puts inside
+`mutex_lock`/`mutex_unlock`, but retain/release on a shared heap
+global's own header are emitted implicitly by codegen wherever the
+global is read or reassigned, and are not guaranteed to fall inside the
+user's own critical section. This restriction is not enforced by the
+compiler or runtime in v1 (see "Known limitations" below) — violating
+it is undefined behavior at the same trust level as every other
+memory-safety invariant this runtime already asks the program to
+uphold itself (e.g. array bounds, fd validity).
+
+## Known limitations (added post-implementation, final review)
+
+- **Heap-typed globals are not protected** — see the Context correction
+  above. Only primitive (`NIL`/`BOOL`/`INT`/`FLOAT`) globals may safely
+  be touched from a spawned thread. No compiler or runtime check exists
+  to catch a violation; it silently corrupts the heap instead of
+  aborting cleanly. A real fix needs either static enforcement (reject
+  a spawned closure whose body touches a heap-typed global) or runtime
+  enforcement (tag global slots and abort on cross-thread heap access)
+  — tracked as follow-up work, not done in this spec.
+- **The `VERB_GC_DEBUG` leak counter (`verb_gc_live`) is not
+  thread-safe.** `inc_live_counter`/`dec_live_counter` are a plain
+  load-add-store on a shared global, and any spawned closure that
+  allocates a heap value locally (a string, array, map, or nested
+  closure — even one never shared with another thread) races on this
+  counter with concurrent allocations on other threads. This is bounded
+  to a torn/lost update on the *debug-only* counter — it never drives
+  an actual alloc/free decision, so it causes no memory corruption and
+  no effect on real refcounts. Practical consequence: `verb_gc_live=0`
+  leak-checking is only a meaningful guarantee for single-threaded
+  programs, or multithreaded programs whose thread bodies allocate no
+  heap values at all (as today's `std_thread_spawn_join` fixture does —
+  its thread body only touches an `INT`). It gives no assurance for a
+  thread body that allocates strings/arrays/maps/closures internally.
+  Fix (not done here): make the counter atomic.
+- **`mutex_new()`/`channel_new()` handles are never freed.** Unlike
+  `thread_join`, which frees its `ThreadHandle`, there is no
+  `mutex_free`/`channel_free` — every mutex/channel a program creates
+  leaks its underlying `std::mutex`/`Channel` for the process's
+  lifetime. Acceptable under this runtime's existing trust model
+  (program-lifetime handles, same as never-`free`'d maps), but this
+  means the "confirm the fixture doesn't leave dangling C++ heap
+  allocations" testing goal in this spec's own Testing section is not
+  actually verified by any test — doing so would need ASan/valgrind,
+  which this project doesn't currently run.
+
 ## Goals
 
 - `thread_spawn`/`thread_join` — run a 0-arity closure on a new OS
@@ -167,14 +246,18 @@ listing all three names.
   exclusion, not just "doesn't crash"); channel send/recv handoff
   between main and a spawned thread; `channel_send` of a string/array
   returns `false` and does not deadlock the receiver.
-- GC: new leak-check fixture for `import std thread`, isolated from
-  other temp-file-using fixtures the same way the recent std-io
-  leak-check isolation commit already established — thread/mutex/
-  channel handles are `VERB_INT`-tagged (not refcounted) so there is
-  nothing to leak-check on the Verb-value side, but confirm the fixture
-  process itself doesn't leave dangling C++ heap allocations (handle
-  structs) after every `thread_join`/no unmatched `mutex_new`/
-  `channel_new`.
+- GC: the spawn/join fixture is included in the existing
+  `gc_no_leaks_across_all_heap_kinds` `verb_gc_live=0` check — thread/
+  mutex/channel handles are `VERB_INT`-tagged (not refcounted) so there
+  is nothing to leak-check on the Verb-value side, and this fixture's
+  thread body only touches an `INT` (no heap allocation), so the check
+  is deterministic for it specifically (see "Known limitations" above
+  for why it would NOT be for an allocating thread body). **Not
+  actually verified by any test** (would need ASan/valgrind, not
+  currently run by this project): that `mutex_new()`/`channel_new()`'s
+  C++ handles get freed — they don't (see "Known limitations" above),
+  and `thread_join`'s own `ThreadHandle` free is likewise unverified by
+  tooling, only by code inspection.
 
 ## Error handling summary
 
