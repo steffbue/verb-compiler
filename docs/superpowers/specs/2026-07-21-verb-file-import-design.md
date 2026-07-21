@@ -93,9 +93,10 @@ recursive worklist starting from the single entry file:
 3. `process(path)`:
    - If `path` is in `done`, return immediately (diamond dependency —
      include once).
-   - If `path` is in `stack`, error: import cycle, reporting the chain
-     (`stack` joined with `->`, plus `path` closing the loop) at the
-     import statement that closed the cycle.
+   - If `path` is in `stack`, error: a plain (no source line/col —
+     consistent with today's "cannot read `<file>`" entry-file error,
+     which also carries none) message naming the cycle, built from the
+     chain (`stack` joined with `->`, plus `path` closing the loop).
    - Push `path` onto `stack`. Read, lex, parse it (same `die()`-based
      error path as today, `sources` list grows to include every file
      touched so error messages can still show source snippets for
