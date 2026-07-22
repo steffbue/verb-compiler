@@ -88,6 +88,39 @@ Verb programs can call `extern "C"` functions from a native library:
 See `docs/superpowers/specs/2026-07-20-cpp-import-design.md` for the full
 design.
 
+## Importing other Verb files
+
+`import mod` also pulls in another Verb source file, not just a C++
+library — the CLI itself now only ever takes a single entry file, so
+multi-file programs are built entirely through this:
+
+    %% utils.verb
+    make double(x) begin
+      return x times 2;
+    end
+
+    %% main.verb
+    import mod utils.verb;
+
+    print(double(21));
+
+- Disambiguation is purely by name: `import mod <name>;` (no `.verb`
+  suffix) is a C++ library; `import mod <name>.verb;` is a Verb source
+  file.
+- The path is a bare filename (no `/`, no subdirectories in v1), resolved
+  relative to the directory of the file doing the importing — not the
+  current working directory.
+- Imports are recursive (an imported file can `import mod` further files)
+  and deduplicated (the same file imported from two places is only
+  included once). A file that imports itself, directly or transitively,
+  is a compile error.
+- Everything imported lands in one flat global scope, same as if it had
+  all been written in one file — there's no `utils.helper()`-style
+  qualified access in v1.
+
+See `docs/superpowers/specs/2026-07-21-verb-file-import-design.md` for the
+full design.
+
 ## Standard library I/O (`import std io`)
 
 Unlike `import mod`, which requires writing your own `extern "C"`
@@ -106,8 +139,9 @@ Available functions: `read_line()`, `file_read(path)`,
 `send_line(fd, s)`, `recv_line(fd)`, `close_conn(fd)`. Every function
 returns `nil` on failure — check with `check x eq nil`.
 
-- Only `io` and `map` modules exist in v1 (`import std io;` / `import std
-  map;`); an unrecognized module name after `std` is a compile error.
+- Only `io`, `map`, and `time` modules exist in v1 (`import std io;` /
+  `import std map;` / `import std time;`); an unrecognized module name
+  after `std` is a compile error.
 - Like `import mod`, `import std io;` must appear before any other
   top-level statement. `verb run` (JIT) executes it in-process, same as
   `verb build`/`compile`.
@@ -175,6 +209,54 @@ same as `std io`.
   contents as arrays.
 
 See `docs/superpowers/specs/2026-07-21-maps-design.md` for the full design.
+
+## Standard library time (`import std time`)
+
+`import std time;` gives Verb programs wall-clock/monotonic millisecond
+timestamps and a blocking sleep, compiled and linked in the same way
+`import std io;`/`import std map;` are.
+
+    import std time;
+
+    assign start monotonic_ms();
+    sleep_ms(250);
+    print(monotonic_ms() sub start atleast 250);   %% true
+
+Portable functions (every platform): `now_ms()` (milliseconds since the
+Unix epoch, wall-clock — can jump backwards/forwards if the system clock
+is adjusted), `monotonic_ms()` (milliseconds from a monotonic clock —
+never goes backwards, only meaningful as a difference between two calls,
+so prefer it over `now_ms()` for measuring elapsed time), `sleep_ms(ms)`
+(blocks the calling thread for `ms` milliseconds; `ms <= 0` is a no-op),
+`clock_ms()` (CPU time consumed by this process, in milliseconds — the
+same quantity C's `clock()` reports; does *not* advance while blocked or
+sleeping), `difftime_ms(later, earlier)` (equivalent to `later sub
+earlier`, offered under C's familiar name).
+
+Platform-specific functions — only defined (and only linkable) when
+`verb build`/`compile` targets that platform, direct bindings to the
+underlying OS API rather than the `<chrono>`/`<thread>` wrappers above:
+
+- Linux: `linux_clock_gettime_ns(clock_id)` (nanoseconds from
+  `clock_gettime`; `clock_id` is the raw Linux `clockid_t` value — `0`
+  for `CLOCK_REALTIME`, `1` for `CLOCK_MONOTONIC`), `linux_nanosleep_ns(ns)`
+  (`nanosleep`; `ns <= 0` is a no-op).
+- Windows: `win_filetime_100ns()` (`GetSystemTimeAsFileTime`, raw FILETIME
+  as 100ns intervals since 1601-01-01), `win_sleep_ms(ms)` (`Sleep`;
+  `ms <= 0` is a no-op).
+
+Calling a Linux function in a Windows build (or vice versa) is a link
+error, not a compile error — same tradeoff generic `import mod` externs
+already have for an unresolved name (see "C++ import" above).
+
+- Like `import std io;`, `import std time;` must appear before any other
+  top-level statement, and `verb run` (JIT) does not support it — use
+  `verb build`/`compile`.
+- No Windows restriction on the portable functions (`<chrono>`/`<thread>`
+  are portable) — unlike `std io`, `std time` cross-compiles to every v1
+  target.
+
+See `docs/superpowers/specs/2026-07-21-time-design.md` for the full design.
 
 ## Language
 
