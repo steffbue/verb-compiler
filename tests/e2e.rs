@@ -117,6 +117,30 @@ fn array_of_arrays() { run_ok("arrays_of_arrays"); }
 #[test]
 fn array_of_closures() { run_ok("arrays_of_closures"); }
 
+// ----- structs (`shape`) -----
+
+#[test]
+fn struct_construct_get_set_print() { run_ok("structs"); }
+
+#[test]
+fn struct_leaks_nothing() { assert_no_leaks("structs"); }
+
+#[test]
+fn struct_heap_fields_and_nesting() { run_ok("structs_heap"); }
+
+#[test]
+fn struct_heap_fields_leak_nothing() { assert_no_leaks("structs_heap"); }
+
+#[test]
+fn struct_construct_arity_mismatch_is_compile_error() {
+    compile_err("structs_arity", &["Point", "2", "1"]);
+}
+
+#[test]
+fn struct_unknown_field_aborts() {
+    run_err("structs_badfield", "no field 'z'");
+}
+
 #[test]
 fn nested_arrays_retain_and_release_correctly() { run_ok("gc_arrays_nested"); }
 

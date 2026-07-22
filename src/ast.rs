@@ -27,6 +27,7 @@ pub enum Stmt {
     If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
     Fn { name: String, params: Vec<String>, body: Vec<Stmt>, line: u32, col: u32 },
+    Shape { name: String, fields: Vec<String>, line: u32, col: u32 },      // shape Name begin f1, f2 end
     Return { value: Option<Expr> },
     Block(Vec<Stmt>),
 }

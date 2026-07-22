@@ -173,7 +173,8 @@ impl Parser {
                 // the start of whatever comes after the broken statement
                 TokenKind::Semi | TokenKind::End => { self.advance(); return; }
                 TokenKind::Assign | TokenKind::Declare | TokenKind::Make | TokenKind::Return
-                | TokenKind::Check | TokenKind::Repeat | TokenKind::Loop | TokenKind::Begin => return,
+                | TokenKind::Check | TokenKind::Repeat | TokenKind::Loop | TokenKind::Begin
+                | TokenKind::Shape => return,
                 _ => { self.advance(); }
             }
         }
@@ -184,6 +185,7 @@ impl Parser {
             TokenKind::Assign => self.assign_stmt(true),
             TokenKind::Declare => self.declare_stmt(),
             TokenKind::Make => self.fn_stmt(),
+            TokenKind::Shape => self.shape_stmt(),
             TokenKind::Return => self.return_stmt(),
             TokenKind::Check => self.if_stmt(),
             TokenKind::Repeat => self.while_stmt(),
@@ -246,6 +248,34 @@ impl Parser {
         let body = self.block()?;
         self.fn_depth -= 1;
         Ok(Stmt::Fn { name, params, body, line, col })
+    }
+
+    /// `shape Name begin f1, f2, ... end` — declares a struct type. Fields
+    /// are bare identifiers, comma-separated (a trailing comma is allowed);
+    /// whitespace/newlines between them are irrelevant. A struct may have
+    /// zero fields (`shape Empty begin end`). Duplicate field names are
+    /// rejected.
+    fn shape_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
+        self.advance(); // shape
+        let (name, _, _) = self.expect_ident("struct type name after 'shape'")?;
+        self.expect(&TokenKind::Begin, "'begin'")?;
+        let mut fields: Vec<String> = Vec::new();
+        while !self.check(&TokenKind::End) && !self.check(&TokenKind::Eof) {
+            let (f, fl, fc) = self.expect_ident("field name")?;
+            if fields.contains(&f) {
+                return Err(CompileError::new(
+                    format!("duplicate field '{f}' in struct '{name}'"), fl, fc));
+            }
+            fields.push(f);
+            // optional comma between fields (also allowed as a trailing comma)
+            if !self.matches(&TokenKind::Comma) && !self.check(&TokenKind::End) {
+                // no comma and not at the end: next must still be an ident,
+                // so loop around; expect_ident above will error if it isn't
+            }
+        }
+        self.expect(&TokenKind::End, "'end'")?;
+        Ok(Stmt::Shape { name, fields, line, col })
     }
 
     fn return_stmt(&mut self) -> Result<Stmt, CompileError> {
@@ -563,6 +593,30 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_shape_declaration() {
+        let p = parse(lex("shape Point begin x, y end").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::Shape { name, fields, .. } => {
+                assert_eq!(name, "Point");
+                assert_eq!(fields, &vec!["x".to_string(), "y".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_rejects_duplicate_fields() {
+        let err = parse(lex("shape P begin x, x end").unwrap()).unwrap_err();
+        assert!(err.msg.contains("duplicate field 'x'"), "{}", err.msg);
+    }
+
+    #[test]
+    fn parses_empty_shape() {
+        let p = parse(lex("shape Empty begin end").unwrap()).unwrap();
+        assert!(matches!(&p.body[0], Stmt::Shape { fields, .. } if fields.is_empty()));
     }
 
     #[test]

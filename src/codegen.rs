@@ -11,6 +11,16 @@ use crate::ast::*;
 use crate::error::CompileError;
 use crate::value::*;
 
+/// A struct type declared with `shape`. `fields` is the declared field
+/// order (positional constructor order); `desc` points at the type's
+/// module-level descriptor global — `{ ptr type_name, i64 nfields, ptr
+/// field_names[] }` — read at runtime by getf/setf/print to resolve a
+/// field name to its slot index and to print the type/field names.
+struct StructInfo<'ctx> {
+    fields: Vec<String>,
+    desc: PointerValue<'ctx>,
+}
+
 pub struct Codegen<'ctx> {
     ctx: &'ctx Context,
     module: Module<'ctx>,
@@ -22,6 +32,7 @@ pub struct Codegen<'ctx> {
     scopes: Vec<HashMap<String, PointerValue<'ctx>>>,
     globals: HashMap<String, PointerValue<'ctx>>,
     externs: HashMap<String, FunctionValue<'ctx>>,
+    structs: HashMap<String, StructInfo<'ctx>>,
     imports: Vec<String>,
     std_imports: Vec<String>,
     fn_depth: u32,
@@ -42,6 +53,7 @@ impl<'ctx> Codegen<'ctx> {
         let cg = Self {
             ctx, module, builder, value_ty, closure_ty, array_ty, ptr_ty,
             scopes: Vec::new(), globals: HashMap::new(), externs: HashMap::new(),
+            structs: HashMap::new(),
             imports: Vec::new(), std_imports: Vec::new(), fn_depth: 0, fn_counter: 0,
             cur_file: String::new(),
         };
@@ -72,6 +84,9 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_array_pop_fn();
         cg.build_retain_cell_fn();
         cg.build_release_cell_fn();
+        cg.build_struct_check_fn();
+        cg.build_struct_get_fn();
+        cg.build_struct_set_fn();
         cg
     }
 
@@ -222,7 +237,7 @@ impl<'ctx> Codegen<'ctx> {
         let mut cases = Vec::new();
         for (t, name) in [(TAG_NIL, "nil"), (TAG_BOOL, "bool"), (TAG_INT, "int"),
                           (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn"),
-                          (TAG_ARRAY, "array"), (TAG_MAP, "map")] {
+                          (TAG_ARRAY, "array"), (TAG_MAP, "map"), (TAG_STRUCT, "struct")] {
             let bb = self.ctx.append_basic_block(f, name);
             self.builder.position_at_end(bb);
             let s = self.cstr(name);
@@ -338,6 +353,7 @@ impl<'ctx> Codegen<'ctx> {
         let clos_bb = self.ctx.append_basic_block(f, "closure");
         let arr_bb = self.ctx.append_basic_block(f, "array");
         let map_bb = self.ctx.append_basic_block(f, "map");
+        let struct_bb = self.ctx.append_basic_block(f, "struct");
         let done = self.ctx.append_basic_block(f, "done");
 
         let i8t = self.ctx.i8_type();
@@ -350,6 +366,7 @@ impl<'ctx> Codegen<'ctx> {
             (i8t.const_int(TAG_CLOSURE, false), clos_bb),
             (i8t.const_int(TAG_ARRAY, false), arr_bb),
             (i8t.const_int(TAG_MAP, false), map_bb),
+            (i8t.const_int(TAG_STRUCT, false), struct_bb),
         ]).unwrap();
 
         self.builder.position_at_end(nil_bb);
@@ -430,6 +447,63 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(map_bb);
         self.call_named("printf", &[self.cstr("<map>\n").into()]);
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        // ----- struct: TypeName{f0: v0, f1: v1} -----
+        self.builder.position_at_end(struct_bb);
+        let desc_ty = self.ctx.struct_type(
+            &[self.ptr_ty.into(), self.ctx.i64_type().into(), self.ptr_ty.into()], false);
+        let shdr = self.builder.build_int_to_ptr(pay, self.ptr_ty, "shdr").unwrap();
+        let sdescp = self.builder.build_struct_gep(self.array_ty, shdr, 0, "sdescp").unwrap();
+        let sdesc_int = self.builder.build_load(self.ctx.i64_type(), sdescp, "sdesc_int").unwrap().into_int_value();
+        let sdesc = self.builder.build_int_to_ptr(sdesc_int, self.ptr_ty, "sdesc").unwrap();
+        // type name (descriptor field 0)
+        let tnp = self.builder.build_struct_gep(desc_ty, sdesc, 0, "tnp").unwrap();
+        let tn = self.builder.build_load(self.ptr_ty, tnp, "tn").unwrap().into_pointer_value();
+        self.call_named("printf", &[self.cstr("%s{").into(), tn.into()]);
+        let snfp = self.builder.build_struct_gep(self.array_ty, shdr, 1, "snfp").unwrap();
+        let snf = self.builder.build_load(self.ctx.i64_type(), snfp, "snf").unwrap().into_int_value();
+        let snamesp = self.builder.build_struct_gep(desc_ty, sdesc, 2, "snamesp").unwrap();
+        let snames = self.builder.build_load(self.ptr_ty, snamesp, "snames").unwrap().into_pointer_value();
+        let sfieldsp = self.builder.build_struct_gep(self.array_ty, shdr, 2, "sfieldsp").unwrap();
+        let sfields = self.builder.build_load(self.ptr_ty, sfieldsp, "sfields").unwrap().into_pointer_value();
+
+        let sidxp = self.entry_alloca(self.ctx.i64_type().into(), "sidx");
+        self.builder.build_store(sidxp, self.ctx.i64_type().const_zero()).unwrap();
+        let s_cond = self.ctx.append_basic_block(f, "struct.cond");
+        let s_body = self.ctx.append_basic_block(f, "struct.body");
+        let s_sep = self.ctx.append_basic_block(f, "struct.sep");
+        let s_field = self.ctx.append_basic_block(f, "struct.field");
+        let s_end = self.ctx.append_basic_block(f, "struct.end");
+        self.builder.build_unconditional_branch(s_cond).unwrap();
+
+        self.builder.position_at_end(s_cond);
+        let si = self.builder.build_load(self.ctx.i64_type(), sidxp, "si").unwrap().into_int_value();
+        let smore = self.builder.build_int_compare(inkwell::IntPredicate::SLT, si, snf, "smore").unwrap();
+        self.builder.build_conditional_branch(smore, s_body, s_end).unwrap();
+
+        self.builder.position_at_end(s_body);
+        let s_is_first = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ, si, self.ctx.i64_type().const_zero(), "sisfirst").unwrap();
+        self.builder.build_conditional_branch(s_is_first, s_field, s_sep).unwrap();
+
+        self.builder.position_at_end(s_sep);
+        self.call_named("printf", &[self.cstr(", ").into()]);
+        self.builder.build_unconditional_branch(s_field).unwrap();
+
+        self.builder.position_at_end(s_field);
+        let namep = unsafe { self.builder.build_in_bounds_gep(self.ptr_ty, snames, &[si], "namep") }.unwrap();
+        let fname = self.builder.build_load(self.ptr_ty, namep, "fname").unwrap().into_pointer_value();
+        self.call_named("printf", &[self.cstr("%s: ").into(), fname.into()]);
+        let fslot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, sfields, &[si], "fslot") }.unwrap();
+        let fval = self.builder.build_load(self.value_ty, fslot, "fval").unwrap().into_struct_value();
+        self.call_named("verb_print_value", &[fval.into()]);
+        let snext = self.builder.build_int_add(si, self.ctx.i64_type().const_int(1, false), "snext").unwrap();
+        self.builder.build_store(sidxp, snext).unwrap();
+        self.builder.build_unconditional_branch(s_cond).unwrap();
+
+        self.builder.position_at_end(s_end);
+        self.call_named("printf", &[self.cstr("}").into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(done);
@@ -1190,8 +1264,10 @@ impl<'ctx> Codegen<'ctx> {
         let is_clos = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_CLOSURE, false), "is_clos").unwrap();
         let is_arr = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ARRAY, false), "is_arr").unwrap();
         let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
+        let is_struct = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STRUCT, false), "is_struct").unwrap();
         let is_clos_or_arr = self.builder.build_or(is_clos, is_arr, "is_clos_or_arr").unwrap();
-        let is_heap = self.builder.build_or(is_clos_or_arr, is_map, "is_heap").unwrap();
+        let is_map_or_struct = self.builder.build_or(is_map, is_struct, "is_map_or_struct").unwrap();
+        let is_heap = self.builder.build_or(is_clos_or_arr, is_map_or_struct, "is_heap").unwrap();
         self.builder.build_conditional_branch(is_heap, heap_bump_bb, done_bb).unwrap();
 
         self.builder.position_at_end(heap_bump_bb);
@@ -1244,6 +1320,15 @@ impl<'ctx> Codegen<'ctx> {
         let map_bb = self.ctx.append_basic_block(f, "map");
         let map_dec_bb = self.ctx.append_basic_block(f, "map.dec");
         let map_free_bb = self.ctx.append_basic_block(f, "map.free");
+        let struct_check_bb = self.ctx.append_basic_block(f, "struct.check");
+        let struct_bb = self.ctx.append_basic_block(f, "struct");
+        let struct_dec_bb = self.ctx.append_basic_block(f, "struct.dec");
+        let struct_free_bb = self.ctx.append_basic_block(f, "struct.free");
+        let struct_loop_cond_bb = self.ctx.append_basic_block(f, "struct.loop.cond");
+        let struct_loop_body_bb = self.ctx.append_basic_block(f, "struct.loop.body");
+        let struct_loop_end_bb = self.ctx.append_basic_block(f, "struct.loop.end");
+        let struct_free_fields_bb = self.ctx.append_basic_block(f, "struct.free_fields");
+        let struct_skip_fields_bb = self.ctx.append_basic_block(f, "struct.skip_fields");
         let done_bb = self.ctx.append_basic_block(f, "done");
 
         self.builder.position_at_end(entry);
@@ -1366,7 +1451,7 @@ impl<'ctx> Codegen<'ctx> {
         // ----- map: cascade via runtime/verb_map.cpp, then free header -----
         self.builder.position_at_end(map_check_bb);
         let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
-        self.builder.build_conditional_branch(is_map, map_bb, done_bb).unwrap();
+        self.builder.build_conditional_branch(is_map, map_bb, struct_check_bb).unwrap();
 
         self.builder.position_at_end(map_bb);
         let mp = self.builder.build_int_to_ptr(p, self.ptr_ty, "mp").unwrap();
@@ -1383,6 +1468,69 @@ impl<'ctx> Codegen<'ctx> {
         self.call_named("verb_map_destroy_contents", &[mp.into()]);
         self.dec_live_counter();
         self.call_named("free", &[mhdr.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- struct: cascade into every field, then free fields + header.
+        // The descriptor is a static global (never verb_alloc'd), so it is
+        // deliberately left untouched. Mirrors the array cascade (two
+        // verb_alloc blocks -> two dec_live_counter). -----
+        self.builder.position_at_end(struct_check_bb);
+        let is_struct = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STRUCT, false), "is_struct").unwrap();
+        self.builder.build_conditional_branch(is_struct, struct_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(struct_bb);
+        let stp = self.builder.build_int_to_ptr(p, self.ptr_ty, "stp").unwrap();
+        let sthdr = self.header_ptr(stp);
+        let stcur = self.builder.build_load(i64t, sthdr, "stcur").unwrap().into_int_value();
+        let stnext = self.builder.build_int_sub(stcur, i64t.const_int(1, false), "stnext").unwrap();
+        self.builder.build_store(sthdr, stnext).unwrap();
+        let stzero = self.builder.build_int_compare(EQ, stnext, i64t.const_zero(), "stzero").unwrap();
+        self.builder.build_conditional_branch(stzero, struct_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(struct_dec_bb);
+        self.builder.build_unconditional_branch(struct_free_bb).unwrap();
+
+        self.builder.position_at_end(struct_free_bb);
+        // field 1 = nfields, field 2 = fields buffer (field 0 is the
+        // descriptor pointer, not owned here).
+        let stnfp = self.builder.build_struct_gep(self.array_ty, stp, 1, "stnfp").unwrap();
+        let stfieldsp = self.builder.build_struct_gep(self.array_ty, stp, 2, "stfieldsp").unwrap();
+        let stnf = self.builder.build_load(i64t, stnfp, "stnf").unwrap().into_int_value();
+        let stfields = self.builder.build_load(self.ptr_ty, stfieldsp, "stfields").unwrap().into_pointer_value();
+        let stidxp = self.entry_alloca(i64t.into(), "strelidx");
+        self.builder.build_store(stidxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(struct_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(struct_loop_cond_bb);
+        let sti = self.builder.build_load(i64t, stidxp, "sti").unwrap().into_int_value();
+        let stmore = self.builder.build_int_compare(
+            inkwell::IntPredicate::SLT, sti, stnf, "stmore").unwrap();
+        self.builder.build_conditional_branch(stmore, struct_loop_body_bb, struct_loop_end_bb).unwrap();
+
+        self.builder.position_at_end(struct_loop_body_bb);
+        let stslot = unsafe {
+            self.builder.build_in_bounds_gep(self.value_ty, stfields, &[sti], "stslot")
+        }.unwrap();
+        let stelemv = self.builder.build_load(self.value_ty, stslot, "stelemv").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[stelemv.into()]);
+        let stinext = self.builder.build_int_add(sti, i64t.const_int(1, false), "stinext").unwrap();
+        self.builder.build_store(stidxp, stinext).unwrap();
+        self.builder.build_unconditional_branch(struct_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(struct_loop_end_bb);
+        self.dec_live_counter();
+        let stfields_addr = self.builder.build_ptr_to_int(stfields, i64t, "stfields_addr").unwrap();
+        let stfields_null = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ, stfields_addr, i64t.const_zero(), "stfields_null").unwrap();
+        self.builder.build_conditional_branch(stfields_null, struct_skip_fields_bb, struct_free_fields_bb).unwrap();
+
+        self.builder.position_at_end(struct_free_fields_bb);
+        self.dec_live_counter();
+        let stehdr = self.header_ptr(stfields);
+        self.call_named("free", &[stehdr.into()]);
+        self.builder.build_unconditional_branch(struct_skip_fields_bb).unwrap();
+
+        self.builder.position_at_end(struct_skip_fields_bb);
+        self.call_named("free", &[sthdr.into()]);
         self.builder.build_unconditional_branch(done_bb).unwrap();
 
         self.builder.position_at_end(done_bb);
@@ -1440,6 +1588,226 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.
+    /// The LLVM type of a struct type's descriptor global:
+    /// `{ ptr type_name, i64 nfields, ptr field_names[] }`.
+    fn struct_desc_ty(&self) -> StructType<'ctx> {
+        self.ctx.struct_type(
+            &[self.ptr_ty.into(), self.ctx.i64_type().into(), self.ptr_ty.into()], false)
+    }
+
+    /// Emit the module-level descriptor for a `shape` type and record it in
+    /// `self.structs`. Must be called with the builder positioned inside a
+    /// function (it uses `cstr`, which emits global string pointers).
+    fn register_struct(&mut self, name: &str, fields: &[String]) {
+        let i64t = self.ctx.i64_type();
+        let nf = fields.len();
+        let name_ptrs: Vec<PointerValue<'ctx>> = fields.iter().map(|f| self.cstr(f)).collect();
+        let typename_ptr = self.cstr(name);
+
+        // field-name pointer array: [ptr x nfields]
+        let names_arr_ty = self.ptr_ty.array_type(nf as u32);
+        let names_const = self.ptr_ty.const_array(&name_ptrs);
+        let names_g = self.module.add_global(names_arr_ty, None, &format!("verb.struct.{name}.names"));
+        names_g.set_initializer(&names_const);
+        names_g.set_constant(true);
+        names_g.set_linkage(inkwell::module::Linkage::Private);
+
+        // descriptor: { ptr type_name, i64 nfields, ptr names }
+        let desc_ty = self.struct_desc_ty();
+        let desc_init = desc_ty.const_named_struct(&[
+            typename_ptr.into(),
+            i64t.const_int(nf as u64, false).into(),
+            names_g.as_pointer_value().into(),
+        ]);
+        let desc_g = self.module.add_global(desc_ty, None, &format!("verb.struct.{name}.desc"));
+        desc_g.set_initializer(&desc_init);
+        desc_g.set_constant(true);
+        desc_g.set_linkage(inkwell::module::Linkage::Private);
+
+        self.structs.insert(name.to_string(),
+            StructInfo { fields: fields.to_vec(), desc: desc_g.as_pointer_value() });
+    }
+
+    /// Construct a struct instance: heap block `{ i64 descriptor_ptr, i64
+    /// nfields, ptr fields }` (same physical shape as `array_ty`, reused
+    /// for its GEPs) plus a separate `fields` buffer of `nfields`
+    /// `VerbValue`s. Each argument's ownership transfers into its slot,
+    /// exactly like `Expr::ArrayLit`.
+    fn gen_struct_new(&mut self, desc: PointerValue<'ctx>, nfields: usize, args: &[Expr])
+        -> Result<StructValue<'ctx>, CompileError>
+    {
+        let i64t = self.ctx.i64_type();
+        let n = nfields as u64;
+        let hdr = self.malloc_bytes(24);
+        let fields_buf = if n == 0 {
+            self.ptr_ty.const_null()
+        } else {
+            self.malloc_bytes(n * 16) // n * sizeof(%verb.value)
+        };
+        for (i, a) in args.iter().enumerate() {
+            let v = self.gen_expr(a)?;
+            let slot = unsafe {
+                self.builder.build_in_bounds_gep(
+                    self.value_ty, fields_buf, &[i64t.const_int(i as u64, false)], "fslot")
+            }.unwrap();
+            self.builder.build_store(slot, v).unwrap();
+        }
+        let desc_int = self.builder.build_ptr_to_int(desc, i64t, "descint").unwrap();
+        let descp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "descp").unwrap();
+        self.builder.build_store(descp, desc_int).unwrap();
+        let nfp = self.builder.build_struct_gep(self.array_ty, hdr, 1, "nfp").unwrap();
+        self.builder.build_store(nfp, i64t.const_int(n, false)).unwrap();
+        let fieldsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "fieldsp").unwrap();
+        self.builder.build_store(fieldsp, fields_buf).unwrap();
+        let bits = self.builder.build_ptr_to_int(hdr, i64t, "sbits").unwrap();
+        Ok(self.make_val(TAG_STRUCT, bits))
+    }
+
+    /// verb_struct_check(VerbValue s, VerbValue key, i32 line, i32 col, ptr
+    /// opname) -> i64 index. Aborts if `s` isn't a struct or has no field
+    /// named `key`; otherwise returns the field's slot index. `key`'s
+    /// payload is treated as a NUL-terminated string pointer.
+    fn build_struct_check_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let i8t = self.ctx.i8_type();
+        let desc_ty = self.struct_desc_ty();
+        let f = self.module.add_function(
+            "verb_struct_check",
+            i64t.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into(), self.ptr_ty.into()],
+                false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let key = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+        let opname = f.get_nth_param(4).unwrap().into_pointer_value();
+        let keyptr = self.builder.build_int_to_ptr(self.payload_of(key), self.ptr_ty, "keyptr").unwrap();
+
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let bad_bb = self.ctx.append_basic_block(f, "badtype");
+        let stag = self.tag_of(s);
+        let is_struct = self.builder.build_int_compare(
+            EQ, stag, i8t.const_int(TAG_STRUCT, false), "is_struct").unwrap();
+        self.builder.build_conditional_branch(is_struct, ok_bb, bad_bb).unwrap();
+
+        self.builder.position_at_end(bad_bb);
+        self.abort_at(line, col, "'%s' needs a struct, got %s", &[opname.into(), self.type_name(stag)]);
+
+        self.builder.position_at_end(ok_bb);
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "hdr").unwrap();
+        let descp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "descp").unwrap();
+        let desc_int = self.builder.build_load(i64t, descp, "desc_int").unwrap().into_int_value();
+        let desc = self.builder.build_int_to_ptr(desc_int, self.ptr_ty, "desc").unwrap();
+        let nfp = self.builder.build_struct_gep(desc_ty, desc, 1, "nfp").unwrap();
+        let nf = self.builder.build_load(i64t, nfp, "nf").unwrap().into_int_value();
+        let namesp = self.builder.build_struct_gep(desc_ty, desc, 2, "namesp").unwrap();
+        let names = self.builder.build_load(self.ptr_ty, namesp, "names").unwrap().into_pointer_value();
+
+        let idxp = self.entry_alloca(i64t.into(), "cidx");
+        self.builder.build_store(idxp, i64t.const_zero()).unwrap();
+        let cond_bb = self.ctx.append_basic_block(f, "find.cond");
+        let body_bb = self.ctx.append_basic_block(f, "find.body");
+        let found_bb = self.ctx.append_basic_block(f, "find.found");
+        let next_bb = self.ctx.append_basic_block(f, "find.next");
+        let notfound_bb = self.ctx.append_basic_block(f, "find.notfound");
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.builder.position_at_end(cond_bb);
+        let i = self.builder.build_load(i64t, idxp, "i").unwrap().into_int_value();
+        let more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, i, nf, "more").unwrap();
+        self.builder.build_conditional_branch(more, body_bb, notfound_bb).unwrap();
+
+        self.builder.position_at_end(body_bb);
+        let namep = unsafe { self.builder.build_in_bounds_gep(self.ptr_ty, names, &[i], "namep") }.unwrap();
+        let name_i = self.builder.build_load(self.ptr_ty, namep, "name_i").unwrap().into_pointer_value();
+        let c = self.call_named("strcmp", &[name_i.into(), keyptr.into()]).unwrap().into_int_value();
+        let matched = self.builder.build_int_compare(EQ, c, i32t.const_zero(), "matched").unwrap();
+        self.builder.build_conditional_branch(matched, found_bb, next_bb).unwrap();
+
+        self.builder.position_at_end(found_bb);
+        self.builder.build_return(Some(&i)).unwrap();
+
+        self.builder.position_at_end(next_bb);
+        let inext = self.builder.build_int_add(i, i64t.const_int(1, false), "inext").unwrap();
+        self.builder.build_store(idxp, inext).unwrap();
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.builder.position_at_end(notfound_bb);
+        self.abort_at(line, col, "struct has no field '%s'", &[keyptr.into()]);
+    }
+
+    /// verb_struct_get(VerbValue s, VerbValue key, i32 line, i32 col) ->
+    /// VerbValue. Returns an owned (retained) copy of the field's value.
+    fn build_struct_get_fn(&self) {
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_struct_get",
+            self.value_ty.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let key = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+
+        let opname = self.cstr("getf");
+        let i = self.call_named(
+            "verb_struct_check", &[s.into(), key.into(), line.into(), col.into(), opname.into()])
+            .unwrap().into_int_value();
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "hdr").unwrap();
+        let fieldsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "fieldsp").unwrap();
+        let fields = self.builder.build_load(self.ptr_ty, fieldsp, "fields").unwrap().into_pointer_value();
+        let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, fields, &[i], "slot") }.unwrap();
+        let v = self.builder.build_load(self.value_ty, slot, "v").unwrap().into_struct_value();
+        // The field keeps its reference; `getf` hands back an independent
+        // copy, mirroring Expr::Var's retain-on-load and verb_array_get.
+        self.call_named("verb_retain_value", &[v.into()]);
+        self.builder.build_return(Some(&v)).unwrap();
+    }
+
+    /// verb_struct_set(VerbValue s, VerbValue key, VerbValue v, i32 line,
+    /// i32 col) -> VerbValue (returns v). Releases the field's previous
+    /// occupant, stores `v`, and returns it. `v` enters owned once; one
+    /// retain covers its two new homes (the field slot and the returned
+    /// copy).
+    fn build_struct_set_fn(&self) {
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_struct_set",
+            self.value_ty.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()],
+                false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let key = f.get_nth_param(1).unwrap().into_struct_value();
+        let v = f.get_nth_param(2).unwrap().into_struct_value();
+        let line = f.get_nth_param(3).unwrap().into_int_value();
+        let col = f.get_nth_param(4).unwrap().into_int_value();
+
+        let opname = self.cstr("setf");
+        let i = self.call_named(
+            "verb_struct_check", &[s.into(), key.into(), line.into(), col.into(), opname.into()])
+            .unwrap().into_int_value();
+        let hdr = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "hdr").unwrap();
+        let fieldsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "fieldsp").unwrap();
+        let fields = self.builder.build_load(self.ptr_ty, fieldsp, "fields").unwrap().into_pointer_value();
+        let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, fields, &[i], "slot") }.unwrap();
+        let old = self.builder.build_load(self.value_ty, slot, "old").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[old.into()]);
+        self.call_named("verb_retain_value", &[v.into()]);
+        self.builder.build_store(slot, v).unwrap();
+        self.builder.build_return(Some(&v)).unwrap();
+    }
+
     fn make_closure(&self, fnv: FunctionValue<'ctx>, arity: usize) -> StructValue<'ctx> {
         let p = self.malloc_bytes(24);
         let fp = fnv.as_global_value().as_pointer_value();
@@ -1475,6 +1843,21 @@ impl<'ctx> Codegen<'ctx> {
         let main = self.module.add_function("main", main_ty, None);
         let entry = self.ctx.append_basic_block(main, "entry");
         self.builder.position_at_end(entry);
+        // Register every top-level `shape` type before emitting any code, so
+        // construction by type name (`Point(..)`) resolves regardless of
+        // source order. (Nested `shape` decls register lazily when reached
+        // in gen_stmt; forward-referencing those from before their decl is
+        // not supported.)
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::Shape { name, fields, line, col } = s {
+                if self.structs.contains_key(name) {
+                    let mut e = CompileError::new(format!("struct '{name}' already defined"), *line, *col);
+                    e.file = Some(stmt_files[i].clone());
+                    return Err(e);
+                }
+                self.register_struct(name, fields);
+            }
+        }
         for (i, s) in stmts.iter().enumerate() {
             self.cur_file = stmt_files[i].clone();
             if let Err(mut e) = self.gen_stmt(s) {
@@ -1736,6 +2119,15 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(saved_bb);
                 r
             }
+            Stmt::Shape { name, fields, .. } => {
+                // Top-level shapes are already registered by compile_program's
+                // pre-pass; register any nested one lazily the first time it's
+                // reached. Either way the decl emits no runtime code.
+                if !self.structs.contains_key(name) {
+                    self.register_struct(name, fields);
+                }
+                Ok(())
+            }
             Stmt::Return { value } => {
                 if self.fn_depth == 0 {
                     return Err(CompileError::new("'return' outside function", 0, 0));
@@ -1962,6 +2354,50 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap().into_struct_value();
                 self.call_named("verb_release_value", &[arr.into()]);
                 return Ok(rv);
+            }
+            if name == "getf" {
+                if args.len() != 2 {
+                    return Err(CompileError::new("getf takes exactly 2 arguments", line, col));
+                }
+                let s = self.gen_expr(&args[0])?;
+                let key = self.gen_expr(&args[1])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_struct_get", &[s.into(), key.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[s.into()]);
+                self.call_named("verb_release_value", &[key.into()]);
+                return Ok(rv);
+            }
+            if name == "setf" {
+                if args.len() != 3 {
+                    return Err(CompileError::new("setf takes exactly 3 arguments", line, col));
+                }
+                let s = self.gen_expr(&args[0])?;
+                let key = self.gen_expr(&args[1])?;
+                // `v`'s ownership flows into the call (verb_struct_set retains
+                // it for the slot and returns it), so it is NOT released here.
+                let v = self.gen_expr(&args[2])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named(
+                    "verb_struct_set", &[s.into(), key.into(), v.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[s.into()]);
+                self.call_named("verb_release_value", &[key.into()]);
+                return Ok(rv);
+            }
+            // struct construction: `TypeName(args...)`. A same-named local or
+            // global binding takes precedence (treated as an ordinary call).
+            if self.lookup(name).is_none() {
+                if let Some(info) = self.structs.get(name) {
+                    let nfields = info.fields.len();
+                    let desc = info.desc;
+                    if args.len() != nfields {
+                        return Err(CompileError::new(
+                            format!("struct '{name}' expects {nfields} field value(s), got {}", args.len()),
+                            line, col));
+                    }
+                    return self.gen_struct_new(desc, nfields, args);
+                }
             }
             let is_bound = self.lookup(name).is_some();
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {

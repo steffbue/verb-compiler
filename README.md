@@ -175,6 +175,43 @@ same as `std io`.
 
 See `docs/superpowers/specs/2026-07-21-maps-design.md` for the full design.
 
+## Structs (`shape`)
+
+`shape` declares a struct type with a fixed, ordered set of named fields.
+Instances are constructed by calling the type name with one positional
+argument per field; fields are read and written with the `getf`/`setf`
+built-ins:
+
+    shape Point begin x, y end
+
+    assign p Point(3, 4);
+    print(getf(p, "x"));       %% 3
+    setf(p, "y", 99);
+    print(getf(p, "y"));       %% 99
+    print(p);                   %% Point{x: 3, y: 99}
+
+- Field lists are comma-separated bare identifiers between `begin`/`end`
+  (a trailing comma is allowed); a struct may have zero fields. Duplicate
+  field names are a compile error.
+- `TypeName(a, b, ...)` takes exactly one argument per declared field, in
+  declared order — a wrong count is a compile error. A local/global
+  variable with the same name as a struct type shadows the constructor
+  (the name is then treated as an ordinary call).
+- `getf(s, "field")` returns the field's value; `setf(s, "field", v)`
+  overwrites it in place and returns `v`. A missing field name, or a
+  non-struct first argument, is a runtime error.
+- Fields may hold any Verb value, including other structs and arrays;
+  nested heap values are reference-counted and released with the struct.
+- `equals`/`differs` compare structs by reference (same underlying
+  instance), like arrays.
+- Top-level `shape` decls may be used before their point of declaration
+  (they're registered ahead of code generation); a `shape` nested inside
+  a function/block is only visible from its declaration onward.
+
+Unlike `import std map`, structs need no `import` — `shape` is a core
+language construct and works under both `verb run` (JIT) and
+`verb build`.
+
 ## Language
 
 See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.

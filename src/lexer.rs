@@ -4,7 +4,7 @@ use crate::error::CompileError;
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
     Assign, Be, Declare, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
-    Import, Mod, Std, List,
+    Import, Mod, Std, List, Shape,
     Add, Sub, Neg, Times, Div,
     Equals, Differs, Trails, Beats, Atmost, Atleast,
     And, Or, Not, Join,
@@ -162,6 +162,7 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), Compil
                     "true" => True, "false" => False, "nil" => Nil,
                     "begin" => Begin, "end" => End,
                     "import" => Import, "mod" => Mod, "std" => Std, "list" => List,
+                    "shape" => Shape,
                     "add" => Add, "sub" => Sub, "neg" => Neg,
                     "times" => Times, "div" => Div,
                     "equals" => Equals, "differs" => Differs, "trails" => Trails,
@@ -211,6 +212,16 @@ mod tests {
             kinds("declare make check orelse repeat loop sub neg times join equals differs trails beats atmost atleast"),
             vec![Declare, Make, Check, Orelse, Repeat, Loop, Sub, Neg, Times, Join,
                  Equals, Differs, Trails, Beats, Atmost, Atleast, Eof]
+        );
+    }
+
+    #[test]
+    fn scans_shape_keyword() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("shape Point begin x, y end"),
+            vec![Shape, Ident("Point".into()), Begin, Ident("x".into()), Comma,
+                 Ident("y".into()), End, Eof]
         );
     }
 

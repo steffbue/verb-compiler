@@ -201,6 +201,7 @@ fn token_text(tok: &Token) -> String {
         Mod => "mod".into(),
         Std => "std".into(),
         List => "list".into(),
+        Shape => "shape".into(),
         Add => "add".into(),
         Sub => "sub".into(),
         Neg => "neg".into(),
