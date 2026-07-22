@@ -4,7 +4,7 @@ use crate::lexer::{renamed_keyword, Token, TokenKind};
 
 pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
-    let (imports, std_imports) = p.imports()?;
+    let (imports, std_imports, verb_imports) = p.imports()?;
     let mut body = Vec::new();
     while !p.check(&TokenKind::Eof) {
         if p.check(&TokenKind::Import) {
@@ -12,7 +12,7 @@ pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
         }
         body.push(p.statement()?);
     }
-    Ok(Program { imports, std_imports, body })
+    Ok(Program { imports, std_imports, verb_imports, body })
 }
 
 /// Same grammar as `parse`, but doesn't stop at the first syntax error:
@@ -26,11 +26,13 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
     let mut imports = Vec::new();
     let mut std_imports = Vec::new();
+    let mut verb_imports = Vec::new();
     let mut errors = Vec::new();
     while p.check(&TokenKind::Import) {
         match p.import_stmt() {
             Ok(ImportStmt::Mod(name)) => dedup_push(&mut imports, name),
             Ok(ImportStmt::Std(name)) => dedup_push(&mut std_imports, name),
+            Ok(ImportStmt::VerbFile(name)) => dedup_push(&mut verb_imports, name),
             Err(e) => { errors.push(e); p.synchronize(); }
         }
     }
@@ -65,12 +67,13 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
             }
         }
     }
-    (Program { imports, std_imports, body }, errors)
+    (Program { imports, std_imports, verb_imports, body }, errors)
 }
 
 enum ImportStmt {
     Mod(String),
     Std(String),
+    VerbFile(String),
 }
 
 fn dedup_push(v: &mut Vec<String>, name: String) {
@@ -127,16 +130,18 @@ impl Parser {
         }
     }
 
-    fn imports(&mut self) -> Result<(Vec<String>, Vec<String>), CompileError> {
+    fn imports(&mut self) -> Result<(Vec<String>, Vec<String>, Vec<String>), CompileError> {
         let mut imports = Vec::new();
         let mut std_imports = Vec::new();
+        let mut verb_imports = Vec::new();
         while self.check(&TokenKind::Import) {
             match self.import_stmt()? {
                 ImportStmt::Mod(name) => dedup_push(&mut imports, name),
                 ImportStmt::Std(name) => dedup_push(&mut std_imports, name),
+                ImportStmt::VerbFile(name) => dedup_push(&mut verb_imports, name),
             }
         }
-        Ok((imports, std_imports))
+        Ok((imports, std_imports, verb_imports))
     }
 
     fn import_stmt(&mut self) -> Result<ImportStmt, CompileError> {
@@ -144,6 +149,9 @@ impl Parser {
         if self.matches(&TokenKind::Mod) {
             let (name, ..) = self.expect_ident("library name after 'mod'")?;
             self.expect(&TokenKind::Semi, "';'")?;
+            if name.ends_with(".verb") {
+                return Ok(ImportStmt::VerbFile(name));
+            }
             return Ok(ImportStmt::Mod(name));
         }
         self.expect(&TokenKind::Std, "'mod' or 'std'")?;
@@ -152,9 +160,9 @@ impl Parser {
         // time), `std` module names are first-party and fully known ahead
         // of time, so an unrecognized one is rejected here rather than at
         // link time.
-        if name != "io" && name != "map" {
+        if name != "io" && name != "map" && name != "thread" && name != "time" {
             return Err(CompileError::new(
-                format!("unknown std module '{name}' (known std modules: io, map)"),
+                format!("unknown std module '{name}' (known std modules: io, map, thread, time)"),
                 l, c,
             ));
         }
@@ -181,16 +189,17 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
         match self.peek() {
-            TokenKind::Assign => self.assign_stmt(true),
-            TokenKind::Declare => self.declare_stmt(),
+            TokenKind::Assign => self.assign_stmt(true, line, col),
+            TokenKind::Declare => self.declare_stmt(line, col),
             TokenKind::Make => self.fn_stmt(),
             TokenKind::Shape => self.shape_stmt(),
             TokenKind::Return => self.return_stmt(),
-            TokenKind::Check => self.if_stmt(),
-            TokenKind::Repeat => self.while_stmt(),
+            TokenKind::Check => self.if_stmt(line, col),
+            TokenKind::Repeat => self.while_stmt(line, col),
             TokenKind::Loop => self.for_stmt(),
-            TokenKind::Begin => Ok(Stmt::Block(self.block()?)),
+            TokenKind::Begin => Ok(Stmt::Block(self.block()?, line, col)),
             // old statement keywords lex as identifiers now — catch them for a rename hint
             TokenKind::Ident(n) if *self.peek2() != TokenKind::Be
                 && matches!(n.as_str(), "if" | "else" | "while" | "for" | "fn") =>
@@ -203,24 +212,24 @@ impl Parser {
             _ => {
                 let e = self.expression()?;
                 self.expect(&TokenKind::Semi, "';'")?;
-                Ok(Stmt::ExprStmt(e))
+                Ok(Stmt::ExprStmt(e, line, col))
             }
         }
     }
 
-    fn assign_stmt(&mut self, semi: bool) -> Result<Stmt, CompileError> {
+    fn assign_stmt(&mut self, semi: bool, line: u32, col: u32) -> Result<Stmt, CompileError> {
         self.advance(); // assign
         let (name, _, _) = self.expect_ident("variable name after 'assign'")?;
         let value = self.expression()?;
         if semi { self.expect(&TokenKind::Semi, "';'")?; }
-        Ok(Stmt::Assign { name, value })
+        Ok(Stmt::Assign { name, value, line, col })
     }
 
-    fn declare_stmt(&mut self) -> Result<Stmt, CompileError> {
+    fn declare_stmt(&mut self, line: u32, col: u32) -> Result<Stmt, CompileError> {
         self.advance(); // declare
         let (name, _, _) = self.expect_ident("variable name after 'declare'")?;
         self.expect(&TokenKind::Semi, "';'")?;
-        Ok(Stmt::Declare { name })
+        Ok(Stmt::Declare { name, line, col })
     }
 
     fn reassign_stmt(&mut self, semi: bool) -> Result<Stmt, CompileError> {
@@ -288,45 +297,50 @@ impl Parser {
         Ok(Stmt::Return { value })
     }
 
-    fn if_stmt(&mut self) -> Result<Stmt, CompileError> {
+    fn if_stmt(&mut self, line: u32, col: u32) -> Result<Stmt, CompileError> {
         self.advance(); // check
         let cond = self.expression()?;
         let then_body = self.block()?;
         let else_body = if self.matches(&TokenKind::Orelse) {
             if self.check(&TokenKind::Check) {
-                Some(vec![self.if_stmt()?]) // orelse check …
+                Some(vec![self.if_stmt(line, col)?]) // orelse check …
             } else {
                 Some(self.block()?)
             }
         } else {
             None
         };
-        Ok(Stmt::If { cond, then_body, else_body })
+        Ok(Stmt::If { cond, then_body, else_body, line, col })
     }
 
-    fn while_stmt(&mut self) -> Result<Stmt, CompileError> {
+    fn while_stmt(&mut self, line: u32, col: u32) -> Result<Stmt, CompileError> {
         self.advance(); // repeat
         let cond = self.expression()?;
         let body = self.block()?;
-        Ok(Stmt::While { cond, body })
+        Ok(Stmt::While { cond, body, line, col })
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
         self.advance(); // loop
         let init = match self.peek() {
-            TokenKind::Assign => self.assign_stmt(true)?, // consumes ';'
+            TokenKind::Assign => self.assign_stmt(true, line, col)?, // consumes ';'
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true)?,
             _ => return Err(self.err("expected 'assign' or reassignment in for-init")),
         };
+        let (cond_line, cond_col) = self.here();
         let cond = self.expression()?;
         self.expect(&TokenKind::Semi, "';'")?;
         let incr = match self.peek() {
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(false)?,
-            _ => Stmt::ExprStmt(self.expression()?),
+            _ => {
+                let (eline, ecol) = self.here();
+                Stmt::ExprStmt(self.expression()?, eline, ecol)
+            }
         };
         let mut body = self.block()?;
         body.push(incr);
-        Ok(Stmt::Block(vec![init, Stmt::While { cond, body }]))
+        Ok(Stmt::Block(vec![init, Stmt::While { cond, body, line: cond_line, col: cond_col }], line, col))
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, CompileError> {
@@ -496,7 +510,7 @@ mod tests {
         // parse "src;" as a single expression statement
         let prog = parse(lex(&format!("{src};")).unwrap()).unwrap();
         match prog.body.into_iter().next().unwrap() {
-            Stmt::ExprStmt(e) => e,
+            Stmt::ExprStmt(e, ..) => e,
             other => panic!("expected ExprStmt, got {other:?}"),
         }
     }
@@ -550,7 +564,7 @@ mod tests {
     #[test]
     fn parses_declare() {
         let p = parse(lex("declare x; x be 1;").unwrap()).unwrap();
-        assert!(matches!(&p.body[0], Stmt::Declare { name } if name == "x"));
+        assert!(matches!(&p.body[0], Stmt::Declare { name, .. } if name == "x"));
         assert!(matches!(&p.body[1], Stmt::Reassign { name, .. } if name == "x"));
     }
 
@@ -569,7 +583,7 @@ mod tests {
     fn desugars_for_to_while() {
         let p = parse(lex("loop assign i 0; i trails 10; i be i add 1 begin print(i); end").unwrap()).unwrap();
         match &p.body[0] {
-            Stmt::Block(inner) => {
+            Stmt::Block(inner, ..) => {
                 assert!(matches!(&inner[0], Stmt::Assign { name, .. } if name == "i"));
                 match &inner[1] {
                     Stmt::While { body, .. } => {
@@ -641,7 +655,7 @@ mod tests {
         // still sees exactly 2 arguments.
         let p = parse(lex("push(a, list 1, 2);").unwrap()).unwrap();
         match &p.body[0] {
-            Stmt::ExprStmt(Expr::Call { args, .. }) => {
+            Stmt::ExprStmt(Expr::Call { args, .. }, ..) => {
                 assert_eq!(args.len(), 2);
                 assert!(matches!(&args[0], Expr::Var(n, ..) if n == "a"));
                 assert!(matches!(&args[1], Expr::ArrayLit(elems) if elems.len() == 2));
@@ -657,7 +671,7 @@ mod tests {
         // no-delimiter limitation from the design spec.
         let p = parse(lex("foo(list 1, 2, 3);").unwrap()).unwrap();
         match &p.body[0] {
-            Stmt::ExprStmt(Expr::Call { args, .. }) => {
+            Stmt::ExprStmt(Expr::Call { args, .. }, ..) => {
                 assert_eq!(args.len(), 1);
                 assert!(matches!(&args[0], Expr::ArrayLit(elems) if elems.len() == 3));
             }
@@ -741,6 +755,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_std_time_import() {
+        let p = parse(lex("import std time;").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["time".to_string()]);
+        assert!(p.imports.is_empty());
+    }
+
+    #[test]
     fn dedups_repeated_std_import() {
         let p = parse(lex("import std io; import std io;").unwrap()).unwrap();
         assert_eq!(p.std_imports, vec!["io".to_string()]);
@@ -755,11 +776,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_verb_file_import() {
+        let p = parse(lex("import mod utils.verb;").unwrap()).unwrap();
+        assert_eq!(p.verb_imports, vec!["utils.verb".to_string()]);
+        assert!(p.imports.is_empty());
+        assert!(p.body.is_empty());
+    }
+
+    #[test]
+    fn dedups_repeated_verb_file_import() {
+        let p = parse(lex("import mod utils.verb; import mod utils.verb;").unwrap()).unwrap();
+        assert_eq!(p.verb_imports, vec!["utils.verb".to_string()]);
+    }
+
+    #[test]
+    fn verb_file_and_cpp_lib_imports_coexist() {
+        let p = parse(lex(
+            "import mod mathlib; import mod utils.verb; import std io; print(1);"
+        ).unwrap()).unwrap();
+        assert_eq!(p.imports, vec!["mathlib".to_string()]);
+        assert_eq!(p.verb_imports, vec!["utils.verb".to_string()]);
+        assert_eq!(p.std_imports, vec!["io".to_string()]);
+        assert_eq!(p.body.len(), 1);
+    }
+
+    #[test]
+    fn recovering_collects_verb_file_imports_too() {
+        let src = "import mod utils.verb; print(1);";
+        let (prog, errors) = parse_recovering(lex(src).unwrap());
+        assert!(errors.is_empty());
+        assert_eq!(prog.verb_imports, vec!["utils.verb".to_string()]);
+        assert_eq!(prog.body.len(), 1);
+    }
+
+    #[test]
     fn unknown_std_module_is_a_compile_error() {
         let err = parse(lex("import std vector;").unwrap()).unwrap_err();
         assert!(err.msg.contains("unknown std module 'vector'"), "{}", err.msg);
         assert!(err.msg.contains("io"), "{}", err.msg);
         assert!(err.msg.contains("map"), "{}", err.msg);
+        assert!(err.msg.contains("thread"), "{}", err.msg);
+        assert!(err.msg.contains("time"), "{}", err.msg);
     }
 
     #[test]
@@ -775,6 +832,26 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(prog.std_imports, vec!["io".to_string()]);
         assert_eq!(prog.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_std_thread_import() {
+        let p = parse(lex("import std thread;").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["thread".to_string()]);
+        assert!(p.imports.is_empty());
+    }
+
+    #[test]
+    fn dedups_repeated_std_thread_import() {
+        let p = parse(lex("import std thread; import std thread;").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["thread".to_string()]);
+    }
+
+    #[test]
+    fn std_io_map_and_thread_imports_coexist() {
+        let p = parse(lex("import std io; import std map; import std thread; print(1);").unwrap()).unwrap();
+        assert_eq!(p.std_imports, vec!["io".to_string(), "map".to_string(), "thread".to_string()]);
+        assert_eq!(p.body.len(), 1);
     }
 
     #[test]
@@ -824,5 +901,22 @@ mod tests {
         let (recovering, errors) = parse_recovering(lex(src).unwrap());
         assert!(errors.is_empty());
         assert_eq!(ok, recovering);
+    }
+
+    #[test]
+    fn stmt_variants_carry_real_line_col() {
+        let p = parse(lex("assign x 1;\ndeclare y;\nx add 1;\n").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::Assign { line, col, .. } => assert_eq!((*line, *col), (1, 1)),
+            other => panic!("{other:?}"),
+        }
+        match &p.body[1] {
+            Stmt::Declare { line, col, .. } => assert_eq!((*line, *col), (2, 1)),
+            other => panic!("{other:?}"),
+        }
+        match &p.body[2] {
+            Stmt::ExprStmt(_, line, col) => assert_eq!((*line, *col), (3, 1)),
+            other => panic!("{other:?}"),
+        }
     }
 }

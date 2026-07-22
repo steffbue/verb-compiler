@@ -154,6 +154,23 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), Compil
                 while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                     i += 1; col += 1;
                 }
+                // A `.verb` suffix directly after an identifier, at a word
+                // boundary (not followed by another identifier/digit char),
+                // folds into the same token so `import mod utils.verb;`
+                // lexes as one name. `.` is otherwise never valid outside a
+                // numeric literal, so this can't misfire on any program
+                // that lexed successfully before — see
+                // docs/superpowers/specs/2026-07-21-verb-file-import-design.md.
+                const VERB_SUFFIX: &[char] = &['.', 'v', 'e', 'r', 'b'];
+                if chars[i..].starts_with(VERB_SUFFIX) {
+                    let after = i + VERB_SUFFIX.len();
+                    let boundary = chars.get(after)
+                        .map_or(true, |c| !(c.is_ascii_alphanumeric() || *c == '_'));
+                    if boundary {
+                        i += VERB_SUFFIX.len();
+                        col += VERB_SUFFIX.len() as u32;
+                    }
+                }
                 let word: String = chars[start..i].iter().collect();
                 use TokenKind::*;
                 let kind = match word.as_str() {
@@ -286,6 +303,28 @@ mod tests {
             kinds("import std io;"),
             vec![Import, Std, Ident("io".into()), Semi, Eof]
         );
+    }
+
+    #[test]
+    fn folds_dot_verb_suffix_into_identifier() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("import mod utils.verb;"),
+            vec![Import, Mod, Ident("utils.verb".into()), Semi, Eof]
+        );
+    }
+
+    #[test]
+    fn does_not_fold_dot_verb_when_followed_by_identifier_chars() {
+        // `.verbose` is not the exact `.verb` suffix at a word boundary,
+        // so no folding happens and the bare `.` after `utils` is still
+        // a lex error, same as it was before this feature existed.
+        assert!(lex("utils.verbose").is_err());
+    }
+
+    #[test]
+    fn bare_dot_after_identifier_is_still_a_lex_error() {
+        assert!(lex("mathlib.").is_err());
     }
 
     #[test]

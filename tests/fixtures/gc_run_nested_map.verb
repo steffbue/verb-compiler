@@ -1,0 +1,11 @@
+import std map;
+
+assign inner map_new();
+map_set(inner, "x", "deep" join "!");
+assign outer map_new();
+map_set(outer, "child", inner);
+map_set(outer, "nums", list 1, 2, 3);
+assign got map_get(outer, "child");
+print(map_get(got, "x"));
+print(len(map_get(outer, "nums")));
+print(map_len(outer));
