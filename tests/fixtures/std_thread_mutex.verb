@@ -1,0 +1,22 @@
+import std thread;
+
+assign counter 0;
+assign m mutex_new();
+
+make bump() begin
+  loop assign i 0; i trails 1000; i be i add 1 begin
+    mutex_lock(m);
+    counter be counter add 1;
+    mutex_unlock(m);
+  end
+end
+
+assign t1 thread_spawn(bump);
+assign t2 thread_spawn(bump);
+assign t3 thread_spawn(bump);
+assign t4 thread_spawn(bump);
+thread_join(t1);
+thread_join(t2);
+thread_join(t3);
+thread_join(t4);
+print(counter);

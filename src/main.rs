@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::process::{exit, Command};
 
 use verb::codegen;
+use verb::debugger;
 use verb::error::CompileError;
-use verb::lexer;
-use verb::parser;
+use verb::resolve;
 use verb::targets;
 
 // --- JIT runtime symbol resolution -----------------------------------------
@@ -90,7 +90,7 @@ fn check_zig_available() {
 
 struct ParsedArgs {
     cmd: String,
-    files: Vec<String>,
+    file: String,
     out: Option<String>,
     emit_llvm: bool,
     target: Option<String>,
@@ -157,10 +157,11 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
             }
         }
     }
-    if files.is_empty() {
+    if files.len() != 1 {
         return None;
     }
-    Some(ParsedArgs { cmd, files, out, emit_llvm, target, lib_dirs, target_lib_dirs })
+    let file = files.remove(0);
+    Some(ParsedArgs { cmd, file, out, emit_llvm, target, lib_dirs, target_lib_dirs })
 }
 
 fn die(e: CompileError, sources: &[(String, String)]) -> ! {
@@ -184,12 +185,14 @@ fn die(e: CompileError, sources: &[(String, String)]) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
-    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]");
-    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]  (alias for build)");
+    eprintln!("usage: verb run <file.verb> [--emit-llvm]");
+    eprintln!("       verb debug <file.verb>");
+    eprintln!("       verb build <file.verb> -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]");
+    eprintln!("       verb compile <file.verb> -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]  (alias for build)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
     eprintln!("       -L<dir>            library search dir applied to every target");
     eprintln!("       -L<target>=<dir>   library search dir applied only to that --target (e.g. -Llinux-arm64=./libs/arm); use with --target all to supply arch-matched libs per target");
+    eprintln!("       use 'import mod <name>.verb;' inside <file.verb> to pull in other Verb source files");
     exit(2)
 }
 
@@ -197,37 +200,28 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let parsed = parse_cli(&args).unwrap_or_else(|| usage());
 
-    let mut sources: Vec<(String, String)> = Vec::new();
-    let mut stmts = Vec::new();
-    let mut stmt_files = Vec::new();
-    let mut imports: Vec<String> = Vec::new();
-    let mut std_imports: Vec<String> = Vec::new();
-
-    for file in &parsed.files {
-        let src = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: cannot read {file}: {e}");
-                exit(1);
-            }
-        };
-        sources.push((file.clone(), src.clone()));
-
-        let toks = lexer::lex(&src)
-            .map_err(|e| e.with_file(file.clone()))
-            .unwrap_or_else(|e| die(e, &sources));
-        let prog = parser::parse(toks)
-            .map_err(|e| e.with_file(file.clone()))
-            .unwrap_or_else(|e| die(e, &sources));
-
-        stmt_files.extend(std::iter::repeat(file.clone()).take(prog.body.len()));
-        stmts.extend(prog.body);
-        imports.extend(prog.imports);
-        std_imports.extend(prog.std_imports);
-    }
+    let resolved = resolve::resolve(&parsed.file).unwrap_or_else(|e| match e.kind {
+        resolve::ResolveErrorKind::Compile(err) => die(err, &e.sources),
+        resolve::ResolveErrorKind::Cycle(msg) => {
+            eprintln!("error: {msg}");
+            exit(1);
+        }
+        resolve::ResolveErrorKind::Io { path, message } => {
+            eprintln!("error: cannot read {path}: {message}");
+            exit(1);
+        }
+    });
+    let sources = resolved.sources;
+    let stmts = resolved.stmts;
+    let stmt_files = resolved.stmt_files;
+    let imports = resolved.imports;
+    let std_imports = resolved.std_imports;
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
+    if parsed.cmd == "debug" {
+        cg.enable_debug_hooks();
+    }
     cg.compile_program(&stmts, &stmt_files, &imports, &std_imports).unwrap_or_else(|e| die(e, &sources));
 
     if parsed.emit_llvm {
@@ -253,6 +247,53 @@ fn main() {
                     exit(1);
                 });
             register_jit_runtime_symbols(&ee, cg.module());
+            unsafe {
+                let main_fn = ee
+                    .get_function::<unsafe extern "C" fn() -> i32>("main")
+                    .expect("no main");
+                exit(main_fn.call());
+            }
+        }
+        "debug" => {
+            if !imports.is_empty() || !std_imports.is_empty() {
+                let mut names = imports.clone();
+                names.extend(std_imports.iter().map(|m| format!("std {m}")));
+                eprintln!(
+                    "error: 'verb debug' does not support imports ({}); use 'verb build' instead",
+                    names.join(", ")
+                );
+                exit(1);
+            }
+            let ee = cg
+                .module()
+                .create_jit_execution_engine(inkwell::OptimizationLevel::None)
+                .unwrap_or_else(|e| {
+                    eprintln!("JIT error: {e}");
+                    exit(1);
+                });
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_checkpoint").unwrap(),
+                debugger::verb_debug_checkpoint as *const () as usize,
+            );
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_push_frame").unwrap(),
+                debugger::verb_debug_push_frame as *const () as usize,
+            );
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_pop_frame").unwrap(),
+                debugger::verb_debug_pop_frame as *const () as usize,
+            );
+            let print_value_addr = ee.get_function_address("verb_print_value").unwrap_or_else(|e| {
+                eprintln!("JIT error resolving verb_print_value: {e}");
+                exit(1);
+            });
+            debugger::set_print_value_fn(print_value_addr);
+            // Matches `stmt_files`' entry for every top-level statement in
+            // the entry file verbatim (see `resolve::resolve`), so an
+            // unqualified `break <line>` resolves to this file -- see
+            // `DebuggerState::add_breakpoint`.
+            debugger::set_main_file(parsed.file.clone());
+            debugger::run_pre_start_console();
             unsafe {
                 let main_fn = ee
                     .get_function::<unsafe extern "C" fn() -> i32>("main")
@@ -290,6 +331,8 @@ fn main() {
 const RUNTIME_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime");
 const STD_IO_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_io.cpp");
 const MAP_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_map.cpp");
+const STD_THREAD_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_thread.cpp");
+const TIME_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_time.cpp");
 
 /// Compiles the bundled `runtime/verb_std_io.cpp` into an object file with
 /// `compiler` (`"cc"`/`"c++"` for the host, `"zig"` for cross targets),
@@ -327,6 +370,47 @@ fn compile_map_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, Strin
     Ok(obj)
 }
 
+/// Compiles the bundled `runtime/verb_std_thread.cpp` into an object
+/// file. See `compile_std_io_obj`. `-pthread` is required by
+/// `std::thread`/`std::mutex`/`std::condition_variable` on Linux
+/// (glibc splits pthread symbols into a separate archive there); macOS's
+/// libc++ links threading support unconditionally, so the flag is a
+/// harmless no-op there, and is applied unconditionally rather than
+/// gated on host OS to keep this function symmetric with its zig-cross
+/// caller in `build_aot_cross`, which cannot check the *host*'s OS
+/// (only the *target*'s).
+fn compile_std_thread_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, String> {
+    let obj = std::env::temp_dir().join(format!("verb_std_thread_{}.o", std::process::id()));
+    let mut cmd = Command::new(compiler);
+    cmd.args(extra_args);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-pthread", "-c", STD_THREAD_CPP, "-o"]);
+    cmd.arg(&obj);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile {STD_THREAD_CPP}: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to compile {STD_THREAD_CPP}"));
+    }
+    Ok(obj)
+}
+
+/// Compiles the bundled `runtime/verb_time.cpp` into an object file. See
+/// `compile_std_io_obj`.
+fn compile_time_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, String> {
+    let obj = std::env::temp_dir().join(format!("verb_time_{}.o", std::process::id()));
+    let mut cmd = Command::new(compiler);
+    cmd.args(extra_args);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-c", TIME_CPP, "-o"]);
+    cmd.arg(&obj);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile {TIME_CPP}: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to compile {TIME_CPP}"));
+    }
+    Ok(obj)
+}
+
 fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
     use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
@@ -347,6 +431,8 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_std_thread = std_imports.iter().any(|m| m == "thread");
+    let wants_time = std_imports.iter().any(|m| m == "time");
     // `runtime/verb_map.cpp` is now linked into every build, not just ones that
     // `import std map`: codegen's `verb_release_value` references
     // `verb_map_destroy_contents` unconditionally and nothing strips it. Since a
@@ -369,6 +455,30 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         eprintln!("error: {e}");
         exit(1);
     });
+    let std_thread_obj = if wants_std_thread {
+        let extra_link_args: &[&str] = if cfg!(target_os = "linux") { &["-pthread"] } else { &[] };
+        Some(compile_std_thread_obj(linker, extra_link_args).unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&obj);
+            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            let _ = std::fs::remove_file(&map_obj);
+            eprintln!("error: {e}");
+            exit(1);
+        }))
+    } else {
+        None
+    };
+    let time_obj = if wants_time {
+        Some(compile_time_obj(linker, &[]).unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&obj);
+            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            let _ = std::fs::remove_file(&map_obj);
+            if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+            eprintln!("error: {e}");
+            exit(1);
+        }))
+    } else {
+        None
+    };
 
     let mut cmd = Command::new(linker);
     cmd.arg(&obj).arg("-o").arg(out);
@@ -376,6 +486,15 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
+    if let Some(p) = &std_thread_obj {
+        cmd.arg(p);
+    }
+    if wants_std_thread && cfg!(target_os = "linux") {
+        cmd.arg("-pthread");
+    }
+    if let Some(p) = &time_obj {
+        cmd.arg(p);
+    }
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -388,6 +507,8 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
             let _ = std::fs::remove_file(&obj);
             if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
             let _ = std::fs::remove_file(&map_obj);
+            if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+            if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
             eprintln!("error: failed to run linker '{linker}': {e}");
             exit(1);
         }
@@ -395,6 +516,8 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
+    if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         eprintln!("link failed");
         exit(1);
@@ -414,11 +537,20 @@ fn build_aot_cross(
     };
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_std_thread = std_imports.iter().any(|m| m == "thread");
+    let wants_time = std_imports.iter().any(|m| m == "time");
     if wants_std_io && target.is_windows() {
         return Err(
             "'import std io' is not supported when cross-compiling to a Windows target in v1 \
              (POSIX socket APIs aren't available under the mingw cross toolchain) -- build \
              natively on Windows instead, or drop 'import std io'".to_string(),
+        );
+    }
+    if wants_std_thread && target.is_windows() {
+        return Err(
+            "'import std thread' is not supported when cross-compiling to a Windows target in v1 \
+             (std::thread isn't available under the mingw cross toolchain used here) -- build \
+             natively on Windows instead, or drop 'import std thread'".to_string(),
         );
     }
 
@@ -446,6 +578,21 @@ fn build_aot_cross(
     };
     // Always linked now — see build_aot_host for why verb_map.cpp is unconditional.
     let map_obj = compile_map_obj("zig", &["c++", "-target", target.zig_triple()])?;
+    let std_thread_obj = if wants_std_thread {
+        let extra: Vec<&str> = if target.os == targets::Os::Linux {
+            vec!["c++", "-target", target.zig_triple(), "-pthread"]
+        } else {
+            vec!["c++", "-target", target.zig_triple()]
+        };
+        Some(compile_std_thread_obj("zig", &extra)?)
+    } else {
+        None
+    };
+    let time_obj = if wants_time {
+        Some(compile_time_obj("zig", &["c++", "-target", target.zig_triple()])?)
+    } else {
+        None
+    };
 
     // Imports/lib_dirs are forwarded to zig c++ so cross-linking works when the imported
     // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
@@ -459,6 +606,15 @@ fn build_aot_cross(
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
+    if let Some(p) = &std_thread_obj {
+        cmd.arg(p);
+    }
+    if wants_std_thread && target.os == targets::Os::Linux {
+        cmd.arg("-pthread");
+    }
+    if let Some(p) = &time_obj {
+        cmd.arg(p);
+    }
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -469,6 +625,8 @@ fn build_aot_cross(
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
+    if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         return Err("link failed".to_string());
     }
@@ -522,21 +680,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiple_files() {
-        let p = parse_cli(&args(&["verb", "run", "a.verb", "b.verb"])).unwrap();
+    fn parses_a_single_file() {
+        let p = parse_cli(&args(&["verb", "run", "a.verb"])).unwrap();
         assert_eq!(p.cmd, "run");
-        assert_eq!(p.files, vec!["a.verb".to_string(), "b.verb".to_string()]);
+        assert_eq!(p.file, "a.verb".to_string());
         assert!(!p.emit_llvm);
         assert_eq!(p.out, None);
     }
 
     #[test]
-    fn parses_flags_interleaved_with_files() {
+    fn rejects_multiple_files() {
+        assert!(parse_cli(&args(&["verb", "run", "a.verb", "b.verb"])).is_none());
+    }
+
+    #[test]
+    fn parses_flags_around_a_single_file() {
         let p = parse_cli(&args(&[
-            "verb", "build", "a.verb", "-o", "out", "b.verb", "--emit-llvm",
+            "verb", "build", "a.verb", "-o", "out", "--emit-llvm",
         ])).unwrap();
         assert_eq!(p.cmd, "build");
-        assert_eq!(p.files, vec!["a.verb".to_string(), "b.verb".to_string()]);
+        assert_eq!(p.file, "a.verb".to_string());
         assert_eq!(p.out, Some("out".to_string()));
         assert!(p.emit_llvm);
     }
@@ -546,7 +709,7 @@ mod tests {
         let p = parse_cli(&args(&[
             "verb", "build", "a.verb", "-o", "out", "-L/opt/lib", "-L./libs",
         ])).unwrap();
-        assert_eq!(p.files, vec!["a.verb".to_string()]);
+        assert_eq!(p.file, "a.verb".to_string());
         assert_eq!(p.lib_dirs, vec!["-L/opt/lib".to_string(), "-L./libs".to_string()]);
         assert!(p.target_lib_dirs.is_empty());
     }
@@ -615,5 +778,12 @@ mod tests {
     #[test]
     fn rejects_no_command() {
         assert!(parse_cli(&args(&["verb"])).is_none());
+    }
+
+    #[test]
+    fn parses_debug_command() {
+        let p = parse_cli(&args(&["verb", "debug", "a.verb"])).unwrap();
+        assert_eq!(p.cmd, "debug");
+        assert_eq!(p.file, "a.verb".to_string());
     }
 }
