@@ -796,6 +796,29 @@ fn run_mod_import_missing_library_errors_clearly() {
     assert!(stderr.contains("verb build"), "stderr: {stderr}");
 }
 
+#[test]
+fn run_mixes_mod_std_io_and_std_map_imports() {
+    // Combined JIT-import path: one `verb run` that pulls in an `import mod`
+    // C++ FFI library, `import std io`, and `import std map` at once, proving
+    // the mod extern, std-io and std-map runtime symbols all resolve and the
+    // refcount forwarders stay consistent across all three.
+    let _ = std::fs::remove_file("verb_jit_all_imports.tmp");
+    let lib_dir = build_mathlib_fixture();
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "run",
+            "tests/fixtures/jit_all_imports.verb",
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .env("DYLD_LIBRARY_PATH", &lib_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/jit_all_imports.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = std::fs::remove_file("verb_jit_all_imports.tmp");
+}
+
 fn build_and_run_ok(name: &str, lib_dir: &std::path::Path) {
     let out_path = std::env::temp_dir().join(format!("verb_e2e_build_{name}"));
     let build = Command::new(env!("CARGO_BIN_EXE_verb"))

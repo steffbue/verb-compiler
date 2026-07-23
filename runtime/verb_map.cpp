@@ -15,6 +15,11 @@
 //
 // Invalid usage (non-map `m`, unsupported key type) returns nil/false/0
 // rather than aborting, matching the `std io` "nil on failure" convention.
+//
+// ABI note: every non-static `extern "C"` global symbol in this file is
+// force-linked into the `verb` binary and dynamically exported (see
+// build.rs), making it part of the JIT-relied-upon ABI surface. Mark
+// internal helpers `static` so they aren't accidentally added to it.
 #include "verb.h"
 
 #include <cstring>

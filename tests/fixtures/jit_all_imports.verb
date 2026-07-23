@@ -1,0 +1,14 @@
+import mod mathlib;
+import std io;
+import std map;
+
+assign m map_new();
+map_set(m, "greet", "hi");
+%% c_shout's result must flow only into print, never be stored into the map:
+%% it returns a std::malloc'd (header-less) string, and mathlib deliberately
+%% violates the extern-string->verb_alloc contract from runtime/verb.h, so
+%% storing it in the refcounted map would SIGABRT on release.
+print(c_shout(map_get(m, "greet")));
+print(c_add_int(2, 3));
+assign ok file_write("verb_jit_all_imports.tmp", "data");
+print(map_len(m));
