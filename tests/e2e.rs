@@ -204,6 +204,9 @@ fn type_error_aborts() {
 fn div_zero_aborts() { run_err("err_divzero", "runtime error [1:9]: division by zero"); }
 
 #[test]
+fn int_overflow_aborts() { run_err("err_int_overflow", "integer overflow"); }
+
+#[test]
 fn join_type_error_aborts() {
     run_err("err_join", "'join' needs strings, got string and nil");
 }
@@ -320,6 +323,46 @@ fn verb_alloc_is_emitted() {
         .output()
         .unwrap();
     let ir = String::from_utf8_lossy(&out.stdout);
+    assert!(ir.contains("define ptr @verb_alloc"), "no verb_alloc in IR:\n{ir}");
+}
+
+#[test]
+fn overflow_checked_arith_intrinsics_are_emitted() {
+    // The array-push and string-concat size computations, and the language
+    // integer arithmetic helpers, are all built unconditionally into every
+    // module, so any fixture's IR carries the checked-arith intrinsics.
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/strings.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    // Unsigned size computations: array cap*2 / new_cap*16 (push) and la+lb /
+    // sum+1 (concat).
+    assert!(ir.contains("@llvm.umul.with.overflow.i64"),
+        "no unsigned checked-mul (array push growth) in IR:\n{ir}");
+    assert!(ir.contains("@llvm.uadd.with.overflow.i64"),
+        "no unsigned checked-add (concat / verb_alloc header) in IR:\n{ir}");
+    // Signed language arithmetic: add/sub/mul.
+    for sym in ["@llvm.sadd.with.overflow.i64", "@llvm.ssub.with.overflow.i64",
+                "@llvm.smul.with.overflow.i64"] {
+        assert!(ir.contains(sym), "missing signed checked-arith {sym} in IR:\n{ir}");
+    }
+}
+
+#[test]
+fn verb_alloc_has_oom_null_check() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/strings.verb", "--emit-llvm"])
+        .output()
+        .unwrap();
+    let ir = String::from_utf8_lossy(&out.stdout);
+    // The malloc result is null-checked and, on failure, an OOM block prints
+    // "out of memory" and exits. Split into two blocks: null -> abort, else
+    // store/GEP/return.
+    assert!(ir.contains("icmp eq ptr") && ir.contains("null"),
+        "no null-check on malloc result in IR:\n{ir}");
+    assert!(ir.contains("out of memory"), "no OOM message in IR:\n{ir}");
+    // The header add is itself overflow-checked (n+8 can't wrap).
     assert!(ir.contains("define ptr @verb_alloc"), "no verb_alloc in IR:\n{ir}");
 }
 

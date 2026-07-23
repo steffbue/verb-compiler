@@ -278,6 +278,85 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unreachable().unwrap();
     }
 
+    /// Abort with a plain message and no source location -- used where no
+    /// line/col is available (e.g. inside `verb_alloc`). Same printf + exit(1)
+    /// + unreachable trailer as `abort_at`, but the caller supplies the full
+    /// (already newline-terminated) message.
+    fn abort_msg(&self, msg: &str) {
+        let s = self.cstr(msg);
+        self.call_named("printf", &[s.into()]);
+        self.call_named("exit", &[self.ctx.i32_type().const_int(1, false).into()]);
+        self.builder.build_unreachable().unwrap();
+    }
+
+    /// Get (or lazily declare) an LLVM overflow-checked-arithmetic intrinsic,
+    /// e.g. `llvm.umul.with.overflow.i64`. All of these have the shape
+    /// `{i64, i1} (i64, i64)` -- the i1 is the overflow flag.
+    fn overflow_intrinsic(&self, name: &str) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(name) {
+            return f;
+        }
+        let i64t = self.ctx.i64_type();
+        let i1t = self.ctx.bool_type();
+        let ret_ty = self.ctx.struct_type(&[i64t.into(), i1t.into()], false);
+        let fnty = ret_ty.fn_type(&[i64t.into(), i64t.into()], false);
+        self.module.add_function(name, fnty, None)
+    }
+
+    /// Emit a call to an overflow-checked arithmetic intrinsic, branch on the
+    /// overflow flag: on overflow abort (with a source location via `abort_at`
+    /// if `loc` is `Some`, else a plain `abort_msg`), otherwise fall through
+    /// and return the computed result. Positions the builder on the
+    /// non-overflow continuation block before returning.
+    fn checked_binop(&self, intrinsic: &str, a: IntValue<'ctx>, b: IntValue<'ctx>,
+                     loc: Option<(IntValue<'ctx>, IntValue<'ctx>)>) -> IntValue<'ctx>
+    {
+        let f = self.overflow_intrinsic(intrinsic);
+        let agg = self.builder.build_call(f, &[a.into(), b.into()], "ovf")
+            .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
+        let result = self.builder.build_extract_value(agg, 0, "ovf.res").unwrap().into_int_value();
+        let ovf = self.builder.build_extract_value(agg, 1, "ovf.bit").unwrap().into_int_value();
+        let cur_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let abort_bb = self.ctx.append_basic_block(cur_fn, "ovf.abort");
+        let cont_bb = self.ctx.append_basic_block(cur_fn, "ovf.cont");
+        self.builder.build_conditional_branch(ovf, abort_bb, cont_bb).unwrap();
+        self.builder.position_at_end(abort_bb);
+        match loc {
+            Some((line, col)) => self.abort_at(line, col, "integer overflow", &[]),
+            None => self.abort_msg("runtime error: integer overflow\n"),
+        }
+        self.builder.position_at_end(cont_bb);
+        result
+    }
+
+    /// Checked `a + b` (aborts on overflow). `signed` selects the signed
+    /// (language int) vs unsigned (size computation) intrinsic.
+    fn checked_add_or_abort(&self, a: IntValue<'ctx>, b: IntValue<'ctx>,
+                            loc: Option<(IntValue<'ctx>, IntValue<'ctx>)>, signed: bool)
+        -> IntValue<'ctx>
+    {
+        let name = if signed { "llvm.sadd.with.overflow.i64" } else { "llvm.uadd.with.overflow.i64" };
+        self.checked_binop(name, a, b, loc)
+    }
+
+    /// Checked `a * b` (aborts on overflow). `signed` selects the signed
+    /// (language int) vs unsigned (size computation) intrinsic.
+    fn checked_mul_or_abort(&self, a: IntValue<'ctx>, b: IntValue<'ctx>,
+                            loc: Option<(IntValue<'ctx>, IntValue<'ctx>)>, signed: bool)
+        -> IntValue<'ctx>
+    {
+        let name = if signed { "llvm.smul.with.overflow.i64" } else { "llvm.umul.with.overflow.i64" };
+        self.checked_binop(name, a, b, loc)
+    }
+
+    /// Checked signed `a - b` (aborts on overflow). Language arithmetic only;
+    /// there is no unsigned subtraction site.
+    fn checked_sub_or_abort(&self, a: IntValue<'ctx>, b: IntValue<'ctx>,
+                            loc: Option<(IntValue<'ctx>, IntValue<'ctx>)>) -> IntValue<'ctx>
+    {
+        self.checked_binop("llvm.ssub.with.overflow.i64", a, b, loc)
+    }
+
     /// Runtime type name of a tag, as a printf %s argument.
     fn type_name(&self, tag: IntValue<'ctx>) -> inkwell::values::BasicMetadataValueEnum<'ctx> {
         self.call_named("verb_type_name", &[tag.into()]).unwrap().into()
@@ -324,8 +403,23 @@ impl<'ctx> Codegen<'ctx> {
         let entry = self.ctx.append_basic_block(f, "entry");
         self.builder.position_at_end(entry);
         let n = f.get_nth_param(0).unwrap().into_int_value();
-        let total = self.builder.build_int_add(n, i64t.const_int(8, false), "total").unwrap();
+        // Header add is a size computation: a pathological `n` near i64::MAX
+        // must not silently wrap the +8 and hand malloc a tiny size.
+        let total = self.checked_add_or_abort(n, i64t.const_int(8, false), None, false);
         let raw = self.call_named("malloc", &[total.into()]).unwrap().into_pointer_value();
+        // OOM: on malloc failure the pointer is null; storing the refcount
+        // below would null-deref (segfault). Split and abort cleanly instead.
+        let is_null = self.builder.build_is_null(raw, "malloc_null").unwrap();
+        let oom_bb = self.ctx.append_basic_block(f, "oom");
+        let ok_bb = self.ctx.append_basic_block(f, "alloc.ok");
+        self.builder.build_conditional_branch(is_null, oom_bb, ok_bb).unwrap();
+
+        self.builder.position_at_end(oom_bb);
+        self.abort_msg("out of memory\n");
+
+        // Success path: store header, compute payload, count the live block.
+        // inc_live_counter MUST stay here (never on the OOM path).
+        self.builder.position_at_end(ok_bb);
         self.builder.build_store(raw, i64t.const_int(1, false)).unwrap();
         let payload = unsafe {
             self.builder.build_in_bounds_gep(
@@ -732,10 +826,11 @@ impl<'ctx> Codegen<'ctx> {
             self.abort_at(line, col, "division by zero", &[]);
             self.builder.position_at_end(go_bb);
         }
+        let loc = Some((line, col));
         let ir = match op {
-            BinOp::Add => self.builder.build_int_add(pa, pb, "r").unwrap(),
-            BinOp::Sub => self.builder.build_int_sub(pa, pb, "r").unwrap(),
-            BinOp::Mul => self.builder.build_int_mul(pa, pb, "r").unwrap(),
+            BinOp::Add => self.checked_add_or_abort(pa, pb, loc, true),
+            BinOp::Sub => self.checked_sub_or_abort(pa, pb, loc),
+            BinOp::Mul => self.checked_mul_or_abort(pa, pb, loc, true),
             BinOp::Div => self.builder.build_int_signed_div(pa, pb, "r").unwrap(),
             BinOp::Mod => self.builder.build_int_signed_rem(pa, pb, "r").unwrap(),
             _ => unreachable!(),
@@ -929,8 +1024,9 @@ impl<'ctx> Codegen<'ctx> {
         let sb = self.builder.build_int_to_ptr(pb, self.ptr_ty, "sb").unwrap();
         let la = self.call_named("strlen", &[sa.into()]).unwrap().into_int_value();
         let lb = self.call_named("strlen", &[sb.into()]).unwrap().into_int_value();
-        let sum = self.builder.build_int_add(la, lb, "sum").unwrap();
-        let size = self.builder.build_int_add(sum, self.ctx.i64_type().const_int(1, false), "sz").unwrap();
+        let loc = Some((line, col));
+        let sum = self.checked_add_or_abort(la, lb, loc, false);
+        let size = self.checked_add_or_abort(sum, self.ctx.i64_type().const_int(1, false), loc, false);
         let buf = self.call_named("verb_alloc", &[size.into()]).unwrap().into_pointer_value();
         self.call_named("strcpy", &[buf.into(), sa.into()]);
         self.call_named("strcat", &[buf.into(), sb.into()]);
@@ -1233,9 +1329,10 @@ impl<'ctx> Codegen<'ctx> {
         let one = i64t.const_int(1, false);
         let elems = self.builder.build_load(self.ptr_ty, elemsp, "elems").unwrap().into_pointer_value();
         let is_zero = self.builder.build_int_compare(EQ, cap, i64t.const_zero(), "capzero").unwrap();
-        let doubled = self.builder.build_int_mul(cap, i64t.const_int(2, false), "doubled").unwrap();
+        let loc = Some((line, col));
+        let doubled = self.checked_mul_or_abort(cap, i64t.const_int(2, false), loc, false);
         let new_cap = self.builder.build_select(is_zero, one, doubled, "newcap").unwrap().into_int_value();
-        let new_bytes = self.builder.build_int_mul(new_cap, i64t.const_int(16, false), "newbytes").unwrap();
+        let new_bytes = self.checked_mul_or_abort(new_cap, i64t.const_int(16, false), loc, false);
         let new_elems = self.malloc_bytes_dyn(new_bytes);
 
         let idxp = self.entry_alloca(i64t.into(), "cpidx");
