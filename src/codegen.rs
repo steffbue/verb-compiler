@@ -4322,6 +4322,8 @@ const MAP_FUNCS: &[(&str, usize)] = &[
     ("map_remove", 2),
     ("map_len", 1),
     ("map_key_at", 2),
+    ("map_keys", 1),
+    ("map_values", 1),
 ];
 
 fn map_func_arity(name: &str) -> Option<usize> {

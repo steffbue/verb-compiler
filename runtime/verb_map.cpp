@@ -21,6 +21,7 @@
 #include <iterator>
 #include <new>
 #include <unordered_map>
+#include <vector>
 
 // Defined by Verb's own generated LLVM module (src/codegen.rs). GC
 // contract: any heap value this file allocates must go through
@@ -74,6 +75,47 @@ using VerbMapImpl = std::unordered_map<VerbValue, VerbValue, KeyHash, KeyEq>;
 VerbMapImpl* as_impl(VerbValue m) {
     if (m.tag != VERB_MAP) return nullptr;
     return static_cast<VerbMapImpl*>(verb_as_map(m));
+}
+
+// Byte-identical mirror of the array header src/codegen.rs's
+// Expr::ArrayLit builds inline ({ i64 len, i64 cap, ptr elems }). Verb's
+// own array get/len/release code never learns whether an array came from
+// a literal or from here, so any drift in this layout corrupts arrays
+// map_keys/map_values return.
+struct VerbArray {
+    int64_t len;
+    int64_t cap;
+    VerbValue* elems;
+};
+static_assert(sizeof(VerbValue) == 16,
+    "elems stride must match codegen's 16-byte %verb.value slot");
+static_assert(sizeof(VerbArray) == 24,
+    "array header must match codegen's { i64, i64, ptr } (24 bytes)");
+
+// Builds a fresh Verb array holding `items`, retaining each element: the
+// array is a second live home for values the map still holds, so -- like
+// map_get handing back a stored value -- each must be retained before the
+// array's eventual release cascades a matching release over them. Two
+// verb_alloc blocks (header + elems buffer), exactly as Expr::ArrayLit
+// emits, so the generated array-release path's two decrements balance.
+// An empty array's elems is a plain null, never verb_alloc'd, matching
+// Expr::ArrayLit (its release path guards on that null).
+VerbValue build_array(const std::vector<VerbValue>& items) {
+    auto* hdr = static_cast<VerbArray*>(verb_alloc(sizeof(VerbArray)));
+    int64_t n = static_cast<int64_t>(items.size());
+    hdr->len = n;
+    hdr->cap = n;
+    if (n == 0) {
+        hdr->elems = nullptr;
+    } else {
+        hdr->elems = static_cast<VerbValue*>(
+            verb_alloc(n * static_cast<int64_t>(sizeof(VerbValue))));
+        for (int64_t i = 0; i < n; ++i) {
+            verb_retain_value(items[static_cast<size_t>(i)]);
+            hdr->elems[i] = items[static_cast<size_t>(i)];
+        }
+    }
+    return verb_array(hdr);
 }
 
 } // namespace
@@ -153,6 +195,32 @@ extern "C" VerbValue map_key_at(VerbValue m, VerbValue i) {
     // back an independent one, mirroring map_get on the value side.
     verb_retain_value(it->first);
     return it->first;
+}
+
+// map_keys / map_values -- snapshot a map's keys (resp. values) into a
+// fresh array. Order is unspecified (std::unordered_map iteration order),
+// but keys line up with values position-by-position within a single
+// snapshot only if the map isn't mutated between the two calls; callers
+// wanting paired iteration should not rely on that and should look values
+// up by key. A non-map argument returns nil, matching map_get's
+// invalid-input convention (not an empty array, which is a valid result
+// for an empty map).
+extern "C" VerbValue map_keys(VerbValue m) {
+    VerbMapImpl* impl = as_impl(m);
+    if (!impl) return verb_nil();
+    std::vector<VerbValue> items;
+    items.reserve(impl->size());
+    for (const auto& entry : *impl) items.push_back(entry.first);
+    return build_array(items);
+}
+
+extern "C" VerbValue map_values(VerbValue m) {
+    VerbMapImpl* impl = as_impl(m);
+    if (!impl) return verb_nil();
+    std::vector<VerbValue> items;
+    items.reserve(impl->size());
+    for (const auto& entry : *impl) items.push_back(entry.second);
+    return build_array(items);
 }
 
 // Called by the LLVM-defined verb_release_value (src/codegen.rs) when a

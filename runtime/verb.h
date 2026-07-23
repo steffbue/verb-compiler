@@ -34,6 +34,7 @@ enum {
     VERB_FLOAT = 3,
     VERB_STRING = 4,
     VERB_MAP = 6,
+    VERB_ARRAY = 7,
 };
 
 static inline VerbValue verb_nil(void) {
@@ -54,6 +55,14 @@ static inline VerbValue verb_string(const char* s) {
 static inline VerbValue verb_map(void* p) {
     VerbValue v; v.tag = VERB_MAP; memcpy(&v.payload, &p, sizeof(p)); return v;
 }
+// Tags a pointer to an array header (the { i64 len, i64 cap, ptr elems }
+// block src/codegen.rs's Expr::ArrayLit builds). Like verb_map, this only
+// stamps the tag -- the header itself must be verb_alloc'd with the exact
+// layout Verb's own array get/len/release code expects; see
+// runtime/verb_map.cpp's build_array for the one place that does so.
+static inline VerbValue verb_array(void* p) {
+    VerbValue v; v.tag = VERB_ARRAY; memcpy(&v.payload, &p, sizeof(p)); return v;
+}
 
 static inline int verb_is(VerbValue v, int tag) { return v.tag == tag; }
 
@@ -65,6 +74,9 @@ static inline const char* verb_as_string(VerbValue v) {
     const char* s; memcpy(&s, &v.payload, sizeof(s)); return s;
 }
 static inline void* verb_as_map(VerbValue v) {
+    void* p; memcpy(&p, &v.payload, sizeof(p)); return p;
+}
+static inline void* verb_as_array(VerbValue v) {
     void* p; memcpy(&p, &v.payload, sizeof(p)); return p;
 }
 static inline int verb_as_bool(VerbValue v) { return v.payload != 0; }

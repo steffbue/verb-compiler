@@ -1399,6 +1399,33 @@ fn map_with_heap_valued_entries_retains_and_releases_correctly() {
 }
 
 #[test]
+fn map_keys_and_values_iterate_into_arrays() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_map_iteration_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_map_iteration.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_map_iteration.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn map_keys_and_values_arrays_retain_and_release_correctly() {
+    // The arrays map_keys/map_values return own a retained copy of every
+    // key/value; releasing them must cascade back to zero live objects.
+    assert_no_leaks("std_map_iteration");
+}
+
+#[test]
 fn cross_build_links_a_program_using_std_map_for_a_non_host_target() {
     if !zig_available() {
         eprintln!("skipping: zig not on PATH");
