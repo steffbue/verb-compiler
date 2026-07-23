@@ -1678,6 +1678,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(end_bb);
                 Ok(())
             }
+            Stmt::ForEach { .. } => unimplemented!("for-each codegen (Task 4)"),
             Stmt::Fn { name, params, body, .. } => {
                 self.fn_counter += 1;
                 let llname = format!("fn.{}.{}", name, self.fn_counter);

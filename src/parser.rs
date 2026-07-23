@@ -188,6 +188,7 @@ impl Parser {
             TokenKind::Check => self.if_stmt(),
             TokenKind::Repeat => self.while_stmt(),
             TokenKind::Loop => self.for_stmt(),
+            TokenKind::Each => self.foreach_stmt(),
             TokenKind::Begin => Ok(Stmt::Block(self.block()?)),
             // old statement keywords lex as identifiers now — catch them for a rename hint
             TokenKind::Ident(n) if *self.peek2() != TokenKind::Be
@@ -297,6 +298,48 @@ impl Parser {
         let mut body = self.block()?;
         body.push(incr);
         Ok(Stmt::Block(vec![init, Stmt::While { cond, body }]))
+    }
+
+    fn foreach_stmt(&mut self) -> Result<Stmt, CompileError> {
+        self.advance(); // each
+        let (name, _, _) = self.expect_ident("loop variable name")?;
+        self.expect(&TokenKind::In, "'in'")?;
+        let first = self.expression()?;
+
+        if self.matches(&TokenKind::To) {
+            // range: `each x in a to b` -> [assign x a; while x trails b { body; x be x add 1 }]
+            let (line, col) = self.here();
+            let end = self.expression()?;
+            let mut body = self.block()?;
+            let cond = Expr::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(Expr::Var(name.clone(), line, col)),
+                rhs: Box::new(end),
+                line,
+                col,
+            };
+            let incr = Stmt::Reassign {
+                name: name.clone(),
+                value: Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Var(name.clone(), line, col)),
+                    rhs: Box::new(Expr::Int(1)),
+                    line,
+                    col,
+                },
+                line,
+                col,
+            };
+            body.push(incr);
+            return Ok(Stmt::Block(vec![
+                Stmt::Assign { name, value: first },
+                Stmt::While { cond, body },
+            ]));
+        }
+
+        // collection form: `each x in coll begin ... end`
+        let body = self.block()?;
+        Ok(Stmt::ForEach { name, coll: first, body })
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, CompileError> {
@@ -550,6 +593,44 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_foreach_collection() {
+        let p = parse(lex("each item in fruits begin print(item); end").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::ForEach { name, coll, body } => {
+                assert_eq!(name, "item");
+                assert!(matches!(coll, Expr::Var(n, ..) if n == "fruits"));
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn desugars_foreach_range_to_while() {
+        let p = parse(lex("each x in 0 to 3 begin print(x); end").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::Block(inner) => {
+                assert!(matches!(&inner[0], Stmt::Assign { name, .. } if name == "x"));
+                match &inner[1] {
+                    Stmt::While { cond, body } => {
+                        // half-open: cond is `x trails 3`
+                        assert!(matches!(cond, Expr::Binary { op: BinOp::Lt, .. }));
+                        // last body stmt is the increment `x be x add 1`
+                        assert!(matches!(body.last().unwrap(), Stmt::Reassign { name, .. } if name == "x"));
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreach_requires_in() {
+        assert!(parse(lex("each x fruits begin end").unwrap()).is_err());
     }
 
     #[test]
