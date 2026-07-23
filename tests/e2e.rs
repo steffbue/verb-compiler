@@ -437,6 +437,54 @@ fn verb_std_io_cpp_compiles_standalone() {
     let _ = std::fs::remove_file(&obj);
 }
 
+// `runtime/verb_std_io.cpp` is compiled into every binary in this package
+// via build.rs, but a plain static-archive link only pulls in object files
+// that resolve an undefined symbol -- nothing in this test crate calls
+// `file_read`, so without a forcing reference `verb_std_io.o` would never
+// be linked into *this* test binary at all, regardless of the dynamic-export
+// flag (see .cargo/config.toml). build.rs forces every runtime symbol into
+// the `verb` bin specifically (via `-Wl,-u,SYMBOL`, scoped with
+// rustc-link-arg-bin); Cargo has no per-test-name equivalent of that
+// scoping, so this test binary instead mirrors the older, narrower trick
+// `src/main.rs` already uses for `verb_map_destroy_contents`: take a real
+// reference to the one symbol under test, which is enough to pull its
+// object file in via ordinary archive extraction (see the unscoped
+// `-lverb_runtime`/`-lc++` re-emitted in build.rs) and, since it's `#[used]`,
+// to survive dead-code stripping too. `file_read` itself calls `verb_alloc`
+// (defined by Verb's own generated code per runtime/verb.h); this test
+// binary has none, so it supplies a stub purely to satisfy the linker -- it
+// is never invoked, since the test only resolves `file_read`'s address,
+// never calls it.
+#[repr(C)]
+struct VerbValueAbi {
+    tag: i8,
+    payload: i64,
+}
+
+extern "C" {
+    fn file_read(path: VerbValueAbi) -> VerbValueAbi;
+}
+
+#[no_mangle]
+pub extern "C" fn verb_alloc(_n: i64) -> *mut std::ffi::c_void {
+    unreachable!("test stub: file_read is resolved via dlsym but never called");
+}
+
+#[used]
+static FORCE_LINK_FILE_READ: unsafe extern "C" fn(VerbValueAbi) -> VerbValueAbi = file_read;
+
+#[test]
+fn in_binary_std_symbols_are_dynamically_resolvable() {
+    // verb_std_io.cpp must be compiled into the `verb` test binary (build.rs)
+    // and its symbols exported so dlsym(RTLD_DEFAULT, ...) can find them.
+    // This is the resolution path the JIT uses for std io / std map.
+    use std::ffi::CString;
+    let name = CString::new("file_read").unwrap();
+    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    assert!(!addr.is_null(), "file_read not resolvable via dlsym(RTLD_DEFAULT); \
+        verb_std_io.cpp not compiled in or dynamic export flag not effective");
+}
+
 #[test]
 fn verb_map_cpp_compiles_standalone() {
     let obj = std::env::temp_dir().join("verb_map_syntax_check.o");
