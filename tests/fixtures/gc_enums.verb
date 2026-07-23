@@ -1,0 +1,11 @@
+choice Box begin
+  Full(s) or
+  Empty
+end
+assign b Full("hello" join "!");
+b be Full("world" join "!");
+match b begin
+  when Full(s) begin print(s); end
+  when Empty begin print("empty"); end
+end
+b be Empty;

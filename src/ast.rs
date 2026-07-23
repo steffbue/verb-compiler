@@ -32,6 +32,20 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     Record { name: String, fields: Vec<String>, line: u32, col: u32 }, // record Name begin f, g end
     FieldSet { obj: Expr, field: String, value: Expr, line: u32, col: u32 }, // <field> of <expr> be <value>;
+    // choice Name begin V1(a, b) or V2(c) or V3 end -- a tagged-union type
+    // declaration. Each variant has a name and an ordered field list.
+    Choice { name: String, variants: Vec<(String, Vec<String>)>, line: u32, col: u32 },
+    // match <expr> begin when V(a, b) begin .. end .. otherwise begin .. end end
+    Match { scrutinee: Expr, arms: Vec<MatchArm>, otherwise: Option<Vec<Stmt>>, line: u32, col: u32 },
+}
+
+/// One `when V(a, b) begin .. end` arm of a `match`: the variant name, the
+/// names it binds each field to (positional), and the body run on a match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub variant: String,
+    pub bindings: Vec<String>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +172,25 @@ fn collect_free_stmt(
         Stmt::FieldSet { obj, value, .. } => {
             collect_free_expr(obj, bound, out, seen);
             collect_free_expr(value, bound, out, seen);
+        }
+        // A `choice` type declaration binds no runtime names (like `record`).
+        Stmt::Choice { .. } => {}
+        Stmt::Match { scrutinee, arms, otherwise, .. } => {
+            collect_free_expr(scrutinee, bound, out, seen);
+            // Each arm's bindings are a fresh scope frame (like params), local
+            // to that arm's body only.
+            for arm in arms {
+                let mut frame = HashSet::new();
+                for b in &arm.bindings { frame.insert(b.clone()); }
+                bound.push(frame);
+                collect_free_stmts(&arm.body, bound, out, seen);
+                bound.pop();
+            }
+            if let Some(ob) = otherwise {
+                bound.push(HashSet::new());
+                collect_free_stmts(ob, bound, out, seen);
+                bound.pop();
+            }
         }
     }
 }

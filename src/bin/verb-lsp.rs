@@ -451,6 +451,19 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
                     out.vars.push(name.clone());
                 }
             }
+            Stmt::Choice { name, .. } => {
+                if !out.vars.contains(name) {
+                    out.vars.push(name.clone());
+                }
+            }
+            Stmt::Match { arms, otherwise, .. } => {
+                for arm in arms {
+                    collect_from_stmts(&arm.body, out);
+                }
+                if let Some(ob) = otherwise {
+                    collect_from_stmts(ob, out);
+                }
+            }
             Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_)
             | Stmt::FieldSet { .. } => {}
         }

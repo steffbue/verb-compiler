@@ -1,0 +1,9 @@
+choice Shape begin
+  Circle(r) or
+  Square(s)
+end
+assign sh Square(9);
+match sh begin
+  when Circle(r) begin print(r); end
+end
+print(999);

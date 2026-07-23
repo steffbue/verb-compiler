@@ -1,0 +1,14 @@
+record Point begin x, y end
+choice Node begin
+  Leaf(v) or
+  Branch(p, items)
+end
+assign n Branch(Point(1, 2), list 10, 20, 30);
+match n begin
+  when Leaf(v) begin print(v); end
+  when Branch(p, items) begin
+    print(x of p);
+    print(get(items, 1));
+  end
+end
+print(n);

@@ -167,6 +167,28 @@ fn field_of_nonstruct_aborts() {
     run_err("err_field_of_nonstruct", "'field access' needs a record, got int");
 }
 
+// ----- enums (choice) / pattern matching (match) -----
+
+#[test]
+fn enums_basic_construct_match_print() { run_ok("enums_basic"); }
+
+#[test]
+fn enums_match_binds_fields_and_otherwise() { run_ok("enums_match_bind"); }
+
+#[test]
+fn enums_nested_hold_structs_and_arrays() { run_ok("enums_nested"); }
+
+#[test]
+fn enums_reassign_and_heap_fields_leak_nothing() {
+    run_ok("gc_enums");
+    assert_no_leaks("gc_enums");
+}
+
+#[test]
+fn match_no_matching_variant_aborts() {
+    run_err("err_match_no_variant", "no matching variant");
+}
+
 #[test]
 fn arith() { run_ok("arith"); }
 
@@ -917,6 +939,7 @@ fn gc_no_leaks_across_all_heap_kinds() {
         "gc_arrays_nested", "gc_arrays_of_closures", "gc_arrays_regrow",
         "gc_map_heap_values", "gc_std_io_file_roundtrip",
         "structs_basic", "structs_nested", "gc_structs",
+        "enums_basic", "enums_nested", "gc_enums",
         "closures_capture_local", "closures_capture_param",
         "closures_counter", "closures_by_value", "gc_closures_capture",
     ] {

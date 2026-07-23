@@ -19,11 +19,13 @@ pub struct Codegen<'ctx> {
     closure_ty: StructType<'ctx>,
     array_ty: StructType<'ctx>,
     struct_hdr_ty: StructType<'ctx>,
+    enum_hdr_ty: StructType<'ctx>,
     ptr_ty: PointerType<'ctx>,
     scopes: Vec<HashMap<String, PointerValue<'ctx>>>,
     globals: HashMap<String, PointerValue<'ctx>>,
     externs: HashMap<String, FunctionValue<'ctx>>,
     records: HashMap<String, RecordInfo<'ctx>>,
+    variants: HashMap<String, VariantInfo<'ctx>>,
     imports: Vec<String>,
     std_imports: Vec<String>,
     fn_depth: u32,
@@ -42,6 +44,19 @@ struct RecordInfo<'ctx> {
     fields: Vec<String>,
 }
 
+/// Compile-time info for one variant of a declared `choice`. Keyed by
+/// variant name (flat across all choices) so that variant construction and
+/// `match` arms can resolve a bare variant name. The descriptor is a static
+/// global shaped exactly like a record descriptor ({ i8* variant_name, i64
+/// nfields, [nfields x i8*] field_names }), so enum print/GC reuse the struct
+/// machinery. `variant_id` is the variant's index within its choice.
+#[derive(Clone)]
+struct VariantInfo<'ctx> {
+    descriptor: PointerValue<'ctx>,
+    variant_id: u64,
+    fields: Vec<String>,
+}
+
 impl<'ctx> Codegen<'ctx> {
     pub fn new(ctx: &'ctx Context) -> Self {
         let module = ctx.create_module("verb");
@@ -56,10 +71,15 @@ impl<'ctx> Codegen<'ctx> {
         // i64 nfields }. The nfields inline `value_ty` fields follow at
         // byte offset 16 (see `struct_field_slot`).
         let struct_hdr_ty = ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into()], false);
+        // Header shared by every enum heap block: { ptr descriptor, i64
+        // variant_id, i64 nfields }. The nfields inline `value_ty` fields
+        // follow at byte offset 24 (see `enum_field_slot`).
+        let enum_hdr_ty =
+            ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into(), ctx.i64_type().into()], false);
         let cg = Self {
-            ctx, module, builder, value_ty, closure_ty, array_ty, struct_hdr_ty, ptr_ty,
+            ctx, module, builder, value_ty, closure_ty, array_ty, struct_hdr_ty, enum_hdr_ty, ptr_ty,
             scopes: Vec::new(), globals: HashMap::new(), externs: HashMap::new(),
-            records: HashMap::new(),
+            records: HashMap::new(), variants: HashMap::new(),
             imports: Vec::new(), std_imports: Vec::new(), fn_depth: 0, fn_counter: 0,
             cur_file: String::new(),
         };
@@ -155,6 +175,21 @@ impl<'ctx> Codegen<'ctx> {
         }.unwrap();
         unsafe {
             self.builder.build_in_bounds_gep(self.value_ty, base, &[idx], "fslot")
+        }.unwrap()
+    }
+
+    /// Pointer to field slot `idx` (a `value_ty`) inside an enum heap block
+    /// whose payload pointer is `sp`. Fields live inline after the 24-byte
+    /// `enum_hdr_ty` header (descriptor + variant_id + nfields), so slot
+    /// `idx` is at `sp + 24 + idx*16`.
+    fn enum_field_slot(&self, sp: PointerValue<'ctx>, idx: IntValue<'ctx>) -> PointerValue<'ctx> {
+        let i64t = self.ctx.i64_type();
+        let base = unsafe {
+            self.builder.build_in_bounds_gep(
+                self.ctx.i8_type(), sp, &[i64t.const_int(24, false)], "efbase")
+        }.unwrap();
+        unsafe {
+            self.builder.build_in_bounds_gep(self.value_ty, base, &[idx], "efslot")
         }.unwrap()
     }
 
@@ -260,7 +295,8 @@ impl<'ctx> Codegen<'ctx> {
         let mut cases = Vec::new();
         for (t, name) in [(TAG_NIL, "nil"), (TAG_BOOL, "bool"), (TAG_INT, "int"),
                           (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn"),
-                          (TAG_ARRAY, "array"), (TAG_MAP, "map"), (TAG_STRUCT, "struct")] {
+                          (TAG_ARRAY, "array"), (TAG_MAP, "map"), (TAG_STRUCT, "struct"),
+                          (TAG_ENUM, "enum")] {
             let bb = self.ctx.append_basic_block(f, name);
             self.builder.position_at_end(bb);
             let s = self.cstr(name);
@@ -377,6 +413,7 @@ impl<'ctx> Codegen<'ctx> {
         let arr_bb = self.ctx.append_basic_block(f, "array");
         let map_bb = self.ctx.append_basic_block(f, "map");
         let struct_bb = self.ctx.append_basic_block(f, "struct");
+        let enum_bb = self.ctx.append_basic_block(f, "enum");
         let done = self.ctx.append_basic_block(f, "done");
 
         let i8t = self.ctx.i8_type();
@@ -390,6 +427,7 @@ impl<'ctx> Codegen<'ctx> {
             (i8t.const_int(TAG_ARRAY, false), arr_bb),
             (i8t.const_int(TAG_MAP, false), map_bb),
             (i8t.const_int(TAG_STRUCT, false), struct_bb),
+            (i8t.const_int(TAG_ENUM, false), enum_bb),
         ]).unwrap();
 
         self.builder.position_at_end(nil_bb);
@@ -526,6 +564,60 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(send_bb);
         self.call_named("printf", &[self.cstr("}").into()]);
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        // ----- enum/variant: Circle(<v>, <v>) (name from descriptor, then a
+        // parenthesized, comma-separated field list; bare name if no fields) -----
+        self.builder.position_at_end(enum_bb);
+        let esp = self.builder.build_int_to_ptr(pay, self.ptr_ty, "esp").unwrap();
+        let edescp = self.builder.build_struct_gep(self.enum_hdr_ty, esp, 0, "edescp").unwrap();
+        let edesc = self.builder.build_load(self.ptr_ty, edescp, "edesc").unwrap().into_pointer_value();
+        // descriptor field 0 = variant_name (shaped exactly like a record descriptor)
+        let enamep = self.builder.build_struct_gep(self.struct_hdr_ty, edesc, 0, "enamep").unwrap();
+        let ename = self.builder.build_load(self.ptr_ty, enamep, "ename").unwrap();
+        self.call_named("printf", &[self.cstr("%s").into(), ename.into()]);
+        let enfp = self.builder.build_struct_gep(self.enum_hdr_ty, esp, 2, "enfp").unwrap();
+        let enf = self.builder.build_load(i64t, enfp, "enf").unwrap().into_int_value();
+        let ehas = self.builder.build_int_compare(
+            inkwell::IntPredicate::NE, enf, i64t.const_zero(), "ehas").unwrap();
+        let eopen_bb = self.ctx.append_basic_block(f, "ep.open");
+        let econd_bb = self.ctx.append_basic_block(f, "ep.cond");
+        let ebody_bb = self.ctx.append_basic_block(f, "ep.body");
+        let esep_bb = self.ctx.append_basic_block(f, "ep.sep");
+        let efield_bb = self.ctx.append_basic_block(f, "ep.field");
+        let eclose_bb = self.ctx.append_basic_block(f, "ep.close");
+        self.builder.build_conditional_branch(ehas, eopen_bb, done).unwrap();
+
+        self.builder.position_at_end(eopen_bb);
+        self.call_named("printf", &[self.cstr("(").into()]);
+        let eidxp = self.entry_alloca(i64t.into(), "epidx");
+        self.builder.build_store(eidxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(econd_bb).unwrap();
+
+        self.builder.position_at_end(econd_bb);
+        let ei = self.builder.build_load(i64t, eidxp, "ei").unwrap().into_int_value();
+        let emore = self.builder.build_int_compare(inkwell::IntPredicate::SLT, ei, enf, "emore").unwrap();
+        self.builder.build_conditional_branch(emore, ebody_bb, eclose_bb).unwrap();
+
+        self.builder.position_at_end(ebody_bb);
+        let efirst = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ, ei, i64t.const_zero(), "efirst").unwrap();
+        self.builder.build_conditional_branch(efirst, efield_bb, esep_bb).unwrap();
+
+        self.builder.position_at_end(esep_bb);
+        self.call_named("printf", &[self.cstr(", ").into()]);
+        self.builder.build_unconditional_branch(efield_bb).unwrap();
+
+        self.builder.position_at_end(efield_bb);
+        let eslot = self.enum_field_slot(esp, ei);
+        let efv = self.builder.build_load(self.value_ty, eslot, "efv").unwrap().into_struct_value();
+        self.call_named("verb_print_value", &[efv.into()]);
+        let enext = self.builder.build_int_add(ei, i64t.const_int(1, false), "enext").unwrap();
+        self.builder.build_store(eidxp, enext).unwrap();
+        self.builder.build_unconditional_branch(econd_bb).unwrap();
+
+        self.builder.position_at_end(eclose_bb);
+        self.call_named("printf", &[self.cstr(")").into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(done);
@@ -1287,9 +1379,11 @@ impl<'ctx> Codegen<'ctx> {
         let is_arr = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ARRAY, false), "is_arr").unwrap();
         let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
         let is_struct = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STRUCT, false), "is_struct").unwrap();
+        let is_enum = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ENUM, false), "is_enum").unwrap();
         let is_clos_or_arr = self.builder.build_or(is_clos, is_arr, "is_clos_or_arr").unwrap();
         let is_map_or_struct = self.builder.build_or(is_map, is_struct, "is_map_or_struct").unwrap();
-        let is_heap = self.builder.build_or(is_clos_or_arr, is_map_or_struct, "is_heap").unwrap();
+        let is_heap0 = self.builder.build_or(is_clos_or_arr, is_map_or_struct, "is_heap0").unwrap();
+        let is_heap = self.builder.build_or(is_heap0, is_enum, "is_heap").unwrap();
         self.builder.build_conditional_branch(is_heap, heap_bump_bb, done_bb).unwrap();
 
         self.builder.position_at_end(heap_bump_bb);
@@ -1357,6 +1451,13 @@ impl<'ctx> Codegen<'ctx> {
         let struct_loop_cond_bb = self.ctx.append_basic_block(f, "struct.loop.cond");
         let struct_loop_body_bb = self.ctx.append_basic_block(f, "struct.loop.body");
         let struct_loop_end_bb = self.ctx.append_basic_block(f, "struct.loop.end");
+        let enum_check_bb = self.ctx.append_basic_block(f, "enum.check");
+        let enum_bb = self.ctx.append_basic_block(f, "enum");
+        let enum_dec_bb = self.ctx.append_basic_block(f, "enum.dec");
+        let enum_free_bb = self.ctx.append_basic_block(f, "enum.free");
+        let enum_loop_cond_bb = self.ctx.append_basic_block(f, "enum.loop.cond");
+        let enum_loop_body_bb = self.ctx.append_basic_block(f, "enum.loop.body");
+        let enum_loop_end_bb = self.ctx.append_basic_block(f, "enum.loop.end");
         let done_bb = self.ctx.append_basic_block(f, "done");
 
         self.builder.position_at_end(entry);
@@ -1545,7 +1646,7 @@ impl<'ctx> Codegen<'ctx> {
         // ----- struct/record: cascade into every field, then free the one block -----
         self.builder.position_at_end(struct_check_bb);
         let is_struct = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STRUCT, false), "is_struct").unwrap();
-        self.builder.build_conditional_branch(is_struct, struct_bb, done_bb).unwrap();
+        self.builder.build_conditional_branch(is_struct, struct_bb, enum_check_bb).unwrap();
 
         self.builder.position_at_end(struct_bb);
         let ssp = self.builder.build_int_to_ptr(p, self.ptr_ty, "ssp").unwrap();
@@ -1584,6 +1685,50 @@ impl<'ctx> Codegen<'ctx> {
         // a static global) -- one dec + one free, like a closure.
         self.dec_live_counter();
         self.call_named("free", &[shdr2.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        // ----- enum/variant: cascade into every field, then free the one block.
+        // Identical to the struct cascade, but fields live after the 24-byte
+        // enum header (descriptor + variant_id + nfields), and nfields is read
+        // from enum_hdr slot 2. -----
+        self.builder.position_at_end(enum_check_bb);
+        let is_enum = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ENUM, false), "is_enum").unwrap();
+        self.builder.build_conditional_branch(is_enum, enum_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(enum_bb);
+        let esp = self.builder.build_int_to_ptr(p, self.ptr_ty, "esp").unwrap();
+        let ehdr = self.header_ptr(esp);
+        let ecur = self.builder.build_load(i64t, ehdr, "ecur").unwrap().into_int_value();
+        let enext = self.builder.build_int_sub(ecur, i64t.const_int(1, false), "enext").unwrap();
+        self.builder.build_store(ehdr, enext).unwrap();
+        let ezero = self.builder.build_int_compare(EQ, enext, i64t.const_zero(), "ezero").unwrap();
+        self.builder.build_conditional_branch(ezero, enum_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(enum_dec_bb);
+        self.builder.build_unconditional_branch(enum_free_bb).unwrap();
+
+        self.builder.position_at_end(enum_free_bb);
+        let enfp = self.builder.build_struct_gep(self.enum_hdr_ty, esp, 2, "enfp").unwrap();
+        let enf = self.builder.build_load(i64t, enfp, "enf").unwrap().into_int_value();
+        let eidxp = self.entry_alloca(i64t.into(), "erelidx2");
+        self.builder.build_store(eidxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(enum_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(enum_loop_cond_bb);
+        let ei = self.builder.build_load(i64t, eidxp, "ei").unwrap().into_int_value();
+        let emore = self.builder.build_int_compare(SLT, ei, enf, "emore").unwrap();
+        self.builder.build_conditional_branch(emore, enum_loop_body_bb, enum_loop_end_bb).unwrap();
+
+        self.builder.position_at_end(enum_loop_body_bb);
+        let eslot = self.enum_field_slot(esp, ei);
+        let efv = self.builder.build_load(self.value_ty, eslot, "efv").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[efv.into()]);
+        let einext = self.builder.build_int_add(ei, i64t.const_int(1, false), "einext").unwrap();
+        self.builder.build_store(eidxp, einext).unwrap();
+        self.builder.build_unconditional_branch(enum_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(enum_loop_end_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[ehdr.into()]);
         self.builder.build_unconditional_branch(done_bb).unwrap();
 
         self.builder.position_at_end(done_bb);
@@ -2186,6 +2331,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.gen_record(name, fields);
                 Ok(())
             }
+            Stmt::Choice { name, variants, .. } => {
+                self.gen_choice(name, variants);
+                Ok(())
+            }
+            Stmt::Match { scrutinee, arms, otherwise, line, col } => {
+                self.gen_match(scrutinee, arms, otherwise.as_deref(), *line, *col)
+            }
             Stmt::FieldSet { obj, field, value, line, col } => {
                 let o = self.gen_expr(obj)?;
                 let val = self.gen_expr(value)?;
@@ -2229,6 +2381,164 @@ impl<'ctx> Codegen<'ctx> {
         });
     }
 
+    /// Builds one static descriptor global per variant of a `choice` -- each
+    /// shaped exactly like a record descriptor ({ i8* variant_name, i64
+    /// nfields, [nfields x i8*] field_names }) -- and registers every variant
+    /// (keyed by its own name, flat across choices) in `self.variants` with
+    /// its index as `variant_id`. Emits no runtime instructions.
+    fn gen_choice(&mut self, name: &str, variants: &[(String, Vec<String>)]) {
+        let i64t = self.ctx.i64_type();
+        for (vid, (vname, fields)) in variants.iter().enumerate() {
+            let n = fields.len() as u64;
+            let name_const = self.cstr(vname);
+            let field_consts: Vec<PointerValue<'ctx>> =
+                fields.iter().map(|fld| self.cstr(fld)).collect();
+            let names_arr = self.ptr_ty.const_array(&field_consts);
+            let desc_ty = self.ctx.struct_type(
+                &[self.ptr_ty.into(), i64t.into(), self.ptr_ty.array_type(n as u32).into()], false);
+            let init = desc_ty.const_named_struct(&[
+                name_const.into(),
+                i64t.const_int(n, false).into(),
+                names_arr.into(),
+            ]);
+            let g = self.module.add_global(desc_ty, None, &format!("verb.choice.{name}.{vname}"));
+            g.set_initializer(&init);
+            g.set_constant(true);
+            self.variants.insert(vname.clone(), VariantInfo {
+                descriptor: g.as_pointer_value(),
+                variant_id: vid as u64,
+                fields: fields.clone(),
+            });
+        }
+    }
+
+    /// Allocates and initializes an enum heap block for `info` with the given
+    /// (already-owned) field values, returning the tagged value. Layout is
+    /// `[ptr descriptor][i64 variant_id][i64 nfields][fields...]`, a single
+    /// `verb_alloc` block (like a struct, plus the variant_id word).
+    fn build_variant(&self, info: &VariantInfo<'ctx>, vals: Vec<StructValue<'ctx>>)
+        -> StructValue<'ctx>
+    {
+        let i64t = self.ctx.i64_type();
+        let n = vals.len() as u64;
+        let sp = self.malloc_bytes(24 + n * 16);
+        let descp = self.builder.build_struct_gep(self.enum_hdr_ty, sp, 0, "edescp").unwrap();
+        self.builder.build_store(descp, info.descriptor).unwrap();
+        let vidp = self.builder.build_struct_gep(self.enum_hdr_ty, sp, 1, "evidp").unwrap();
+        self.builder.build_store(vidp, i64t.const_int(info.variant_id, false)).unwrap();
+        let nfp = self.builder.build_struct_gep(self.enum_hdr_ty, sp, 2, "enfp").unwrap();
+        self.builder.build_store(nfp, i64t.const_int(n, false)).unwrap();
+        for (i, v) in vals.into_iter().enumerate() {
+            let slot = self.enum_field_slot(sp, i64t.const_int(i as u64, false));
+            self.builder.build_store(slot, v).unwrap();
+        }
+        let bits = self.builder.build_ptr_to_int(sp, i64t, "ebits").unwrap();
+        self.make_val(TAG_ENUM, bits)
+    }
+
+    /// `match` codegen: evaluate the scrutinee, then an if-chain over the arms
+    /// keyed on the loaded variant_id. Each matching arm loads+retains its
+    /// bound fields, releases the scrutinee temp, then binds the fields into a
+    /// fresh scope and runs its body. A non-enum scrutinee, or an enum whose
+    /// variant no arm covers, falls to `otherwise` (if present) or a runtime
+    /// abort. Fields are retained *before* the scrutinee is released so an
+    /// early `return` in a body leaks nothing (the temp is never held across
+    /// the body).
+    fn gen_match(&mut self, scrutinee: &Expr, arms: &[MatchArm],
+                 otherwise: Option<&[Stmt]>, line: u32, col: u32)
+        -> Result<(), CompileError>
+    {
+        use inkwell::IntPredicate::EQ;
+        let i64t = self.ctx.i64_type();
+        let i8t = self.ctx.i8_type();
+        let sv = self.gen_expr(scrutinee)?;
+        let tag = self.tag_of(sv);
+        let is_enum = self.builder.build_int_compare(
+            EQ, tag, i8t.const_int(TAG_ENUM, false), "match.isenum").unwrap();
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let dispatch_bb = self.ctx.append_basic_block(f, "match.dispatch");
+        let nomatch_bb = self.ctx.append_basic_block(f, "match.nomatch");
+        let merge_bb = self.ctx.append_basic_block(f, "match.end");
+        self.builder.build_conditional_branch(is_enum, dispatch_bb, nomatch_bb).unwrap();
+
+        self.builder.position_at_end(dispatch_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(sv), self.ptr_ty, "match.sp").unwrap();
+        let vidp = self.builder.build_struct_gep(self.enum_hdr_ty, sp, 1, "match.vidp").unwrap();
+        let vid = self.builder.build_load(i64t, vidp, "match.vid").unwrap().into_int_value();
+
+        let mut test_bbs = Vec::with_capacity(arms.len());
+        let mut body_bbs = Vec::with_capacity(arms.len());
+        for i in 0..arms.len() {
+            test_bbs.push(self.ctx.append_basic_block(f, &format!("match.test{i}")));
+            body_bbs.push(self.ctx.append_basic_block(f, &format!("match.body{i}")));
+        }
+        let first = test_bbs.first().copied().unwrap_or(nomatch_bb);
+        self.builder.build_unconditional_branch(first).unwrap();
+
+        for (i, arm) in arms.iter().enumerate() {
+            let info = self.variants.get(&arm.variant).cloned().ok_or_else(|| {
+                CompileError::new(format!("unknown variant '{}' in match", arm.variant), line, col)
+            })?;
+            if arm.bindings.len() != info.fields.len() {
+                return Err(CompileError::new(
+                    format!("variant '{}' has {} field(s), but the pattern binds {}",
+                            arm.variant, info.fields.len(), arm.bindings.len()),
+                    line, col));
+            }
+            self.builder.position_at_end(test_bbs[i]);
+            let want = i64t.const_int(info.variant_id, false);
+            let eq = self.builder.build_int_compare(EQ, vid, want, "match.eq").unwrap();
+            let next = test_bbs.get(i + 1).copied().unwrap_or(nomatch_bb);
+            self.builder.build_conditional_branch(eq, body_bbs[i], next).unwrap();
+
+            self.builder.position_at_end(body_bbs[i]);
+            // Load + retain every bound field BEFORE releasing the scrutinee.
+            let mut bound_vals = Vec::with_capacity(arm.bindings.len());
+            for j in 0..arm.bindings.len() {
+                let slot = self.enum_field_slot(sp, i64t.const_int(j as u64, false));
+                let fv = self.builder.build_load(self.value_ty, slot, "match.fv")
+                    .unwrap().into_struct_value();
+                self.call_named("verb_retain_value", &[fv.into()]);
+                bound_vals.push(fv);
+            }
+            self.call_named("verb_release_value", &[sv.into()]);
+            self.scopes.push(HashMap::new());
+            for (bn, bv) in arm.bindings.iter().zip(bound_vals.into_iter()) {
+                self.bind(bn, bv);
+            }
+            self.gen_stmts(&arm.body)?;
+            if self.cur_block_open() {
+                if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+            } else {
+                self.scopes.pop();
+            }
+            if self.cur_block_open() {
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+            }
+        }
+
+        self.builder.position_at_end(nomatch_bb);
+        self.call_named("verb_release_value", &[sv.into()]);
+        if let Some(ob) = otherwise {
+            self.scopes.push(HashMap::new());
+            self.gen_stmts(ob)?;
+            if self.cur_block_open() {
+                if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+            } else {
+                self.scopes.pop();
+            }
+            if self.cur_block_open() {
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+            }
+        } else {
+            let (lc, cc) = self.loc_consts(line, col);
+            self.abort_at(lc, cc, "no matching variant in match", &[]);
+        }
+
+        self.builder.position_at_end(merge_bb);
+        Ok(())
+    }
+
     fn gen_expr(&mut self, expr: &Expr) -> Result<StructValue<'ctx>, CompileError> {
         match expr {
             Expr::Int(v) => Ok(self.make_val(TAG_INT, self.ctx.i64_type().const_int(*v as u64, true))),
@@ -2251,6 +2561,18 @@ impl<'ctx> Codegen<'ctx> {
                         .unwrap().into_struct_value();
                     self.call_named("verb_retain_value", &[v.into()]);
                     return Ok(v);
+                }
+                // A bare name that is a fieldless enum variant constructs that
+                // variant (a fielded variant must be written `V(..)`, handled
+                // in gen_call).
+                if let Some(info) = self.variants.get(name).cloned() {
+                    if info.fields.is_empty() {
+                        return Ok(self.build_variant(&info, Vec::new()));
+                    }
+                    return Err(CompileError::new(
+                        format!("variant '{name}' takes {} field(s) -- construct it as {name}(..)",
+                                info.fields.len()),
+                        *line, *col));
                 }
                 Err(self.undefined_var(name, *line, *col))
             }
@@ -2477,6 +2799,23 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 let bits = self.builder.build_ptr_to_int(sp, self.ctx.i64_type(), "sbits").unwrap();
                 return Ok(self.make_val(TAG_STRUCT, bits));
+            }
+            // enum variant construction: `Circle(5)` -> heap enum value
+            if let Some(info) = self.variants.get(name).cloned() {
+                let n = info.fields.len();
+                if args.len() != n {
+                    return Err(CompileError::new(
+                        format!("variant '{name}' takes {n} field(s), got {}", args.len()),
+                        line, col));
+                }
+                // Evaluate each field value first (owned temporaries), moved
+                // into the variant's inline slots -- same ownership handoff as
+                // record construction.
+                let mut vals = Vec::with_capacity(n);
+                for a in args {
+                    vals.push(self.gen_expr(a)?);
+                }
+                return Ok(self.build_variant(&info, vals));
             }
             let is_bound = self.lookup(name).is_some();
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {

@@ -189,6 +189,8 @@ impl Parser {
             TokenKind::Repeat => self.while_stmt(),
             TokenKind::Loop => self.for_stmt(),
             TokenKind::Record => self.record_stmt(),
+            TokenKind::Choice => self.choice_stmt(),
+            TokenKind::Match => self.match_stmt(),
             TokenKind::Begin => Ok(Stmt::Block(self.block()?)),
             // `<field> of <expr> [be <value>];` — field get expr-stmt or field set
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Of => self.field_stmt(),
@@ -317,6 +319,71 @@ impl Parser {
         }
         self.expect(&TokenKind::End, "'end'")?;
         Ok(Stmt::Record { name, fields, line, col })
+    }
+
+    /// `choice Shape begin Circle(r) or Square(s) or Empty end` — a tagged
+    /// union type declaration. Variants are separated by `or` (reusing the
+    /// existing token); each variant has an optional parenthesized field list.
+    fn choice_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
+        self.advance(); // choice
+        let (name, _, _) = self.expect_ident("choice name")?;
+        self.expect(&TokenKind::Begin, "'begin'")?;
+        let mut variants = Vec::new();
+        if !self.check(&TokenKind::End) {
+            loop {
+                let (vname, _, _) = self.expect_ident("variant name")?;
+                let mut fields = Vec::new();
+                if self.matches(&TokenKind::LParen) {
+                    if !self.check(&TokenKind::RParen) {
+                        loop {
+                            fields.push(self.expect_ident("field name")?.0);
+                            if !self.matches(&TokenKind::Comma) { break; }
+                        }
+                    }
+                    self.expect(&TokenKind::RParen, "')'")?;
+                }
+                variants.push((vname, fields));
+                if !self.matches(&TokenKind::Or) { break; }
+            }
+        }
+        self.expect(&TokenKind::End, "'end'")?;
+        Ok(Stmt::Choice { name, variants, line, col })
+    }
+
+    /// `match <expr> begin when V(a, b) begin .. end .. otherwise begin .. end end`
+    /// — pattern-match on an enum value. Each `when` arm names a variant and
+    /// binds its fields positionally; an optional trailing `otherwise` catches
+    /// everything else.
+    fn match_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
+        self.advance(); // match
+        let scrutinee = self.expression()?;
+        self.expect(&TokenKind::Begin, "'begin'")?;
+        let mut arms = Vec::new();
+        while self.check(&TokenKind::When) {
+            self.advance(); // when
+            let (variant, _, _) = self.expect_ident("variant name after 'when'")?;
+            let mut bindings = Vec::new();
+            if self.matches(&TokenKind::LParen) {
+                if !self.check(&TokenKind::RParen) {
+                    loop {
+                        bindings.push(self.expect_ident("binding name")?.0);
+                        if !self.matches(&TokenKind::Comma) { break; }
+                    }
+                }
+                self.expect(&TokenKind::RParen, "')'")?;
+            }
+            let body = self.block()?;
+            arms.push(MatchArm { variant, bindings, body });
+        }
+        let otherwise = if self.matches(&TokenKind::Otherwise) {
+            Some(self.block()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::End, "'end'")?;
+        Ok(Stmt::Match { scrutinee, arms, otherwise, line, col })
     }
 
     /// A statement starting `<field> of <expr>`: either a field-set

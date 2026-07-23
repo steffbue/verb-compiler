@@ -1,0 +1,17 @@
+choice Pair begin
+  Two(a, b) or
+  One(x) or
+  None
+end
+assign p Two(3, 4);
+match p begin
+  when Two(a, b) begin print(a add b); end
+  when One(x) begin print(x); end
+  otherwise begin print(0); end
+end
+assign q None;
+match q begin
+  when Two(a, b) begin print(a); end
+  otherwise begin print(99); end
+end
+print(q);
