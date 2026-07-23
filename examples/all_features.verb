@@ -1,0 +1,131 @@
+%% ============================================================
+%%  all_features.verb
+%%  One program exercising every feature landed in `main`:
+%%    records, shapes, enums + match, closures / first-class fns,
+%%    for-each (range | array | string | map), break/continue,
+%%    std map + map_keys/map_values, std io, strings.
+%%
+%%  Run (JIT, resolves `std io` / `std map` imports at run time):
+%%      verb run examples/all_features.verb
+%%  Optimised AOT build:
+%%      verb build examples/all_features.verb -O2 && ./all_features
+%% ============================================================
+
+import std io;
+import std map;
+
+%% ---- global: closures below capture this ----
+assign tax 2;
+
+%% ---- record: struct with `of` field get/set ----
+record Item begin name, price end
+
+%% ---- shape: struct with getf ----
+shape Store begin label, count end
+
+%% ---- enum: choice + match ----
+choice Event begin
+  Sale(amount) or
+  Restock(qty) or
+  Closed
+end
+
+%% ---- top-level functions (closures) ----
+make taxed(p) begin
+  return p add tax;          %% captures global `tax`
+end
+make double(n) begin
+  return n times 2;
+end
+make cube(n) begin
+  return n times n times n;
+end
+
+print("== records ==");
+assign apple Item("apple", 3);
+price of apple be price of apple add 1;   %% mutate a field
+print(name of apple);                      %% apple
+print(price of apple);                     %% 4
+print(apple);                              %% Item{name: apple, price: 4}
+
+print("== shapes ==");
+assign shop Store("Verbmart", 2);
+print(getf(shop, "label"));                %% Verbmart
+
+print("== first-class functions ==");
+assign fns list double, cube;
+print(get(fns, 0)(5));                      %% 10
+print(get(fns, 1)(3));                      %% 27
+
+print("== for-each over array (+ closure over global) ==");
+assign prices list price of apple, 5, 10;   %% 4, 5, 10
+assign total 0;
+each p in prices begin
+  total be total add taxed(p);              %% +2 each
+end
+print(total);                               %% 6+7+12 = 25
+
+print("== strings (join) ==");
+assign greeting "verb" join " " join "lang";
+print(greeting);                            %% verb lang
+
+print("== for-each over string ==");
+each ch in "abc" begin
+  print(ch);
+end
+
+print("== repeat + leave/next ==");
+assign i 0;
+repeat i trails 10 begin
+  i be i add 1;
+  assign r i mod 2;
+  check r equals 0 begin
+    next;                                   %% skip evens
+  end
+  check i beats 7 begin
+    leave;                                  %% stop past 7
+  end
+  print(i);                                 %% 1 3 5 7
+end
+
+print("== loop (c-style) + match ==");
+loop assign k 0; k trails 3; k be k add 1 begin
+  assign ev Closed;
+  check k equals 0 begin
+    ev be Sale(100);
+  end orelse check k equals 1 begin
+    ev be Restock(5);
+  end
+  match ev begin
+    when Sale(amount) begin print("sale"); print(amount); end
+    when Restock(qty) begin print("restock"); print(qty); end
+    otherwise begin print("closed"); end
+  end
+end
+
+print("== std map + iteration ==");
+assign m map_new();
+map_set(m, "apple", price of apple);
+map_set(m, "banana", 5);
+map_set(m, "cherry", 10);
+print(map_len(m));                          %% 3
+print(map_has(m, "apple"));                 %% true
+%% order of keys/values is not deterministic -> sum values instead
+assign vs map_values(m);
+assign sum 0;
+each v in vs begin
+  sum be sum add v;
+end
+print(sum);                                 %% 4+5+10 = 19
+%% for-each directly over a map iterates its keys
+assign klen 0;
+each key in m begin
+  klen be klen add 1;
+end
+print(klen);                                %% 3
+
+print("== std io (file round-trip) ==");
+assign path "verb_all_features_demo.tmp";
+file_write(path, "verb");
+file_append(path, " rocks");
+print(file_read(path));                     %% verb rocks
