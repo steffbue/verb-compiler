@@ -144,6 +144,7 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_array_set_fn();
         cg.build_array_push_fn();
         cg.build_array_pop_fn();
+        cg.build_char_at_fn();
         cg.build_retain_cell_fn();
         cg.build_release_cell_fn();
         // Built-in `Result` choice: `Ok(value)` and `Err(kind, msg)` are
@@ -1639,6 +1640,46 @@ impl<'ctx> Codegen<'ctx> {
 
     // ----- generated runtime helper: verb_array_get(arr, idx, line, col) -> value -----
 
+    /// Generated runtime helper: verb_char_at(VerbValue s, VerbValue idx)
+    /// -> VerbValue. Reads byte `idx` of the string payload and returns a
+    /// fresh +1-owned 1-char TAG_STR string allocated through `verb_alloc`,
+    /// so it carries the same 8-byte refcount header (payload-8) as every
+    /// other heap string and is tracked by retain/release and the GC live
+    /// counter. Bounds are guaranteed by the for-each loop that calls it.
+    fn build_char_at_fn(&self) {
+        let f = self.module.add_function(
+            "verb_char_at",
+            self.value_ty.fn_type(&[self.value_ty.into(), self.value_ty.into()], false),
+            None,
+        );
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let idxv = f.get_nth_param(1).unwrap().into_struct_value();
+        let i = self.payload_of(idxv); // TAG_INT payload = i64 index
+        let sptr = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "sptr").unwrap();
+        let bytep = unsafe {
+            self.builder.build_in_bounds_gep(i8t, sptr, &[i], "bytep").unwrap()
+        };
+        let byte = self.builder.build_load(i8t, bytep, "byte").unwrap().into_int_value();
+
+        // allocate a 2-byte NUL-terminated string via the GC alloc path
+        let buf = self.call_named("verb_alloc", &[i64t.const_int(2, false).into()])
+            .unwrap().into_pointer_value();
+        self.builder.build_store(buf, byte).unwrap();
+        let secondp = unsafe {
+            self.builder.build_in_bounds_gep(i8t, buf, &[i64t.const_int(1, false)], "secondp").unwrap()
+        };
+        self.builder.build_store(secondp, i8t.const_zero()).unwrap();
+
+        let payload = self.builder.build_ptr_to_int(buf, i64t, "cp").unwrap();
+        let out = self.make_val(crate::value::TAG_STR, payload);
+        self.builder.build_return(Some(&out)).unwrap();
+    }
+
     fn build_array_get_fn(&self) {
         let i32t = self.ctx.i32_type();
         let f = self.module.add_function(
@@ -2852,6 +2893,188 @@ impl<'ctx> Codegen<'ctx> {
                 let lc = *self.loops.last().expect("'next' outside loop reached codegen");
                 self.release_scopes_to_loop(lc.body_scope_depth);
                 self.builder.build_unconditional_branch(lc.continue_bb).unwrap();
+                Ok(())
+            }
+            Stmt::ForEach { name, coll, body } => {
+                use crate::value::{TAG_ARRAY, TAG_INT};
+                let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let i64t = self.ctx.i64_type();
+                let i8t = self.ctx.i8_type();
+
+                // Evaluate the collection once (+1 owned). Park it in an outer
+                // scope cell so a `return` inside the body (which calls
+                // release_all_open_scopes) frees it, and so normal loop exit
+                // frees it exactly once.
+                let collv = self.gen_expr(coll)?;
+                self.scopes.push(HashMap::new());
+                self.bind("$foreach_coll", collv);
+
+                let tag = self.tag_of(collv);
+                // Reuse the collection expression's source span for error
+                // locations (ForEach carries none of its own).
+                let (el, ec) = match coll {
+                    Expr::Var(_, l, c) => (*l, *c),
+                    Expr::Binary { line, col, .. }
+                    | Expr::Unary { line, col, .. }
+                    | Expr::Call { line, col, .. } => (*line, *col),
+                    _ => (0, 0),
+                };
+                let (lc, cc) = self.loc_consts(el, ec);
+
+                // len + kind are computed in the dispatch, read in the loop.
+                let lenp = self.builder.build_alloca(i64t, "fe.lenp").unwrap();
+                let kindp = self.builder.build_alloca(i8t, "fe.kindp").unwrap();
+                let idxp = self.builder.build_alloca(i64t, "fe.idxp").unwrap();
+                // Hoisted out of the loop body: an alloca inside `fe.body` would
+                // re-execute (and grow the stack) on every iteration under
+                // OptimizationLevel::None, since LLVM only dedupes/hoists allocas
+                // via mem2reg at higher opt levels.
+                let elemp = self.builder.build_alloca(self.value_ty, "fe.elemp").unwrap();
+
+                // Maps can only exist under `import std map`; only then is
+                // verb_map.cpp linked and `map_key_at` resolvable. Gating the
+                // whole map case on the import keeps non-map programs from
+                // referencing a symbol that isn't linked into them.
+                let has_map = self.std_imports.iter().any(|m| m == "map");
+                if has_map {
+                    for (fname, arity) in [("map_len", 1usize), ("map_key_at", 2usize)] {
+                        if self.module.get_function(fname).is_none() {
+                            let ptys: Vec<_> = (0..arity).map(|_| self.value_ty.into()).collect();
+                            self.module.add_function(fname, self.value_ty.fn_type(&ptys, false), None);
+                        }
+                    }
+                }
+
+                let arr_bb  = self.ctx.append_basic_block(f, "fe.array");
+                let str_bb  = self.ctx.append_basic_block(f, "fe.string");
+                let map_bb  = self.ctx.append_basic_block(f, "fe.map");
+                let bad_bb  = self.ctx.append_basic_block(f, "fe.badtype");
+                let setup_bb = self.ctx.append_basic_block(f, "fe.setup");
+                let cond_bb = self.ctx.append_basic_block(f, "fe.cond");
+                let body_bb = self.ctx.append_basic_block(f, "fe.body");
+                let bound_bb = self.ctx.append_basic_block(f, "fe.bound");
+                let end_bb  = self.ctx.append_basic_block(f, "fe.end");
+
+                // dispatch on runtime tag; map case only reachable under `import std map`
+                let mut tag_cases = vec![
+                    (i8t.const_int(TAG_ARRAY, false), arr_bb),
+                    (i8t.const_int(crate::value::TAG_STR, false), str_bb),
+                ];
+                if has_map {
+                    tag_cases.push((i8t.const_int(crate::value::TAG_MAP, false), map_bb));
+                }
+                self.builder.build_switch(tag, bad_bb, &tag_cases).unwrap();
+
+                // array: len = verb_array_len(coll)
+                self.builder.position_at_end(arr_bb);
+                let alen = self.call_named("verb_array_len", &[collv.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.builder.build_store(lenp, self.payload_of(alen)).unwrap();
+                self.builder.build_store(kindp, i8t.const_int(0, false)).unwrap();
+                self.builder.build_unconditional_branch(setup_bb).unwrap();
+
+                // string: len = strlen(payload), kind = 1
+                self.builder.position_at_end(str_bb);
+                let sptr = self.builder.build_int_to_ptr(self.payload_of(collv), self.ptr_ty, "fe.sptr").unwrap();
+                let slen = self.call_named("strlen", &[sptr.into()]).unwrap().into_int_value();
+                self.builder.build_store(lenp, slen).unwrap();
+                self.builder.build_store(kindp, i8t.const_int(1, false)).unwrap();
+                self.builder.build_unconditional_branch(setup_bb).unwrap();
+
+                // map: len = map_len(m), kind = 2
+                self.builder.position_at_end(map_bb);
+                if has_map {
+                    let mlen = self.call_named("map_len", &[collv.into()]).unwrap().into_struct_value();
+                    self.builder.build_store(lenp, self.payload_of(mlen)).unwrap();
+                    self.builder.build_store(kindp, i8t.const_int(2, false)).unwrap();
+                    self.builder.build_unconditional_branch(setup_bb).unwrap();
+                } else {
+                    // unreachable: no map value can exist without `import std map`,
+                    // so the tag switch never targets this block. Still terminate
+                    // it (branch to bad_bb) so the module verifies.
+                    self.builder.build_unconditional_branch(bad_bb).unwrap();
+                }
+
+                // non-iterable value: abort with its type name
+                self.builder.position_at_end(bad_bb);
+                self.abort_at(lc, cc, "cannot iterate %s", &[self.type_name(tag)]);
+
+                // setup: idx = 0
+                self.builder.position_at_end(setup_bb);
+                self.builder.build_store(idxp, i64t.const_zero()).unwrap();
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+                // cond: idx < len ?
+                self.builder.position_at_end(cond_bb);
+                let i = self.builder.build_load(i64t, idxp, "fe.i").unwrap().into_int_value();
+                let len = self.builder.build_load(i64t, lenp, "fe.len").unwrap().into_int_value();
+                let more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, i, len, "fe.more").unwrap();
+                self.builder.build_conditional_branch(more, body_bb, end_bb).unwrap();
+
+                // body: fetch element by kind, store into elemp, branch to bound
+                self.builder.position_at_end(body_bb);
+                let kind = self.builder.build_load(i8t, kindp, "fe.kind").unwrap().into_int_value();
+                let fetch_arr_bb = self.ctx.append_basic_block(f, "fe.fetch.array");
+                let fetch_str_bb = self.ctx.append_basic_block(f, "fe.fetch.string");
+                let fetch_map_bb = self.ctx.append_basic_block(f, "fe.fetch.map");
+                let mut kind_cases = vec![
+                    (i8t.const_int(0, false), fetch_arr_bb),
+                    (i8t.const_int(1, false), fetch_str_bb),
+                ];
+                if has_map {
+                    kind_cases.push((i8t.const_int(2, false), fetch_map_bb));
+                }
+                self.builder.build_switch(kind, fetch_arr_bb, &kind_cases).unwrap();
+
+                self.builder.position_at_end(fetch_arr_bb);
+                let iv = self.make_val(TAG_INT, i);
+                let elem = self.call_named("verb_array_get", &[collv.into(), iv.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.builder.build_store(elemp, elem).unwrap();
+                self.builder.build_unconditional_branch(bound_bb).unwrap();
+
+                // string: fetch the idx-th char as a fresh +1 1-char string
+                self.builder.position_at_end(fetch_str_bb);
+                let ivs = self.make_val(TAG_INT, i);
+                let selem = self.call_named("verb_char_at", &[collv.into(), ivs.into()])
+                    .unwrap().into_struct_value();
+                self.builder.build_store(elemp, selem).unwrap();
+                self.builder.build_unconditional_branch(bound_bb).unwrap();
+
+                // map: fetch the idx-th key as a fresh +1 value (map_key_at retains)
+                self.builder.position_at_end(fetch_map_bb);
+                if has_map {
+                    let ivm = self.make_val(TAG_INT, i);
+                    let melem = self.call_named("map_key_at", &[collv.into(), ivm.into()])
+                        .unwrap().into_struct_value();
+                    self.builder.build_store(elemp, melem).unwrap();
+                    self.builder.build_unconditional_branch(bound_bb).unwrap();
+                } else {
+                    // unreachable: kind is never 2 without `import std map`.
+                    self.builder.build_unreachable().unwrap();
+                }
+
+                // bound: bind element to `name` in a fresh iteration scope, run body
+                self.builder.position_at_end(bound_bb);
+                let elemv = self.builder.build_load(self.value_ty, elemp, "fe.elem").unwrap().into_struct_value();
+                self.scopes.push(HashMap::new());
+                self.bind(name, elemv);
+                self.gen_stmts(body)?;
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
+                if self.cur_block_open() {
+                    let i2 = self.builder.build_load(i64t, idxp, "fe.i2").unwrap().into_int_value();
+                    let nxt = self.builder.build_int_add(i2, i64t.const_int(1, false), "fe.next").unwrap();
+                    self.builder.build_store(idxp, nxt).unwrap();
+                    self.builder.build_unconditional_branch(cond_bb).unwrap();
+                }
+
+                // end: release the collection (outer scope cell)
+                self.builder.position_at_end(end_bb);
+                if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
                 Ok(())
             }
             Stmt::Fn { name, params, body, .. } => {
@@ -4098,6 +4321,7 @@ const MAP_FUNCS: &[(&str, usize)] = &[
     ("map_has", 2),
     ("map_remove", 2),
     ("map_len", 1),
+    ("map_key_at", 2),
 ];
 
 fn map_func_arity(name: &str) -> Option<usize> {
@@ -4198,6 +4422,8 @@ fn stmt_line(stmt: &Stmt) -> Option<u32> {
         Stmt::For { line, .. } => Some(*line),
         Stmt::Break { line, .. } => Some(*line),
         Stmt::Continue { line, .. } => Some(*line),
+        // ForEach carries no line/col of its own (see its codegen arm).
+        Stmt::ForEach { .. } => None,
         Stmt::Return { .. } => None,
     }
 }

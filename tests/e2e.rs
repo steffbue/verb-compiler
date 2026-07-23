@@ -437,6 +437,61 @@ fn break_word_gets_rename_hint() {
 }
 
 #[test]
+fn foreach_over_range_counts_half_open() {
+    run_ok("foreach_range");
+}
+
+#[test]
+fn foreach_over_empty_range_runs_zero_times() {
+    run_ok("foreach_range_empty");
+}
+
+#[test]
+fn foreach_over_array_visits_every_element() {
+    run_ok("foreach_array");
+}
+
+#[test]
+fn foreach_over_array_is_leak_free() {
+    assert_no_leaks("foreach_array");
+}
+
+#[test]
+fn foreach_early_return_is_leak_free() {
+    assert_no_leaks("foreach_array_early_return");
+}
+
+#[test]
+fn foreach_early_return_output() {
+    run_ok("foreach_array_early_return");
+}
+
+#[test]
+fn foreach_over_non_iterable_is_runtime_error() {
+    run_err("err_foreach_not_iterable", "cannot iterate int");
+}
+
+#[test]
+fn foreach_over_string_visits_each_char() {
+    run_ok("foreach_string");
+}
+
+#[test]
+fn foreach_over_string_is_leak_free() {
+    assert_no_leaks("foreach_string");
+}
+
+#[test]
+fn foreach_over_empty_string_runs_zero_times() {
+    run_ok("foreach_empty_string");
+}
+
+#[test]
+fn foreach_over_empty_string_is_leak_free() {
+    assert_no_leaks("foreach_empty_string");
+}
+
+#[test]
 fn functions() { run_ok("functions"); }
 
 #[test]
@@ -1300,6 +1355,27 @@ fn build_links_and_runs_a_program_using_std_map() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 
     let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_runs_foreach_over_map_keys() {
+    let out_path = std::env::temp_dir().join("verb_e2e_foreach_map_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/foreach_map.verb", "-o", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/foreach_map.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn foreach_over_map_is_leak_free() {
+    assert_no_leaks("foreach_map");
 }
 
 #[test]

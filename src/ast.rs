@@ -28,6 +28,7 @@ pub enum Stmt {
     If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>>, line: u32, col: u32 },
     While { cond: Expr, body: Vec<Stmt>, line: u32, col: u32 },
     For { init: Box<Stmt>, cond: Expr, incr: Box<Stmt>, body: Vec<Stmt>, line: u32, col: u32 }, // loop init; cond; incr begin … end
+    ForEach { name: String, coll: Expr, body: Vec<Stmt> }, // each x in <coll> begin … end
     Break { line: u32, col: u32 },     // leave;   -- exit innermost loop
     Continue { line: u32, col: u32 },  // next;    -- jump to next iteration
     Fn { name: String, params: Vec<String>, body: Vec<Stmt>, line: u32, col: u32 },
@@ -183,6 +184,15 @@ fn collect_free_stmt(
             collect_free_stmt(init, bound, out, seen);
             collect_free_expr(cond, bound, out, seen);
             collect_free_stmt(incr, bound, out, seen);
+            collect_free_stmts(body, bound, out, seen);
+            bound.pop();
+        }
+        Stmt::ForEach { name, coll, body } => {
+            // The collection is evaluated in the enclosing scope (a use); the
+            // loop variable binds a fresh frame visible only in the body.
+            collect_free_expr(coll, bound, out, seen);
+            bound.push(HashSet::new());
+            bound.last_mut().unwrap().insert(name.clone());
             collect_free_stmts(body, bound, out, seen);
             bound.pop();
         }

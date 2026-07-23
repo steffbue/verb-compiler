@@ -1,0 +1,17 @@
+%% return from inside a for-each body: exercises release_all_open_scopes
+%% freeing both the parked collection cell ($foreach_coll) and the live
+%% per-iteration element cell, without a double-free from the (unreached)
+%% loop-end release.
+make find_first_over(xs, threshold) begin
+  each n in xs begin
+    check n trails threshold begin
+      print(n);
+    end orelse begin
+      return n;
+    end
+  end
+  return neg 1;
+end
+
+assign xs list 1, 2, 3, 40, 5;
+print(find_first_over(xs, 10));

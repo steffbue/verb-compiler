@@ -1,0 +1,14 @@
+import std map;
+
+assign m map_new();
+map_set(m, "a", 1);
+map_set(m, "b", 2);
+map_set(m, "c", 3);
+assign total 0;
+assign count 0;
+each k in m begin
+  total be total add map_get(m, k);
+  count be count add 1;
+end
+print(total);
+print(count);

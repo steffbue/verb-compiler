@@ -525,6 +525,12 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
                 collect_from_stmts(std::slice::from_ref(init), out);
                 collect_from_stmts(body, out);
             }
+            Stmt::ForEach { name, body, .. } => {
+                if !out.vars.contains(name) {
+                    out.vars.push(name.clone());
+                }
+                collect_from_stmts(body, out);
+            }
             Stmt::Block(inner, ..) => collect_from_stmts(inner, out),
             // A `shape` type name is callable as its positional constructor.
             Stmt::Shape { name, fields, .. } => out.functions.push((name.clone(), fields.len())),
