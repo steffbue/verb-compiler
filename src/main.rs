@@ -170,12 +170,36 @@ fn usage() -> ! {
     eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
     eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]");
     eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]  (alias for build)");
+    eprintln!("       verb targets   (list supported cross-compile targets, marking the host)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
+    eprintln!("       for --target all, each -L<dir> prefers a per-target subdir <dir>/<os>-<arch> when present");
     exit(2)
+}
+
+/// Prints the six supported cross-compile targets (label + LLVM triple),
+/// marking the one matching this host with `(host)`. Dispatched before
+/// `parse_cli` so it needs no `<file.verb>` argument.
+fn print_targets() {
+    use inkwell::targets::TargetMachine;
+    let host_triple = TargetMachine::get_default_triple();
+    let host_str = host_triple.as_str().to_string_lossy().into_owned();
+    let host = targets::Target::from_host_triple(&host_str);
+    for t in targets::ALL {
+        let marker = if Some(t) == host { "  (host)" } else { "" };
+        println!("{:<16} {}{}", t.label(), t.llvm_triple(), marker);
+    }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // `verb targets` takes no file argument, so it must be handled before
+    // `parse_cli`, which returns `None` (→ usage) whenever `files` is empty.
+    if args.get(1).map(String::as_str) == Some("targets") {
+        print_targets();
+        return;
+    }
+
     let parsed = parse_cli(&args).unwrap_or_else(|| usage());
 
     let mut sources: Vec<(String, String)> = Vec::new();
@@ -439,7 +463,13 @@ fn build_aot_cross(
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
-    for dir in lib_dirs {
+    // Per-target `-L` resolution: for `--target all` (and any single cross
+    // build) each `-L<dir>` prefers a `<dir>/<label>` subdir holding that
+    // target's single-arch libraries, falling back to the bare `<dir>` when
+    // absent. Fixes arch-mismatch link failures when one flat `-L` served all
+    // six targets. See Target::resolve_lib_dirs.
+    let resolved = target.resolve_lib_dirs(lib_dirs);
+    for dir in &resolved {
         cmd.arg(dir);
     }
     for lib in imports {

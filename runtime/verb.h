@@ -90,7 +90,23 @@ template <> inline int         unwrap<int>(VerbValue v)         { return verb_as
 template <typename T> VerbValue wrap(T v);
 template <> inline VerbValue wrap<int64_t>(int64_t v)         { return verb_int(v); }
 template <> inline VerbValue wrap<double>(double v)           { return verb_float(v); }
-template <> inline VerbValue wrap<const char*>(const char* v) { return verb_string(v); }
+// A callable returning `const char*` may hand back any pointer (a malloc'd
+// buffer, a string literal, a static). Verb strings must live in a
+// `verb_alloc`-headed block (8-byte refcount at ptr-8) so that the GC can
+// retain/release them; stuffing the raw pointer into a VerbValue corrupts
+// allocator metadata the first time Verb retains it (SIGTRAP). Defensively
+// copy into a Verb-owned buffer. Ownership caveat: the callee's original
+// buffer is never freed here — the FFI boundary can't know its free
+// convention — so a malloc'd return leaks its own copy (invisible to the
+// verb_gc_live leak counter, which only tracks verb_alloc blocks).
+template <> inline VerbValue wrap<const char*>(const char* v) {
+    if (!v) return verb_nil();
+    size_t n = strlen(v);
+    char* out = static_cast<char*>(verb_alloc(static_cast<int64_t>(n) + 1));
+    if (!out) return verb_nil();
+    memcpy(out, v, n + 1);
+    return verb_string(out);
+}
 template <> inline VerbValue wrap<int>(int v)                 { return verb_bool(v); }
 
 inline VerbValue wrap_void() { return verb_nil(); }

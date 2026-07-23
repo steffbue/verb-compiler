@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <cstdio>
 
+// Returns a malloc'd buffer. Verb defensively copies `const char*` returns
+// into a verb_alloc'd block (see wrap<const char*> in runtime/verb.h), so
+// this original buffer is never freed and leaks — acceptable at the FFI
+// boundary, and invisible to the verb_gc_live leak counter.
 static const char* shout_impl(const char* in) {
     size_t len = std::strlen(in);
     char* out = static_cast<char*>(std::malloc(len + 2));

@@ -384,6 +384,11 @@ fn build_mathlib_fixture() -> std::path::PathBuf {
             "-std=c++17",
             "-Iruntime",
             "-dynamiclib",
+            // wrap<const char*> now references verb_alloc (defensive-copy fix,
+            // runtime/verb.h). verb_alloc is defined in the *host* verb
+            // executable's generated module, not this dylib, so allow it to be
+            // resolved at load time rather than failing the dylib link.
+            "-undefined", "dynamic_lookup",
             "-o", lib_path.to_str().unwrap(),
             "tests/fixtures/cpp/mathlib.cpp",
         ])
@@ -1067,4 +1072,191 @@ fn integration_example_cross_builds_all_targets() {
             .unwrap_or_else(|e| panic!("missing output for {label} at {expected_path:?}: {e}"));
         assert!(meta.len() > 0, "empty output for {label}");
     }
+}
+
+// --- Tier 2 Task 2: FFI string ABI (defensive-copy of `const char*` returns) ---
+
+/// Regression for the SIGTRAP-on-retain FFI string bug: `c_shout` returns a
+/// bare malloc'd `const char*`; assigning it to a Verb variable retains it,
+/// which (pre-fix) writes an 8-byte refcount at ptr-8 into malloc metadata and
+/// crashes (exit 133). With the defensive copy in wrap<const char*> the string
+/// lives in a verb_alloc'd block and the assignment/print works.
+#[test]
+fn ffi_string_return_can_be_retained() {
+    let lib_dir = build_mathlib_fixture();
+    build_and_run_ok("ffi_string_retain", &lib_dir);
+}
+
+/// The defensive copy must not leak on the Verb side: the copied buffer is a
+/// verb_alloc block and must reach refcount 0 by exit (verb_gc_live=0). The
+/// callee's *original* malloc'd buffer leaks but is invisible to this counter
+/// (it only tracks verb_alloc blocks), so the count stays 0.
+#[test]
+fn ffi_string_return_retain_is_leak_free() {
+    let lib_dir = build_mathlib_fixture();
+    let out_path = std::env::temp_dir().join("verb_test_ffi_string_retain_leak");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/ffi_string_retain.verb",
+            "-o", out_path.to_str().unwrap(),
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path)
+        .env("VERB_GC_DEBUG", "1")
+        .env("DYLD_LIBRARY_PATH", &lib_dir)
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("no verb_gc_live line in stdout:\n{stdout}"));
+    assert_eq!(live_line, "verb_gc_live=0", "leaked heap objects:\n{stdout}");
+    let _ = std::fs::remove_file(&out_path);
+}
+
+// --- Tier 4 Task A: `verb targets` command ---
+
+/// `verb targets` lists all six supported targets and marks exactly one host.
+#[test]
+fn targets_command_lists_all_targets_and_marks_host() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["targets"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "verb targets failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for label in ["linux-x86_64", "linux-arm64", "macos-x86_64", "macos-arm64", "windows-x86_64", "windows-arm64"] {
+        assert!(stdout.contains(label), "missing target {label} in:\n{stdout}");
+    }
+    let host_markers = stdout.matches("(host)").count();
+    assert_eq!(host_markers, 1, "expected exactly one (host) marker, got {host_markers}:\n{stdout}");
+}
+
+// --- Tier 2 Task 1: per-target `-L` resolution for cross builds ---
+
+/// Builds `tests/fixtures/cpp/mathlib.cpp` for a specific cross target into a
+/// caller-chosen directory as a static `libmathlib.a` (for `-L<dir>`), used to
+/// exercise per-target `-L` subdir resolution. Callers must guard with
+/// `zig_available()`.
+fn build_mathlib_into(dir: &std::path::Path, zig_triple: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let obj_path = dir.join("mathlib.o");
+    let compile = Command::new("zig")
+        .args([
+            "c++", "-target", zig_triple, "-std=c++17", "-Iruntime", "-c",
+            "tests/fixtures/cpp/mathlib.cpp", "-o", obj_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to invoke zig c++");
+    assert!(compile.status.success(), "zig c++ failed: {}", String::from_utf8_lossy(&compile.stderr));
+    let lib_path = dir.join("libmathlib.a");
+    let archive = Command::new("zig")
+        .args(["ar", "rcs", lib_path.to_str().unwrap(), obj_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke zig ar");
+    assert!(archive.status.success(), "zig ar failed: {}", String::from_utf8_lossy(&archive.stderr));
+    let _ = std::fs::remove_file(&obj_path);
+}
+
+/// Maps this host to a (label, zig_triple) pair for cross-build-to-host tests,
+/// or `None` when the host os/arch isn't one of the six supported targets.
+fn host_label_and_zig_triple() -> Option<(String, &'static str)> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    let label = format!("{os}-{arch}");
+    let target = verb::targets::Target::parse(&label).ok()?;
+    Some((label, target.zig_triple()))
+}
+
+/// With `--target <host-label>`, a `-L<dir>` where the matching library lives
+/// only in the per-target subdir `<dir>/<label>` must still resolve — proving
+/// `Target::resolve_lib_dirs` rewrites the token to the subdir. If it didn't,
+/// `-lmathlib` would be unresolved and the link would fail.
+#[test]
+fn cross_build_resolves_per_target_lib_subdir() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let Some((label, zig_triple)) = host_label_and_zig_triple() else {
+        eprintln!("skipping: host os/arch not a supported target");
+        return;
+    };
+    let root = std::env::temp_dir().join("verb_e2e_per_target_L_subdir");
+    let _ = std::fs::remove_dir_all(&root);
+    let libs = root.join("libs");
+    build_mathlib_into(&libs.join(&label), zig_triple);
+
+    let bin = root.join("app");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/import_mathlib.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", &label,
+            &format!("-L{}", libs.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build with per-target -L subdir failed (resolve_lib_dirs did not pick <dir>/{label}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = std::fs::metadata(&bin).expect("missing output binary");
+    assert!(meta.len() > 0, "empty output binary");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Flat `-L<dir>` layout (library directly in `<dir>`, no per-target subdir)
+/// keeps working: `resolve_lib_dirs` falls back to the bare token. Backward
+/// compatibility guard for the per-target resolution change.
+#[test]
+fn cross_build_flat_lib_dir_still_works() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let Some((label, zig_triple)) = host_label_and_zig_triple() else {
+        eprintln!("skipping: host os/arch not a supported target");
+        return;
+    };
+    let root = std::env::temp_dir().join("verb_e2e_flat_L_dir");
+    let _ = std::fs::remove_dir_all(&root);
+    let libs = root.join("libs");
+    build_mathlib_into(&libs, zig_triple); // flat: no per-target subdir
+
+    let bin = root.join("app");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/import_mathlib.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", &label,
+            &format!("-L{}", libs.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build with flat -L dir failed (fallback broken): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = std::fs::metadata(&bin).expect("missing output binary");
+    assert!(meta.len() > 0, "empty output binary");
+    let _ = std::fs::remove_dir_all(&root);
 }

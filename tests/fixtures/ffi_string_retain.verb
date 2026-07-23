@@ -1,0 +1,4 @@
+import mod mathlib;
+
+assign s c_shout("hi");
+print(s);
