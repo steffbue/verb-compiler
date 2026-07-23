@@ -1,0 +1,7 @@
+shape Point begin x, y end
+assign p Point(3, 4);
+print(getf(p, "x"));
+print(getf(p, "y"));
+setf(p, "y", 99);
+print(getf(p, "y"));
+print(p);

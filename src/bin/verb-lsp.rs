@@ -271,6 +271,7 @@ fn hover(msg: &Value, docs: &HashMap<String, String>) -> Option<Value> {
 
     let text = keyword_doc(&word)
         .map(str::to_string)
+        .or_else(|| builtin_func_doc(&word).map(|(module, arity)| builtin_func_text(&word, module, arity)))
         .or_else(|| {
             let symbols = collect_symbols(src);
             symbols
@@ -323,7 +324,7 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
         "begin" => "opens a block (Verb has no `{ }`).",
         "end" => "closes a block opened by `begin`.",
         "import" => "`import mod <lib>;` / `import std <module>;` — must appear before any other top-level statement.",
-        "std" => "`import std io;` — built-in stdlib module (file/stdin/TCP I/O), no user-written C++ shim needed.",
+        "std" => "`import std <module>;` — built-in stdlib module, no user-written C++ shim needed. Four modules exist: `io` (file/stdin/TCP I/O), `map` (hash maps), `thread` (OS threads/mutex/channel), `time` (clocks/sleep).",
         "true" => "boolean literal `true`.",
         "false" => "boolean literal `false`.",
         "nil" => "the null / not-yet-initialized value.",
@@ -348,6 +349,73 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
     })
 }
 
+/// Fixed name -> (stdlib module, arity) table for every built-in stdlib
+/// function, mirroring the authoritative tables in `src/codegen.rs`
+/// (`IO_FUNCS`, `MAP_FUNCS`, `THREAD_FUNCS`, `TIME_FUNCS`) plus
+/// `thread_spawn`, which codegen dispatches through bespoke codegen
+/// (`gen_thread_spawn`) rather than a table lookup, since its closure
+/// argument can't cross the C++ boundary as a plain `VerbValue`. These
+/// are a distinct hover/completion category from both keywords
+/// (`keyword_doc`) and user-defined functions (`collect_symbols`):
+/// they're only meaningful once the matching `import std <module>;`
+/// is present, but are still worth surfacing unconditionally so a user
+/// typing `thread_join(...)` gets its arity and origin module on hover
+/// without having to go look at the runtime source.
+const BUILTIN_FUNCS: &[(&str, &str, usize)] = &[
+    // std io (see IO_FUNCS in src/codegen.rs)
+    ("read_line", "io", 0),
+    ("file_read", "io", 1),
+    ("file_write", "io", 2),
+    ("file_append", "io", 2),
+    ("tcp_connect", "io", 2),
+    ("tcp_listen", "io", 1),
+    ("tcp_accept", "io", 1),
+    ("send_line", "io", 2),
+    ("recv_line", "io", 1),
+    ("close_conn", "io", 1),
+    // std map (see MAP_FUNCS in src/codegen.rs)
+    ("map_new", "map", 0),
+    ("map_set", "map", 3),
+    ("map_get", "map", 2),
+    ("map_has", "map", 2),
+    ("map_remove", "map", 2),
+    ("map_len", "map", 1),
+    // std thread (see THREAD_FUNCS in src/codegen.rs; thread_spawn has no
+    // table entry there, but does have one here -- see doc comment above)
+    ("thread_spawn", "thread", 1),
+    ("thread_join", "thread", 1),
+    ("thread_sleep_ms", "thread", 1),
+    ("mutex_new", "thread", 0),
+    ("mutex_lock", "thread", 1),
+    ("mutex_unlock", "thread", 1),
+    ("channel_new", "thread", 0),
+    ("channel_send", "thread", 2),
+    ("channel_recv", "thread", 1),
+    // std time (see TIME_FUNCS in src/codegen.rs)
+    ("now_ms", "time", 0),
+    ("monotonic_ms", "time", 0),
+    ("sleep_ms", "time", 1),
+    ("clock_ms", "time", 0),
+    ("difftime_ms", "time", 2),
+    ("linux_clock_gettime_ns", "time", 1),
+    ("linux_nanosleep_ns", "time", 1),
+    ("win_filetime_100ns", "time", 0),
+    ("win_sleep_ms", "time", 1),
+];
+
+/// Looks up a stdlib builtin's `(module, arity)` by name, or `None` if
+/// `word` isn't one. See `BUILTIN_FUNCS`.
+fn builtin_func_doc(word: &str) -> Option<(&'static str, usize)> {
+    BUILTIN_FUNCS.iter().find(|(n, _, _)| *n == word).map(|(_, module, arity)| (*module, *arity))
+}
+
+/// Renders the shared hover/completion-detail text for a builtin, e.g.
+/// "built-in `std thread` function `thread_join` (1 parameter)."
+fn builtin_func_text(name: &str, module: &str, arity: usize) -> String {
+    let plural = if arity == 1 { "" } else { "s" };
+    format!("built-in `std {module}` function `{name}` ({arity} parameter{plural}).")
+}
+
 // ----- completion -----
 
 fn completion_items(src: &str) -> Value {
@@ -366,6 +434,14 @@ fn completion_items(src: &str) -> Value {
             "label": word,
             "kind": KEYWORD_KIND,
             "detail": keyword_doc(word).unwrap_or_default(),
+        }));
+    }
+
+    for (name, module, arity) in BUILTIN_FUNCS {
+        items.push(json!({
+            "label": name,
+            "kind": FUNCTION_KIND,
+            "detail": builtin_func_text(name, module, *arity),
         }));
     }
 
@@ -429,7 +505,7 @@ fn collect_symbols(src: &str) -> Symbols {
 fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
     for stmt in stmts {
         match stmt {
-            Stmt::Assign { name, .. } | Stmt::Declare { name } => {
+            Stmt::Assign { name, .. } | Stmt::Declare { name, .. } => {
                 if !out.vars.contains(name) {
                     out.vars.push(name.clone());
                 }
@@ -445,7 +521,9 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
                 }
             }
             Stmt::While { body, .. } => collect_from_stmts(body, out),
-            Stmt::Block(inner) => collect_from_stmts(inner, out),
+            Stmt::Block(inner, ..) => collect_from_stmts(inner, out),
+            // A `shape` type name is callable as its positional constructor.
+            Stmt::Shape { name, fields, .. } => out.functions.push((name.clone(), fields.len())),
             Stmt::Record { name, .. } => {
                 if !out.vars.contains(name) {
                     out.vars.push(name.clone());
@@ -464,7 +542,7 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
                     collect_from_stmts(ob, out);
                 }
             }
-            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_)
+            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(..)
             | Stmt::FieldSet { .. } => {}
         }
     }

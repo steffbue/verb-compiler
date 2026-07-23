@@ -21,15 +21,16 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    Assign { name: String, value: Expr },                    // assign x expr;
-    Declare { name: String },                                // declare x;  (starts as nil)
-    Reassign { name: String, value: Expr, line: u32, col: u32 }, // x be expr;
-    ExprStmt(Expr),
-    If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>> },
-    While { cond: Expr, body: Vec<Stmt> },
+    Assign { name: String, value: Expr, line: u32, col: u32 },
+    Declare { name: String, line: u32, col: u32 },
+    Reassign { name: String, value: Expr, line: u32, col: u32 },
+    ExprStmt(Expr, u32, u32),
+    If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>>, line: u32, col: u32 },
+    While { cond: Expr, body: Vec<Stmt>, line: u32, col: u32 },
     Fn { name: String, params: Vec<String>, body: Vec<Stmt>, line: u32, col: u32 },
+    Shape { name: String, fields: Vec<String>, line: u32, col: u32 },      // shape Name begin f1, f2 end
     Return { value: Option<Expr> },
-    Block(Vec<Stmt>),
+    Block(Vec<Stmt>, u32, u32),
     Record { name: String, fields: Vec<String>, line: u32, col: u32 }, // record Name begin f, g end
     FieldSet { obj: Expr, field: String, value: Expr, line: u32, col: u32 }, // <field> of <expr> be <value>;
     // choice Name begin V1(a, b) or V2(c) or V3 end -- a tagged-union type
@@ -69,6 +70,7 @@ pub struct Program {
     pub imports: Vec<String>,
     pub std_imports: Vec<String>,
     pub extern_sigs: Vec<ExternSig>,
+    pub verb_imports: Vec<String>,
     pub body: Vec<Stmt>,
 }
 
@@ -135,11 +137,11 @@ fn collect_free_stmt(
     seen: &mut HashSet<String>,
 ) {
     match s {
-        Stmt::Assign { name, value } => {
+        Stmt::Assign { name, value, .. } => {
             collect_free_expr(value, bound, out, seen);
             bound.last_mut().unwrap().insert(name.clone());
         }
-        Stmt::Declare { name } => {
+        Stmt::Declare { name, .. } => {
             bound.last_mut().unwrap().insert(name.clone());
         }
         Stmt::Reassign { name, value, .. } => {
@@ -148,13 +150,13 @@ fn collect_free_stmt(
             note_free(name, bound, out, seen);
             collect_free_expr(value, bound, out, seen);
         }
-        Stmt::ExprStmt(e) => collect_free_expr(e, bound, out, seen),
+        Stmt::ExprStmt(e, ..) => collect_free_expr(e, bound, out, seen),
         Stmt::Return { value } => {
             if let Some(e) = value {
                 collect_free_expr(e, bound, out, seen);
             }
         }
-        Stmt::If { cond, then_body, else_body } => {
+        Stmt::If { cond, then_body, else_body, .. } => {
             collect_free_expr(cond, bound, out, seen);
             bound.push(HashSet::new());
             collect_free_stmts(then_body, bound, out, seen);
@@ -165,13 +167,13 @@ fn collect_free_stmt(
                 bound.pop();
             }
         }
-        Stmt::While { cond, body } => {
+        Stmt::While { cond, body, .. } => {
             collect_free_expr(cond, bound, out, seen);
             bound.push(HashSet::new());
             collect_free_stmts(body, bound, out, seen);
             bound.pop();
         }
-        Stmt::Block(stmts) => {
+        Stmt::Block(stmts, ..) => {
             bound.push(HashSet::new());
             collect_free_stmts(stmts, bound, out, seen);
             bound.pop();
@@ -186,6 +188,7 @@ fn collect_free_stmt(
             }
         }
         Stmt::Record { .. } => {}
+        Stmt::Shape { .. } => {}
         Stmt::FieldSet { obj, value, .. } => {
             collect_free_expr(obj, bound, out, seen);
             collect_free_expr(value, bound, out, seen);
