@@ -152,7 +152,7 @@ reference (same underlying array), not by contents.
 collection. It dispatches on the value at runtime:
 
     each n in nums begin print(n); end     %% array: each element
-    each ch in "abc" begin print(ch); end  %% string: each char (1-char string)
+    each ch in "abc" begin print(ch); end  %% string: each byte (1-byte string)
     each k in m begin print(map_get(m,k)); end  %% map: each key
 
 There is also a counting form over a half-open integer range `[a, b)`:
@@ -163,6 +163,8 @@ There is also a counting form over a half-open integer range `[a, b)`:
 - Iterating a non-collection (`each x in 42`) is a runtime error.
 - The collection length is snapshot at entry — don't mutate the
   collection you're iterating.
+- Strings iterate **byte by byte** (each byte becomes a 1-byte string);
+  a multibyte UTF-8 character is split across iterations.
 - Map keys iterate in unspecified order; use `map_get(m, key)` for the
   value. Map for-each needs `import std map`, so build with
   `verb build` (JIT `verb run` does not support std imports).

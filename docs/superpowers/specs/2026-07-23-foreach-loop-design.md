@@ -49,7 +49,7 @@ collection value's runtime tag:
 | Runtime type   | `<name>` binds to                         |
 |----------------|-------------------------------------------|
 | array (`list`) | each element, index `0 .. len-1`          |
-| string         | each character, as a 1-char string        |
+| string         | each byte, as a 1-byte string (UTF-8 multibyte chars split) |
 | map            | each **key** (use `map_get(m, name)` for the value) |
 | (range head)   | each int in `[a, b)` — see above          |
 
