@@ -396,30 +396,46 @@ fn run_with_lib_ok(fixture: &str, lib_dir: &std::path::Path) {
 
 #[test]
 fn run_imports_a_cpp_library_and_calls_extern_functions() {
-    // import mod under the JIT: dlopen the fixture lib, resolve externs,
-    // and (via c_shout returning a string) exercise the verb_alloc forwarder.
+    // import mod under the JIT: dlopen the fixture lib, resolve every one of
+    // its five mod externs, and call each one successfully.
     let lib_dir = build_mathlib_fixture();
     run_with_lib_ok("import_mathlib", &lib_dir);
 }
 
+#[test]
+fn run_mixes_mod_std_io_and_std_map_imports() {
+    let _ = std::fs::remove_file("verb_jit_all_imports.tmp");
+    let lib_dir = build_mathlib_fixture();
+    run_with_lib_ok("jit_all_imports", &lib_dir);
+}
+
 /// Compiles tests/fixtures/cpp/mathlib.cpp into a shared library once per
 /// test run and returns the directory it landed in (for `-L`).
+///
+/// Several tests in this file call this helper, and `cargo test` runs them
+/// concurrently on multiple threads by default. Without memoizing the build,
+/// concurrent calls would race to write the same `libmathlib.dylib` path,
+/// letting one test dlopen a half-written/truncated library. `OnceLock`
+/// ensures the `c++` invocation happens exactly once per process.
 fn build_mathlib_fixture() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("verb_e2e_cpp_libs");
-    std::fs::create_dir_all(&dir).unwrap();
-    let lib_path = dir.join("libmathlib.dylib");
-    let status = Command::new("c++")
-        .args([
-            "-std=c++17",
-            "-Iruntime",
-            "-dynamiclib",
-            "-o", lib_path.to_str().unwrap(),
-            "tests/fixtures/cpp/mathlib.cpp",
-        ])
-        .status()
-        .expect("failed to invoke c++ to build the mathlib test fixture");
-    assert!(status.success(), "failed to compile tests/fixtures/cpp/mathlib.cpp");
-    dir
+    static LIB_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    LIB_DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("verb_e2e_cpp_libs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib_path = dir.join("libmathlib.dylib");
+        let status = Command::new("c++")
+            .args([
+                "-std=c++17",
+                "-Iruntime",
+                "-dynamiclib",
+                "-o", lib_path.to_str().unwrap(),
+                "tests/fixtures/cpp/mathlib.cpp",
+            ])
+            .status()
+            .expect("failed to invoke c++ to build the mathlib test fixture");
+        assert!(status.success(), "failed to compile tests/fixtures/cpp/mathlib.cpp");
+        dir
+    }).clone()
 }
 
 fn build_and_run_ok(name: &str, lib_dir: &std::path::Path) {

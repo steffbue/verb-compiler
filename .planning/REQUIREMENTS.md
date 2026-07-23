@@ -37,6 +37,12 @@ Requirements for the current milestone. Each maps to a roadmap phase.
   `VERB_EXPORT(name, arity, callable)` line in `runtime/verb.h`, instead of
   hand-writing the `extern "C" VerbValue` wrapper
 
+- [x] **FFI-V2-01**: Developer can run `verb run program.verb` (JIT) with
+  `import mod <lib>`, `import std io`, and/or `import std map` and have the
+  imports resolved at JIT time — mod libraries via `dlopen`/`dlsym`, `std`
+  modules via compiled-in symbol registration — instead of `verb run`
+  rejecting the program; originally deferred to v2, delivered in Phase 8
+
 ### Standard Library I/O & Multi-File Programs
 
 - [x] **STDIO-01**: Developer can write `import std io;` and read stdin,
@@ -131,7 +137,6 @@ Deferred to a future milestone. Tracked but not in current roadmap.
 
 ### Native Interop
 
-- **FFI-V2-01**: JIT-mode (`verb run`) support for imports
 - **FFI-V2-02**: Typed, checked per-function extern signatures, beyond the
   current untyped VerbValue ABI
 
@@ -181,13 +186,14 @@ Which phases cover which requirements.
 | HOUSEKEEP-01 | Phase 8 | Complete |
 | INTEG-01 | Phase 8 | Complete |
 | INTEG-02 | Phase 8 | Complete |
+| FFI-V2-01 | Phase 8 | Complete |
 
 **Coverage:**
 
-- v1 requirements: 20 total
-- Mapped to phases: 20
+- v1 requirements: 21 total
+- Mapped to phases: 21
 - Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-07-21*
-*Last updated: 2026-07-21 after initial ingest-based roadmap creation*
+*Last updated: 2026-07-23 after FFI-V2-01 (JIT import support) landed in Phase 8*

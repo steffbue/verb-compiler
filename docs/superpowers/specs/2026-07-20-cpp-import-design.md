@@ -97,7 +97,7 @@ pub struct Program {
 3. Pass `-l<name>` for each entry in `imports`.
 4. New repeatable CLI flag on `verb build`: `-L<dir>`, passed through as additional linker search paths.
 
-`verb run` (JIT): if `!program.imports.is_empty()`, reject with a compile-time-style error before attempting to JIT ("imports require 'verb build' — JIT does not support extern C++ calls in v1"). JIT-side `dlopen`/`dlsym` support for imports is out of scope, deferred to v2.
+`verb run` (JIT): as of this spec, if `!program.imports.is_empty()`, reject with a compile-time-style error before attempting to JIT ("imports require 'verb build' — JIT does not support extern C++ calls in v1"). JIT-side `dlopen`/`dlsym` support for imports was out of scope here, deferred to v2 — it has since shipped under **FFI-V2-01**; see `docs/superpowers/specs/2026-07-23-jit-import-support-design.md` for the `verb run` JIT-import design (mod libs via `dlopen`, `std io`/`std map` via compiled-in symbol registration).
 
 ## Testing
 
@@ -108,4 +108,4 @@ pub struct Program {
 
 ## Out of scope (v2+)
 
-Package manager/fetching, C++ header parsing/auto-binding, classes/templates/overloads/name demangling, JIT-mode (`verb run`) extern support, extern functions as first-class values, typed per-function signatures, compile-time symbol/typo checking, non-identifier library names.
+Package manager/fetching, C++ header parsing/auto-binding, classes/templates/overloads/name demangling, ~~JIT-mode (`verb run`) extern support~~ (now supported — see **FFI-V2-01** and `docs/superpowers/specs/2026-07-23-jit-import-support-design.md`), extern functions as first-class values, typed per-function signatures, compile-time symbol/typo checking, non-identifier library names.

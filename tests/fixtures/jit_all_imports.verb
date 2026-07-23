@@ -1,0 +1,10 @@
+import mod mathlib;
+import std io;
+import std map;
+
+assign m map_new();
+map_set(m, "greet", "hi");
+print(c_shout(map_get(m, "greet")));
+print(c_add_int(2, 3));
+assign ok file_write("verb_jit_all_imports.tmp", "data");
+print(map_len(m));
