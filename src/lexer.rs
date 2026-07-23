@@ -3,7 +3,7 @@ use crate::error::CompileError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
-    Assign, Be, Declare, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
+    Assign, Be, Declare, Make, Return, Check, Orelse, Repeat, Loop, Each, In, To, True, False, Nil, Begin, End,
     Import, Mod, Std, List,
     Add, Sub, Neg, Times, Div,
     Equals, Differs, Trails, Beats, Atmost, Atleast,
@@ -40,7 +40,7 @@ impl TokenKind {
 pub fn renamed_keyword(word: &str) -> Option<&'static str> {
     Some(match word {
         "fn" => "make", "if" => "check", "else" => "orelse",
-        "while" => "repeat", "for" => "loop",
+        "while" => "repeat", "for" => "loop", "foreach" => "each",
         "plus" => "add", "minus" => "sub (or prefix 'neg')", "mul" => "times",
         "c" => "join",
         "eqeq" => "equals", "neq" => "differs",
@@ -158,7 +158,7 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), Compil
                 use TokenKind::*;
                 let kind = match word.as_str() {
                     "assign" => Assign, "be" => Be, "declare" => Declare, "make" => Make, "return" => Return,
-                    "check" => Check, "orelse" => Orelse, "repeat" => Repeat, "loop" => Loop,
+                    "check" => Check, "orelse" => Orelse, "repeat" => Repeat, "loop" => Loop, "each" => Each, "in" => In, "to" => To,
                     "true" => True, "false" => False, "nil" => Nil,
                     "begin" => Begin, "end" => End,
                     "import" => Import, "mod" => Mod, "std" => Std, "list" => List,
@@ -274,6 +274,23 @@ mod tests {
         assert_eq!(
             kinds("import std io;"),
             vec![Import, Std, Ident("io".into()), Semi, Eof]
+        );
+    }
+
+    #[test]
+    fn lexes_foreach_keywords() {
+        use TokenKind::*;
+        let ts = lex("each x in xs begin end").unwrap();
+        let kinds: Vec<_> = ts.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![Each, Ident("x".into()), In, Ident("xs".into()), Begin, End, Eof]
+        );
+        let ts2 = lex("each i in 0 to 5 begin end").unwrap();
+        let kinds2: Vec<_> = ts2.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds2,
+            vec![Each, Ident("i".into()), In, Int(0), To, Int(5), Begin, End, Eof]
         );
     }
 
