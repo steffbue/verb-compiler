@@ -146,6 +146,29 @@ argument to any of these functions is a runtime error, same as other
 type/bounds errors in Verb. `eqeq`/`neq` on two arrays compares them by
 reference (same underlying array), not by contents.
 
+## For-each loops
+
+`each <name> in <collection> begin … end` visits every element of a
+collection. It dispatches on the value at runtime:
+
+    each n in nums begin print(n); end     %% array: each element
+    each ch in "abc" begin print(ch); end  %% string: each char (1-char string)
+    each k in m begin print(map_get(m,k)); end  %% map: each key
+
+There is also a counting form over a half-open integer range `[a, b)`:
+
+    each x in 0 to 5 begin print(x); end   %% 0 1 2 3 4
+
+- The loop variable is scoped to the body and fresh each iteration.
+- Iterating a non-collection (`each x in 42`) is a runtime error.
+- The collection length is snapshot at entry — don't mutate the
+  collection you're iterating.
+- Map keys iterate in unspecified order; use `map_get(m, key)` for the
+  value. Map for-each needs `import std map`, so build with
+  `verb build` (JIT `verb run` does not support std imports).
+
+See `docs/superpowers/specs/2026-07-23-foreach-loop-design.md`.
+
 ## Standard library maps (`import std map`)
 
 `import std map;` gives Verb programs a hash-map (dictionary) type,
