@@ -94,6 +94,10 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_cmp_fns();
         cg.build_eq_fn();
         cg.build_concat_fn();
+        cg.build_str_len_fn();
+        cg.build_str_index_fn();
+        cg.build_str_slice_fn();
+        cg.build_str_split_fn();
         cg.build_neg_fn();
         cg.build_check_call_fn();
         cg.build_array_len_fn();
@@ -130,6 +134,8 @@ impl<'ctx> Codegen<'ctx> {
         self.module.add_function("strcpy", pt.fn_type(&[pt.into(), pt.into()], false), None);
         self.module.add_function("strcat", pt.fn_type(&[pt.into(), pt.into()], false), None);
         self.module.add_function("strcmp", i32t.fn_type(&[pt.into(), pt.into()], false), None);
+        self.module.add_function("strstr", pt.fn_type(&[pt.into(), pt.into()], false), None);
+        self.module.add_function("memcpy", pt.fn_type(&[pt.into(), pt.into(), i64t.into()], false), None);
         self.module.add_function("free", self.ctx.void_type().fn_type(&[pt.into()], false), None);
         self.module.add_function("getenv", pt.fn_type(&[pt.into()], false), None);
         self.module.add_function(
@@ -1037,6 +1043,317 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(err_bb);
         self.abort_at(line, col, "'join' needs strings, got %s and %s",
                       &[self.type_name(ta), self.type_name(tb)]);
+    }
+
+    // ----- generated runtime helper: verb_str_len(value, i32, i32) -> value(int) -----
+
+    /// `str_len(s)` — length in bytes of a Verb string. Aborts if `s` is
+    /// not a string. Pure read of the literal/heap buffer; allocates nothing.
+    fn build_str_len_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_str_len",
+            self.value_ty.fn_type(&[self.value_ty.into(), i32t.into(), i32t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let bad_bb = self.ctx.append_basic_block(f, "bad");
+        self.builder.position_at_end(entry);
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let line = f.get_nth_param(1).unwrap().into_int_value();
+        let col = f.get_nth_param(2).unwrap().into_int_value();
+        let tag = self.tag_of(s);
+        let is_str = self.builder.build_int_compare(
+            EQ, tag, self.ctx.i8_type().const_int(TAG_STR, false), "isstr").unwrap();
+        self.builder.build_conditional_branch(is_str, ok_bb, bad_bb).unwrap();
+
+        self.builder.position_at_end(bad_bb);
+        self.abort_at(line, col, "'str_len' needs a string, got %s", &[self.type_name(tag)]);
+
+        self.builder.position_at_end(ok_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "sp").unwrap();
+        let n = self.call_named("strlen", &[sp.into()]).unwrap().into_int_value();
+        let rv = self.make_val(TAG_INT, n);
+        self.builder.build_return(Some(&rv)).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_str_index(s, sub, i32, i32) -> value(int) -----
+
+    /// `str_index(s, sub)` — byte offset of the first occurrence of `sub`
+    /// in `s`, or -1 if absent. Uses libc `strstr`; allocates nothing.
+    fn build_str_index_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_str_index",
+            self.value_ty.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let bad_bb = self.ctx.append_basic_block(f, "bad");
+        self.builder.position_at_end(entry);
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let sub = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+        let i8t = self.ctx.i8_type();
+        let ts = self.tag_of(s);
+        let tsub = self.tag_of(sub);
+        let ss = self.builder.build_int_compare(EQ, ts, i8t.const_int(TAG_STR, false), "ss").unwrap();
+        let subs = self.builder.build_int_compare(EQ, tsub, i8t.const_int(TAG_STR, false), "subs").unwrap();
+        let both = self.builder.build_and(ss, subs, "both").unwrap();
+        self.builder.build_conditional_branch(both, ok_bb, bad_bb).unwrap();
+
+        self.builder.position_at_end(bad_bb);
+        self.abort_at(line, col, "'str_index' needs strings, got %s and %s",
+                      &[self.type_name(ts), self.type_name(tsub)]);
+
+        self.builder.position_at_end(ok_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "sp").unwrap();
+        let subp = self.builder.build_int_to_ptr(self.payload_of(sub), self.ptr_ty, "subp").unwrap();
+        let hit = self.call_named("strstr", &[sp.into(), subp.into()]).unwrap().into_pointer_value();
+        let hit_int = self.builder.build_ptr_to_int(hit, i64t, "hit").unwrap();
+        let is_null = self.builder.build_int_compare(EQ, hit_int, i64t.const_zero(), "isnull").unwrap();
+        let sp_int = self.builder.build_ptr_to_int(sp, i64t, "spi").unwrap();
+        let diff = self.builder.build_int_sub(hit_int, sp_int, "diff").unwrap();
+        let neg1 = i64t.const_int((-1i64) as u64, true);
+        let res = self.builder.build_select(is_null, neg1, diff, "idx").unwrap().into_int_value();
+        let rv = self.make_val(TAG_INT, res);
+        self.builder.build_return(Some(&rv)).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_str_slice(s, start, end, i32, i32) -> value(str) -----
+
+    /// `str_slice(s, start, end)` — a NEW heap string holding bytes
+    /// `[start, end)` of `s`. Always `verb_alloc`s a fresh block (refcount
+    /// 1) and `memcpy`s into it, so slicing a literal never aliases the
+    /// literal's static (sentinel-headed) buffer. Bounds are checked
+    /// (`0 <= start <= end <= len`) and violations `abort_at`.
+    fn build_str_slice_fn(&self) {
+        use inkwell::IntPredicate::{EQ, SLT, SGT};
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let i8t = self.ctx.i8_type();
+        let f = self.module.add_function(
+            "verb_str_slice",
+            self.value_ty.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), self.value_ty.into(),
+                  i32t.into(), i32t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let typeok_bb = self.ctx.append_basic_block(f, "typeok");
+        let badtype_bb = self.ctx.append_basic_block(f, "badtype");
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let oob_bb = self.ctx.append_basic_block(f, "oob");
+        self.builder.position_at_end(entry);
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let start_v = f.get_nth_param(1).unwrap().into_struct_value();
+        let end_v = f.get_nth_param(2).unwrap().into_struct_value();
+        let line = f.get_nth_param(3).unwrap().into_int_value();
+        let col = f.get_nth_param(4).unwrap().into_int_value();
+        let ts = self.tag_of(s);
+        let is_str = self.builder.build_int_compare(EQ, ts, i8t.const_int(TAG_STR, false), "isstr").unwrap();
+        let tstart = self.tag_of(start_v);
+        let tend = self.tag_of(end_v);
+        let si = self.builder.build_int_compare(EQ, tstart, i8t.const_int(TAG_INT, false), "si").unwrap();
+        let ei = self.builder.build_int_compare(EQ, tend, i8t.const_int(TAG_INT, false), "ei").unwrap();
+        let ints_ok = self.builder.build_and(si, ei, "intsok").unwrap();
+        let all_ok = self.builder.build_and(is_str, ints_ok, "allok").unwrap();
+        self.builder.build_conditional_branch(all_ok, typeok_bb, badtype_bb).unwrap();
+
+        self.builder.position_at_end(badtype_bb);
+        self.abort_at(line, col, "'str_slice' needs a string and two ints, got %s[%s..%s]",
+                      &[self.type_name(ts), self.type_name(tstart), self.type_name(tend)]);
+
+        self.builder.position_at_end(typeok_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "sp").unwrap();
+        let len = self.call_named("strlen", &[sp.into()]).unwrap().into_int_value();
+        let start = self.payload_of(start_v);
+        let end = self.payload_of(end_v);
+        let start_neg = self.builder.build_int_compare(SLT, start, i64t.const_zero(), "startneg").unwrap();
+        let end_lt_start = self.builder.build_int_compare(SLT, end, start, "endltstart").unwrap();
+        let end_gt_len = self.builder.build_int_compare(SGT, end, len, "endgtlen").unwrap();
+        let bad1 = self.builder.build_or(start_neg, end_lt_start, "bad1").unwrap();
+        let bad = self.builder.build_or(bad1, end_gt_len, "bad").unwrap();
+        self.builder.build_conditional_branch(bad, oob_bb, ok_bb).unwrap();
+
+        self.builder.position_at_end(oob_bb);
+        self.abort_at(line, col, "str_slice out of bounds: start=%lld end=%lld len=%lld",
+                      &[start.into(), end.into(), len.into()]);
+
+        self.builder.position_at_end(ok_bb);
+        let n = self.builder.build_int_sub(end, start, "n").unwrap();
+        let size = self.builder.build_int_add(n, i64t.const_int(1, false), "sz").unwrap();
+        let buf = self.call_named("verb_alloc", &[size.into()]).unwrap().into_pointer_value();
+        let src = unsafe { self.builder.build_in_bounds_gep(i8t, sp, &[start], "src") }.unwrap();
+        self.call_named("memcpy", &[buf.into(), src.into(), n.into()]);
+        let term = unsafe { self.builder.build_in_bounds_gep(i8t, buf, &[n], "term") }.unwrap();
+        self.builder.build_store(term, i8t.const_zero()).unwrap();
+        let bits = self.builder.build_ptr_to_int(buf, i64t, "bits").unwrap();
+        let rv = self.make_val(TAG_STR, bits);
+        self.builder.build_return(Some(&rv)).unwrap();
+    }
+
+    // ----- generated runtime helper: verb_str_split(s, sep, i32, i32) -> value(array) -----
+
+    /// `str_split(s, sep)` — a NEW array whose elements are fresh heap
+    /// strings, the pieces of `s` between occurrences of `sep`. The array
+    /// header, its element buffer, and every piece are separate `verb_alloc`
+    /// blocks (refcount 1), so the existing GC array cascade releases them
+    /// all — no new GC plumbing. An empty separator yields a single-element
+    /// array holding a fresh copy of `s`.
+    fn build_str_split_fn(&self) {
+        use inkwell::IntPredicate::EQ;
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let i8t = self.ctx.i8_type();
+        let f = self.module.add_function(
+            "verb_str_split",
+            self.value_ty.fn_type(
+                &[self.value_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()], false), None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let typeok_bb = self.ctx.append_basic_block(f, "typeok");
+        let badtype_bb = self.ctx.append_basic_block(f, "badtype");
+        let single_bb = self.ctx.append_basic_block(f, "single");
+        let countinit_bb = self.ctx.append_basic_block(f, "countinit");
+        let count_cond_bb = self.ctx.append_basic_block(f, "count.cond");
+        let count_body_bb = self.ctx.append_basic_block(f, "count.body");
+        let count_done_bb = self.ctx.append_basic_block(f, "count.done");
+        let fill_cond_bb = self.ctx.append_basic_block(f, "fill.cond");
+        let fill_next_bb = self.ctx.append_basic_block(f, "fill.next");
+        let fill_done_bb = self.ctx.append_basic_block(f, "fill.done");
+
+        self.builder.position_at_end(entry);
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let sep = f.get_nth_param(1).unwrap().into_struct_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+        let ts = self.tag_of(s);
+        let tsep = self.tag_of(sep);
+        let ss = self.builder.build_int_compare(EQ, ts, i8t.const_int(TAG_STR, false), "ss").unwrap();
+        let seps = self.builder.build_int_compare(EQ, tsep, i8t.const_int(TAG_STR, false), "seps").unwrap();
+        let both = self.builder.build_and(ss, seps, "both").unwrap();
+        self.builder.build_conditional_branch(both, typeok_bb, badtype_bb).unwrap();
+
+        self.builder.position_at_end(badtype_bb);
+        self.abort_at(line, col, "'str_split' needs strings, got %s and %s",
+                      &[self.type_name(ts), self.type_name(tsep)]);
+
+        // Loop bookkeeping (allocas in entry-block idiom via entry_alloca).
+        let curp = self.entry_alloca(self.ptr_ty.into(), "curp");
+        let countp = self.entry_alloca(i64t.into(), "countp");
+        let ip = self.entry_alloca(i64t.into(), "ip");
+        let hdrp = self.entry_alloca(self.ptr_ty.into(), "hdrp");
+        let elemsp_slot = self.entry_alloca(self.ptr_ty.into(), "elemsslot");
+
+        self.builder.position_at_end(typeok_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "sp").unwrap();
+        let sepp = self.builder.build_int_to_ptr(self.payload_of(sep), self.ptr_ty, "sepp").unwrap();
+        let seplen = self.call_named("strlen", &[sepp.into()]).unwrap().into_int_value();
+        let sep_empty = self.builder.build_int_compare(EQ, seplen, i64t.const_zero(), "sepempty").unwrap();
+        self.builder.build_conditional_branch(sep_empty, single_bb, countinit_bb).unwrap();
+
+        // --- empty-separator fast path: array of one fresh copy of s ---
+        self.builder.position_at_end(single_bb);
+        let hdr1 = self.call_named("verb_alloc", &[i64t.const_int(24, false).into()])
+            .unwrap().into_pointer_value();
+        let elems1 = self.call_named("verb_alloc", &[i64t.const_int(16, false).into()])
+            .unwrap().into_pointer_value();
+        let slen = self.call_named("strlen", &[sp.into()]).unwrap().into_int_value();
+        let sz1 = self.builder.build_int_add(slen, i64t.const_int(1, false), "sz1").unwrap();
+        let buf1 = self.call_named("verb_alloc", &[sz1.into()]).unwrap().into_pointer_value();
+        self.call_named("memcpy", &[buf1.into(), sp.into(), slen.into()]);
+        let term1 = unsafe { self.builder.build_in_bounds_gep(i8t, buf1, &[slen], "term1") }.unwrap();
+        self.builder.build_store(term1, i8t.const_zero()).unwrap();
+        let strv1 = self.make_val(TAG_STR, self.builder.build_ptr_to_int(buf1, i64t, "b1").unwrap());
+        let slot1 = unsafe {
+            self.builder.build_in_bounds_gep(self.value_ty, elems1, &[i64t.const_zero()], "slot1")
+        }.unwrap();
+        self.builder.build_store(slot1, strv1).unwrap();
+        self.store_array_header(hdr1, i64t.const_int(1, false), elems1);
+        let arr1 = self.make_val(TAG_ARRAY, self.builder.build_ptr_to_int(hdr1, i64t, "a1").unwrap());
+        self.builder.build_return(Some(&arr1)).unwrap();
+
+        // --- pass 1: count pieces (= 1 + number of separator occurrences) ---
+        self.builder.position_at_end(countinit_bb);
+        self.builder.build_store(countp, i64t.const_int(1, false)).unwrap();
+        self.builder.build_store(curp, sp).unwrap();
+        self.builder.build_unconditional_branch(count_cond_bb).unwrap();
+
+        self.builder.position_at_end(count_cond_bb);
+        let cur1 = self.builder.build_load(self.ptr_ty, curp, "cur1").unwrap().into_pointer_value();
+        let hit1 = self.call_named("strstr", &[cur1.into(), sepp.into()]).unwrap().into_pointer_value();
+        let hit1_int = self.builder.build_ptr_to_int(hit1, i64t, "hit1i").unwrap();
+        let isnull1 = self.builder.build_int_compare(EQ, hit1_int, i64t.const_zero(), "isnull1").unwrap();
+        self.builder.build_conditional_branch(isnull1, count_done_bb, count_body_bb).unwrap();
+
+        self.builder.position_at_end(count_body_bb);
+        let cnt = self.builder.build_load(i64t, countp, "cnt").unwrap().into_int_value();
+        let cnt1 = self.builder.build_int_add(cnt, i64t.const_int(1, false), "cnt1").unwrap();
+        self.builder.build_store(countp, cnt1).unwrap();
+        let next1 = unsafe { self.builder.build_in_bounds_gep(i8t, hit1, &[seplen], "next1") }.unwrap();
+        self.builder.build_store(curp, next1).unwrap();
+        self.builder.build_unconditional_branch(count_cond_bb).unwrap();
+
+        // --- allocate the array, then pass 2: fill it ---
+        self.builder.position_at_end(count_done_bb);
+        let count = self.builder.build_load(i64t, countp, "count").unwrap().into_int_value();
+        let hdr = self.call_named("verb_alloc", &[i64t.const_int(24, false).into()])
+            .unwrap().into_pointer_value();
+        let bytes = self.builder.build_int_mul(count, i64t.const_int(16, false), "bytes").unwrap();
+        let elems = self.malloc_bytes_dyn(bytes);
+        self.builder.build_store(hdrp, hdr).unwrap();
+        self.builder.build_store(elemsp_slot, elems).unwrap();
+        self.builder.build_store(ip, i64t.const_zero()).unwrap();
+        self.builder.build_store(curp, sp).unwrap();
+        self.builder.build_unconditional_branch(fill_cond_bb).unwrap();
+
+        self.builder.position_at_end(fill_cond_bb);
+        let cur = self.builder.build_load(self.ptr_ty, curp, "cur").unwrap().into_pointer_value();
+        let hit = self.call_named("strstr", &[cur.into(), sepp.into()]).unwrap().into_pointer_value();
+        let hit_int = self.builder.build_ptr_to_int(hit, i64t, "hiti").unwrap();
+        let isnull = self.builder.build_int_compare(EQ, hit_int, i64t.const_zero(), "isnull").unwrap();
+        let cur_int = self.builder.build_ptr_to_int(cur, i64t, "curi").unwrap();
+        let curlen = self.call_named("strlen", &[cur.into()]).unwrap().into_int_value();
+        let end_if_null = self.builder.build_int_add(cur_int, curlen, "endnull").unwrap();
+        let end_int = self.builder.build_select(isnull, end_if_null, hit_int, "endi").unwrap().into_int_value();
+        let piece = self.builder.build_int_sub(end_int, cur_int, "piece").unwrap();
+        let psz = self.builder.build_int_add(piece, i64t.const_int(1, false), "psz").unwrap();
+        let buf = self.call_named("verb_alloc", &[psz.into()]).unwrap().into_pointer_value();
+        self.call_named("memcpy", &[buf.into(), cur.into(), piece.into()]);
+        let term = unsafe { self.builder.build_in_bounds_gep(i8t, buf, &[piece], "term") }.unwrap();
+        self.builder.build_store(term, i8t.const_zero()).unwrap();
+        let strv = self.make_val(TAG_STR, self.builder.build_ptr_to_int(buf, i64t, "bufi").unwrap());
+        let i = self.builder.build_load(i64t, ip, "i").unwrap().into_int_value();
+        let elems_now = self.builder.build_load(self.ptr_ty, elemsp_slot, "elemsnow").unwrap().into_pointer_value();
+        let slot = unsafe { self.builder.build_in_bounds_gep(self.value_ty, elems_now, &[i], "slot") }.unwrap();
+        self.builder.build_store(slot, strv).unwrap();
+        let i1 = self.builder.build_int_add(i, i64t.const_int(1, false), "i1").unwrap();
+        self.builder.build_store(ip, i1).unwrap();
+        self.builder.build_conditional_branch(isnull, fill_done_bb, fill_next_bb).unwrap();
+
+        self.builder.position_at_end(fill_next_bb);
+        let next = unsafe { self.builder.build_in_bounds_gep(i8t, hit, &[seplen], "next") }.unwrap();
+        self.builder.build_store(curp, next).unwrap();
+        self.builder.build_unconditional_branch(fill_cond_bb).unwrap();
+
+        self.builder.position_at_end(fill_done_bb);
+        let hdr_f = self.builder.build_load(self.ptr_ty, hdrp, "hdrf").unwrap().into_pointer_value();
+        let elems_f = self.builder.build_load(self.ptr_ty, elemsp_slot, "elemsf").unwrap().into_pointer_value();
+        self.store_array_header(hdr_f, count, elems_f);
+        let arr = self.make_val(TAG_ARRAY, self.builder.build_ptr_to_int(hdr_f, i64t, "arri").unwrap());
+        self.builder.build_return(Some(&arr)).unwrap();
+    }
+
+    /// Writes {len, cap=len, elems} into an array header block laid out like
+    /// `array_ty` (see `Expr::ArrayLit`).
+    fn store_array_header(&self, hdr: PointerValue<'ctx>, len: IntValue<'ctx>, elems: PointerValue<'ctx>) {
+        let lenp = self.builder.build_struct_gep(self.array_ty, hdr, 0, "lenp").unwrap();
+        self.builder.build_store(lenp, len).unwrap();
+        let capp = self.builder.build_struct_gep(self.array_ty, hdr, 1, "capp").unwrap();
+        self.builder.build_store(capp, len).unwrap();
+        let elemsp = self.builder.build_struct_gep(self.array_ty, hdr, 2, "elemsp").unwrap();
+        self.builder.build_store(elemsp, elems).unwrap();
     }
 
     fn build_neg_fn(&self) {
@@ -2868,6 +3185,59 @@ impl<'ctx> Codegen<'ctx> {
                 let rv = self.call_named("verb_array_pop", &[arr.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
                 self.call_named("verb_release_value", &[arr.into()]);
+                return Ok(rv);
+            }
+            if name == "str_len" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("str_len takes exactly 1 argument", line, col));
+                }
+                let s = self.gen_expr(&args[0])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_str_len", &[s.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[s.into()]);
+                return Ok(rv);
+            }
+            if name == "str_index" {
+                if args.len() != 2 {
+                    return Err(CompileError::new("str_index takes exactly 2 arguments", line, col));
+                }
+                let s = self.gen_expr(&args[0])?;
+                let sub = self.gen_expr(&args[1])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_str_index", &[s.into(), sub.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[s.into()]);
+                self.call_named("verb_release_value", &[sub.into()]);
+                return Ok(rv);
+            }
+            if name == "str_slice" {
+                if args.len() != 3 {
+                    return Err(CompileError::new("str_slice takes exactly 3 arguments", line, col));
+                }
+                let s = self.gen_expr(&args[0])?;
+                let start = self.gen_expr(&args[1])?;
+                let end = self.gen_expr(&args[2])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named(
+                    "verb_str_slice", &[s.into(), start.into(), end.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[s.into()]);
+                self.call_named("verb_release_value", &[start.into()]);
+                self.call_named("verb_release_value", &[end.into()]);
+                return Ok(rv);
+            }
+            if name == "str_split" {
+                if args.len() != 2 {
+                    return Err(CompileError::new("str_split takes exactly 2 arguments", line, col));
+                }
+                let s = self.gen_expr(&args[0])?;
+                let sep = self.gen_expr(&args[1])?;
+                let (lc, cc) = self.loc_consts(line, col);
+                let rv = self.call_named("verb_str_split", &[s.into(), sep.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[s.into()]);
+                self.call_named("verb_release_value", &[sep.into()]);
                 return Ok(rv);
             }
             // record construction: `Point(3, 4)` -> heap struct value

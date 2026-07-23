@@ -196,6 +196,17 @@ fn arith() { run_ok("arith"); }
 fn strings() { run_ok("strings"); }
 
 #[test]
+fn string_methods_len_slice_index_split() { run_ok("strings_methods"); }
+
+#[test]
+fn string_split_result_array_leaks_nothing() { assert_no_leaks("gc_string_split"); }
+
+#[test]
+fn string_slice_out_of_bounds_aborts() {
+    run_err("err_str_slice_bounds", "str_slice out of bounds: start=0 end=5 len=2");
+}
+
+#[test]
 fn type_error_aborts() {
     run_err("err_types", "runtime error [1:9]: 'add' needs numbers, got int and string");
 }
@@ -985,6 +996,7 @@ fn gc_no_leaks_across_all_heap_kinds() {
         "enums_basic", "enums_nested", "gc_enums",
         "closures_capture_local", "closures_capture_param",
         "closures_counter", "closures_by_value", "gc_closures_capture",
+        "strings_methods", "gc_string_split",
     ] {
         assert_no_leaks(fixture);
     }

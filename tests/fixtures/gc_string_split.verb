@@ -1,0 +1,6 @@
+assign parts str_split("a,b,c,d", ",");
+print(len(parts));
+assign parts str_split("x,y", ",");
+print(len(parts));
+assign slice str_slice("hello world", 0, 5);
+print(slice);

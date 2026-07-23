@@ -1,0 +1,1 @@
+print(str_slice("hi", 0, 5));
