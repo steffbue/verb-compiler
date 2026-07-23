@@ -1,0 +1,4 @@
+each x in 3 to 3 begin
+  print(x);
+end
+print("done");

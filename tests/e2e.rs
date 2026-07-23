@@ -170,6 +170,16 @@ fn declare_vars() { run_ok("declare"); }
 fn control() { run_ok("control"); }
 
 #[test]
+fn foreach_over_range_counts_half_open() {
+    run_ok("foreach_range");
+}
+
+#[test]
+fn foreach_over_empty_range_runs_zero_times() {
+    run_ok("foreach_range_empty");
+}
+
+#[test]
 fn functions() { run_ok("functions"); }
 
 #[test]
