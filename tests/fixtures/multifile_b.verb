@@ -1,4 +1,6 @@
 %% entry file: uses the function defined in multifile_a.verb
+import mod multifile_a.verb;
+
 print(double(21));
 assign total 0;
 loop assign i 1; i atmost 3; i be i add 1 begin

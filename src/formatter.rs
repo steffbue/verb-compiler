@@ -202,6 +202,7 @@ fn token_text(tok: &Token) -> String {
         Mod => "mod".into(),
         Std => "std".into(),
         List => "list".into(),
+        Shape => "shape".into(),
         Add => "add".into(),
         Sub => "sub".into(),
         Neg => "neg".into(),
@@ -258,6 +259,14 @@ mod tests {
         assert_eq!(
             fmt("import   mod    mathlib ;   import std   io ;\nprint(1);"),
             "import mod mathlib;\nimport std io;\nprint(1);\n"
+        );
+    }
+
+    #[test]
+    fn formats_verb_file_import_statement() {
+        assert_eq!(
+            fmt("import   mod   utils.verb  ;\nprint(1);"),
+            "import mod utils.verb;\nprint(1);\n"
         );
     }
 
@@ -362,5 +371,60 @@ mod tests {
     #[test]
     fn formats_list_literal() {
         assert_eq!(fmt("assign a list 1,   2,3;"), "assign a list 1, 2, 3;\n");
+    }
+
+    #[test]
+    fn formats_std_module_import_statements() {
+        assert_eq!(
+            fmt("import   std    thread ;\nprint(1);"),
+            "import std thread;\nprint(1);\n"
+        );
+        assert_eq!(
+            fmt("import  std map;\nprint(1);"),
+            "import std map;\nprint(1);\n"
+        );
+        assert_eq!(
+            fmt("import std   time ;\nprint(1);"),
+            "import std time;\nprint(1);\n"
+        );
+    }
+
+    #[test]
+    fn formats_stdlib_call_expressions() {
+        assert_eq!(
+            fmt("import std thread;\nthread_join( t ) ;"),
+            "import std thread;\nthread_join(t);\n"
+        );
+        assert_eq!(
+            fmt("import std thread;\nmutex_lock(  m );"),
+            "import std thread;\nmutex_lock(m);\n"
+        );
+        assert_eq!(
+            fmt("import std time;\nprint( now_ms(  ) );"),
+            "import std time;\nprint(now_ms());\n"
+        );
+        assert_eq!(
+            fmt("import std map;\nassign m   map_new() ;"),
+            "import std map;\nassign m map_new();\n"
+        );
+    }
+
+    #[test]
+    fn formats_thread_spawn_with_function_value_argument() {
+        // Verb has no separate closure/lambda syntax — a "function value"
+        // passed to a stdlib call like `thread_spawn` is just the bare
+        // `Ident` naming a `make`-defined function, formatted exactly like
+        // any other identifier argument.
+        let src = "import   std thread ;\n\nassign counter 0;\n\nmake bump() begin\n  counter be counter add 1;\nend\n\nassign t   thread_spawn( bump ) ;\nthread_join(t) ;\nprint(counter);\n";
+        let expected = "import std thread;\n\nassign counter 0;\n\nmake bump() begin\n  counter be counter add 1;\nend\n\nassign t thread_spawn(bump);\nthread_join(t);\nprint(counter);\n";
+        assert_eq!(fmt(src), expected);
+    }
+
+    #[test]
+    fn is_idempotent_across_new_stdlib_constructs() {
+        let src = "import std thread;\nimport std map;\nimport std time;\n\nassign m map_new();\nmap_set(m, \"a\", 1);\n\nassign start now_ms();\nassign lock mutex_new();\n\nmake bump() begin\n  mutex_lock(lock);\n  map_set(m, \"count\", map_get(m, \"a\") add 1);\n  mutex_unlock(lock);\nend\n\nassign t thread_spawn(bump);\nthread_join(t);\nprint(difftime_ms(now_ms(), start) atleast 0);\n";
+        let once = fmt(src);
+        let twice = fmt(&once);
+        assert_eq!(once, twice);
     }
 }

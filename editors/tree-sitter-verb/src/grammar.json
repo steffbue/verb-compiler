@@ -88,8 +88,17 @@
                   "type": "FIELD",
                   "name": "library",
                   "content": {
-                    "type": "SYMBOL",
-                    "name": "identifier"
+                    "type": "CHOICE",
+                    "members": [
+                      {
+                        "type": "SYMBOL",
+                        "name": "verb_file"
+                      },
+                      {
+                        "type": "SYMBOL",
+                        "name": "identifier"
+                      }
+                    ]
                   }
                 }
               ]
@@ -950,6 +959,17 @@
     "identifier": {
       "type": "PATTERN",
       "value": "[A-Za-z_][A-Za-z0-9_]*"
+    },
+    "verb_file": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "PATTERN",
+          "value": "[A-Za-z_][A-Za-z0-9_]*\\.verb"
+        }
+      }
     },
     "int": {
       "type": "PATTERN",

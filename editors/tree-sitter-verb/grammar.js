@@ -57,6 +57,9 @@ module.exports = grammar({
       ),
 
     // `import mod <library>;` (generic C++ extern library) or
+    // `import mod <name>.verb;` (multi-file `verb` import — see
+    // src/lexer.rs's `.verb` suffix folding, around its `VERB_SUFFIX`
+    // handling, and src/parser.rs's `verb_imports` tracking) or
     // `import std <module>;` (built-in stdlib module, e.g. `io`) — see
     // README.md's "Importing C++ libraries" / "Standard library I/O"
     // sections. Both must appear before any other top-level statement;
@@ -65,7 +68,7 @@ module.exports = grammar({
       seq(
         "import",
         choice(
-          seq("mod", field("library", $.identifier)),
+          seq("mod", field("library", choice($.verb_file, $.identifier))),
           seq("std", field("module", $.identifier)),
         ),
         ";",
@@ -207,6 +210,21 @@ module.exports = grammar({
     // ----- literals & tokens -----
 
     identifier: (_) => /[A-Za-z_][A-Za-z0-9_]*/,
+
+    // Mirrors src/lexer.rs's `.verb` suffix folding: a literal `.verb`
+    // directly after an identifier, at a word boundary, lexes as part of
+    // the SAME token (e.g. `utils.verb` is one `Ident`, not `utils` + `.`
+    // + `verb`). Only used for `import_statement`'s `library` field —
+    // scoped there instead of folded into the general `identifier` rule
+    // above, and never used for the `module` field of `import std
+    // <module>;`, which never takes a `.verb` suffix. `prec(1, ...)` is
+    // defensive: it's already the longer match (tree-sitter's lexer
+    // prefers longest match first), so this just makes the intended
+    // priority explicit for `utils.verb` vs. plain `utils`. Inputs like
+    // `utils.verbose` are a hard lex error in the real compiler; here we
+    // only need `utils.verb;` to parse as one token distinct from
+    // `utils` + `.verbose`, not to replicate that error exactly.
+    verb_file: (_) => token(prec(1, /[A-Za-z_][A-Za-z0-9_]*\.verb/)),
 
     int: (_) => /[0-9]+/,
     float: (_) => /[0-9]+\.[0-9]+/,
