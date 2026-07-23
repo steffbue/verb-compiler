@@ -1,0 +1,8 @@
+import std thread;
+
+assign ch channel_new();
+assign ok channel_send(ch, "nope");
+print(ok);
+assign ok2 channel_send(ch, 7);
+print(ok2);
+print(channel_recv(ch));

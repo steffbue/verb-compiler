@@ -1,0 +1,3 @@
+import mod diamond_shared.verb;
+
+print("b");

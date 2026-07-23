@@ -181,6 +181,24 @@ end
             (identifier)))))))
 
 ==================
+import mod (plain library) / import mod (.verb file) / import std
+==================
+
+import mod mathlib;
+import mod utils.verb;
+import std io;
+
+---
+
+(source_file
+  (import_statement
+    (identifier))
+  (import_statement
+    (verb_file))
+  (import_statement
+    (identifier)))
+
+==================
 function definition and call
 ==================
 

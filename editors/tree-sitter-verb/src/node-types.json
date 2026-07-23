@@ -931,6 +931,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "verb_file",
+            "named": true
           }
         ]
       },
@@ -1533,6 +1537,10 @@
   },
   {
     "type": "true",
+    "named": true
+  },
+  {
+    "type": "verb_file",
     "named": true
   }
 ]

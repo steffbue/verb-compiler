@@ -81,11 +81,45 @@ Verb programs can call `extern "C"` functions from a native library:
 
       verb build examples/uses_mathlib.verb -o out -Lpath/to/libs
 
-- `verb run` (JIT) does not support imports — programs using `import mod`
-  must be built with `verb build`/`compile`, not run.
+- `verb run` (JIT) executes `import mod` programs in-process too, but the
+  library must be a **shared** library findable via `-L`/default loader
+  paths — static `.a` archives still require `verb build`/`compile`.
 
 See `docs/superpowers/specs/2026-07-20-cpp-import-design.md` for the full
 design.
+
+## Importing other Verb files
+
+`import mod` also pulls in another Verb source file, not just a C++
+library — the CLI itself now only ever takes a single entry file, so
+multi-file programs are built entirely through this:
+
+    %% utils.verb
+    make double(x) begin
+      return x times 2;
+    end
+
+    %% main.verb
+    import mod utils.verb;
+
+    print(double(21));
+
+- Disambiguation is purely by name: `import mod <name>;` (no `.verb`
+  suffix) is a C++ library; `import mod <name>.verb;` is a Verb source
+  file.
+- The path is a bare filename (no `/`, no subdirectories in v1), resolved
+  relative to the directory of the file doing the importing — not the
+  current working directory.
+- Imports are recursive (an imported file can `import mod` further files)
+  and deduplicated (the same file imported from two places is only
+  included once). A file that imports itself, directly or transitively,
+  is a compile error.
+- Everything imported lands in one flat global scope, same as if it had
+  all been written in one file — there's no `utils.helper()`-style
+  qualified access in v1.
+
+See `docs/superpowers/specs/2026-07-21-verb-file-import-design.md` for the
+full design.
 
 ## Standard library I/O (`import std io`)
 
@@ -105,10 +139,11 @@ Available functions: `read_line()`, `file_read(path)`,
 `send_line(fd, s)`, `recv_line(fd)`, `close_conn(fd)`. Every function
 returns `nil` on failure — check with `check x eq nil`.
 
-- Only `io` and `map` modules exist in v1 (`import std io;` / `import std
-  map;`); an unrecognized module name after `std` is a compile error.
+- Only `io`, `map`, and `time` modules exist in v1 (`import std io;` /
+  `import std map;` / `import std time;`); an unrecognized module name
+  after `std` is a compile error.
 - Like `import mod`, `import std io;` must appear before any other
-  top-level statement, and `verb run` (JIT) does not support it — use
+  top-level statement. `verb run` (JIT) executes it in-process, same as
   `verb build`/`compile`.
 - Cross-compiling to a Windows target (`--target windows-x86_64` /
   `windows-arm64`) with `import std io;` is not supported in v1 — the
@@ -193,12 +228,97 @@ unsupported key type) returns `nil`/`false`/`0` rather than aborting,
 same as `std io`.
 
 - Like `import std io;`, `import std map;` must appear before any other
-  top-level statement, and `verb run` (JIT) does not support it — use
+  top-level statement. `verb run` (JIT) executes it in-process, same as
   `verb build`/`compile`.
 - No `map_keys`/`map_values`/iteration in v1 — maps don't yet return their
   contents as arrays.
 
 See `docs/superpowers/specs/2026-07-21-maps-design.md` for the full design.
+
+## Structs (`shape`)
+
+`shape` declares a struct type with a fixed, ordered set of named fields.
+Instances are constructed by calling the type name with one positional
+argument per field; fields are read and written with the `getf`/`setf`
+built-ins:
+
+    shape Point begin x, y end
+
+    assign p Point(3, 4);
+    print(getf(p, "x"));       %% 3
+    setf(p, "y", 99);
+    print(getf(p, "y"));       %% 99
+    print(p);                   %% Point{x: 3, y: 99}
+
+- Field lists are comma-separated bare identifiers between `begin`/`end`
+  (a trailing comma is allowed); a struct may have zero fields. Duplicate
+  field names are a compile error.
+- `TypeName(a, b, ...)` takes exactly one argument per declared field, in
+  declared order — a wrong count is a compile error. A local/global
+  variable with the same name as a struct type shadows the constructor
+  (the name is then treated as an ordinary call).
+- `getf(s, "field")` returns the field's value; `setf(s, "field", v)`
+  overwrites it in place and returns `v`. A missing field name, or a
+  non-struct first argument, is a runtime error.
+- Fields may hold any Verb value, including other structs and arrays;
+  nested heap values are reference-counted and released with the struct.
+- `equals`/`differs` compare structs by reference (same underlying
+  instance), like arrays.
+- Top-level `shape` decls may be used before their point of declaration
+  (they're registered ahead of code generation); a `shape` nested inside
+  a function/block is only visible from its declaration onward.
+
+Unlike `import std map`, structs need no `import` — `shape` is a core
+language construct and works under both `verb run` (JIT) and
+`verb build`.
+
+## Standard library time (`import std time`)
+
+`import std time;` gives Verb programs wall-clock/monotonic millisecond
+timestamps and a blocking sleep, compiled and linked in the same way
+`import std io;`/`import std map;` are.
+
+    import std time;
+
+    assign start monotonic_ms();
+    sleep_ms(250);
+    print(monotonic_ms() sub start atleast 250);   %% true
+
+Portable functions (every platform): `now_ms()` (milliseconds since the
+Unix epoch, wall-clock — can jump backwards/forwards if the system clock
+is adjusted), `monotonic_ms()` (milliseconds from a monotonic clock —
+never goes backwards, only meaningful as a difference between two calls,
+so prefer it over `now_ms()` for measuring elapsed time), `sleep_ms(ms)`
+(blocks the calling thread for `ms` milliseconds; `ms <= 0` is a no-op),
+`clock_ms()` (CPU time consumed by this process, in milliseconds — the
+same quantity C's `clock()` reports; does *not* advance while blocked or
+sleeping), `difftime_ms(later, earlier)` (equivalent to `later sub
+earlier`, offered under C's familiar name).
+
+Platform-specific functions — only defined (and only linkable) when
+`verb build`/`compile` targets that platform, direct bindings to the
+underlying OS API rather than the `<chrono>`/`<thread>` wrappers above:
+
+- Linux: `linux_clock_gettime_ns(clock_id)` (nanoseconds from
+  `clock_gettime`; `clock_id` is the raw Linux `clockid_t` value — `0`
+  for `CLOCK_REALTIME`, `1` for `CLOCK_MONOTONIC`), `linux_nanosleep_ns(ns)`
+  (`nanosleep`; `ns <= 0` is a no-op).
+- Windows: `win_filetime_100ns()` (`GetSystemTimeAsFileTime`, raw FILETIME
+  as 100ns intervals since 1601-01-01), `win_sleep_ms(ms)` (`Sleep`;
+  `ms <= 0` is a no-op).
+
+Calling a Linux function in a Windows build (or vice versa) is a link
+error, not a compile error — same tradeoff generic `import mod` externs
+already have for an unresolved name (see "C++ import" above).
+
+- Like `import std io;`, `import std time;` must appear before any other
+  top-level statement, and `verb run` (JIT) does not support it — use
+  `verb build`/`compile`.
+- No Windows restriction on the portable functions (`<chrono>`/`<thread>`
+  are portable) — unlike `std io`, `std time` cross-compiles to every v1
+  target.
+
+See `docs/superpowers/specs/2026-07-21-time-design.md` for the full design.
 
 ## Language
 

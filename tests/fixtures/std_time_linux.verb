@@ -1,0 +1,7 @@
+import std time;
+
+assign start linux_clock_gettime_ns(1);
+linux_nanosleep_ns(1000000);
+assign elapsed linux_clock_gettime_ns(1) sub start;
+print(elapsed atleast 0);
+print(linux_clock_gettime_ns(0) beats 0);
