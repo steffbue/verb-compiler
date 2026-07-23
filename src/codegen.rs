@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
+use inkwell::passes::PassBuilderOptions;
+use inkwell::targets::TargetMachine;
 use inkwell::types::{PointerType, StructType};
 use inkwell::values::{FunctionValue, IntValue, PointerValue, StructValue};
 use inkwell::AddressSpace;
@@ -122,6 +124,25 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     pub fn module(&self) -> &Module<'ctx> { &self.module }
+
+    /// Runs the LLVM new-pass-manager optimization pipeline `default<O{level}>`
+    /// over the whole module, targeting `tm`. `level` 0 is a no-op (the
+    /// unoptimized module is emitted verbatim). Levels are clamped to 3.
+    ///
+    /// DCE safety: codegen's GC `verb_release_value` (and `verb_retain_value`)
+    /// calls target *external* declarations with no `readnone`/`willreturn`
+    /// attributes, so LLVM must assume they have observable side effects and
+    /// never eliminates them — even aggressive DCE at `-O2`/`-O3` keeps every
+    /// release, so the `assert_no_leaks` fixtures stay balanced.
+    pub fn optimize(&self, tm: &TargetMachine, level: u8) -> Result<(), String> {
+        if level == 0 {
+            return Ok(());
+        }
+        let level = level.min(3);
+        self.module
+            .run_passes(&format!("default<O{level}>"), tm, PassBuilderOptions::create())
+            .map_err(|e| e.to_string())
+    }
 
     fn declare_libc(&self) {
         let i32t = self.ctx.i32_type();

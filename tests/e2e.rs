@@ -49,10 +49,20 @@ fn run_err(name: &str, msg: &str) {
 /// beyond locating the `verb_gc_live=` line -- callers that also care
 /// about output correctness should use `run_ok` separately or inline
 /// their own check.
-fn assert_no_leaks(fixture: &str) {
-    let out_path = std::env::temp_dir().join(format!("verb_test_gc_v2_{fixture}"));
+fn assert_no_leaks(fixture: &str) { assert_no_leaks_opt(fixture, 0); }
+
+/// Like `assert_no_leaks`, but builds at optimization `level` -- used to
+/// confirm the pass pipeline (esp. DCE) never removes GC release calls.
+fn assert_no_leaks_opt(fixture: &str, level: u8) {
+    let out_path = std::env::temp_dir().join(format!("verb_test_gc_v2_{fixture}_O{level}"));
     let build = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(["build", &format!("tests/fixtures/{fixture}.verb"), "-o", out_path.to_str().unwrap()])
+        .args([
+            "build",
+            &format!("tests/fixtures/{fixture}.verb"),
+            "-o",
+            out_path.to_str().unwrap(),
+            &format!("-O{level}"),
+        ])
         .output()
         .unwrap();
     assert!(build.status.success(), "{fixture}: build failed: {}", String::from_utf8_lossy(&build.stderr));
@@ -136,6 +146,69 @@ fn array_literal_emits_malloc_and_store_in_ir() {
     let ir = String::from_utf8_lossy(&out.stdout);
     assert!(ir.contains("call ptr @malloc"), "no malloc call in IR:\n{ir}");
     assert!(ir.contains("@verb_print_value"), "no verb_print_value in IR:\n{ir}");
+}
+
+// ----- optimizer / -O flags -----
+
+/// Runs `fixture` at optimization `level`, asserting success and that stdout
+/// matches the fixture's `.expected` -- i.e. `-O` preserves observable output.
+fn run_ok_opt(name: &str, level: u8) {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", &format!("tests/fixtures/{name}.verb"), &format!("-O{level}")])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "-O{level} {name}: exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = std::fs::read_to_string(format!("tests/fixtures/{name}.expected")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "-O{level} {name}: output changed");
+}
+
+/// Emits the module IR for `fixture` at `level` via `run --emit-llvm`.
+fn emit_ir(name: &str, level: u8) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", &format!("tests/fixtures/{name}.verb"), "--emit-llvm", &format!("-O{level}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "-O{level} {name}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn opt_o2_reduces_allocas_vs_o0() {
+    // Function-local `assign`s lower to stack `alloca`s at -O0; the -O2
+    // pipeline's mem2reg promotes them to SSA values, so the optimized IR
+    // has strictly fewer `alloca`s. This proves the pass pipeline actually
+    // ran (and differs from the unoptimized emit).
+    let o0 = emit_ir("opt_locals", 0);
+    let o2 = emit_ir("opt_locals", 2);
+    let n0 = o0.matches("alloca").count();
+    let n2 = o2.matches("alloca").count();
+    assert!(n0 > 1, "expected several allocas at -O0, got {n0}");
+    assert!(n2 < n0, "-O2 should reduce allocas ({n2}) below -O0 ({n0})");
+    assert_ne!(o0, o2, "-O2 IR should differ from -O0 IR");
+}
+
+#[test]
+fn opt_preserves_semantics_all_levels() {
+    // Same program, every -O level, identical output: optimization is
+    // semantics-preserving for a compute-heavy fixture.
+    for level in 0..=3 {
+        run_ok_opt("arith", level);
+        run_ok_opt("opt_locals", level);
+    }
+}
+
+#[test]
+fn opt_o2_keeps_gc_release_calls() {
+    // Aggressive DCE must not drop the GC's `verb_release_value` calls (they
+    // have observable side effects). Build at -O2 and confirm the program
+    // still frees every heap object it allocated.
+    assert_no_leaks_opt("gc_structs", 2);
+    assert_no_leaks_opt("gc_closures_capture", 2);
 }
 
 // ----- structs / records -----

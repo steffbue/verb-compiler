@@ -1,0 +1,8 @@
+%% Function-local variables: at -O0 each becomes a stack `alloca`; at -O2+
+%% mem2reg promotes them away, so the optimized IR has far fewer allocas.
+make compute() begin
+  assign a 2;
+  assign b 3;
+  return a add b;
+end
+print(compute());

@@ -95,6 +95,7 @@ struct ParsedArgs {
     emit_llvm: bool,
     target: Option<String>,
     lib_dirs: Vec<String>,
+    opt: u8,
 }
 
 fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
@@ -107,6 +108,7 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     let mut emit_llvm = false;
     let mut target = None;
     let mut lib_dirs = Vec::new();
+    let mut opt = 0u8;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -114,6 +116,10 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
                 emit_llvm = true;
                 i += 1;
             }
+            "-O0" => { opt = 0; i += 1; }
+            "-O1" => { opt = 1; i += 1; }
+            "-O2" => { opt = 2; i += 1; }
+            "-O3" => { opt = 3; i += 1; }
             "-o" => {
                 i += 1;
                 if i >= args.len() {
@@ -143,7 +149,7 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     if files.is_empty() {
         return None;
     }
-    Some(ParsedArgs { cmd, files, out, emit_llvm, target, lib_dirs })
+    Some(ParsedArgs { cmd, files, out, emit_llvm, target, lib_dirs, opt })
 }
 
 fn die(e: CompileError, sources: &[(String, String)]) -> ! {
@@ -167,10 +173,12 @@ fn die(e: CompileError, sources: &[(String, String)]) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
-    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]");
-    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]  (alias for build)");
+    eprintln!("usage: verb run <file.verb>... [-O0|-O1|-O2|-O3] [--emit-llvm]");
+    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-O0|-O1|-O2|-O3] [--emit-llvm]");
+    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-O0|-O1|-O2|-O3] [--emit-llvm]  (alias for build)");
+    eprintln!("       verb repl   (interactive read-eval-print loop; JIT, no imports)");
     eprintln!("       verb targets   (list supported cross-compile targets, marking the host)");
+    eprintln!("       -O0..-O3 select the LLVM optimization level (default -O0)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
     eprintln!("       for --target all, each -L<dir> prefers a per-target subdir <dir>/<os>-<arch> when present");
     exit(2)
@@ -188,6 +196,36 @@ fn print_targets() {
         let marker = if Some(t) == host { "  (host)" } else { "" };
         println!("{:<16} {}{}", t.label(), t.llvm_triple(), marker);
     }
+}
+
+/// Maps a `-O` level (0..=3) to the corresponding inkwell/LLVM codegen
+/// optimization level. Used at both the JIT execution-engine creation and the
+/// AOT `create_target_machine` sites so `run` and `build` agree on `-O`.
+fn opt_level(o: u8) -> inkwell::OptimizationLevel {
+    use inkwell::OptimizationLevel::{Aggressive, Default, Less, None};
+    match o {
+        0 => None,
+        1 => Less,
+        2 => Default,
+        _ => Aggressive,
+    }
+}
+
+/// Builds a `TargetMachine` for the host, used to run the module pass pipeline
+/// on the JIT (`run`/`repl`) path, which otherwise has no `TargetMachine`.
+/// `level` feeds the machine's own backend opt level. Mirrors the setup in
+/// `build_aot_host`.
+fn host_target_machine(level: u8) -> inkwell::targets::TargetMachine {
+    use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
+    Target::initialize_native(&InitializationConfig::default())
+        .unwrap_or_else(|e| { eprintln!("target init error: {e}"); exit(1); });
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple)
+        .unwrap_or_else(|e| { eprintln!("target error: {e}"); exit(1); });
+    target
+        .create_target_machine(&triple, "generic", "",
+            opt_level(level), RelocMode::PIC, CodeModel::Default)
+        .unwrap_or_else(|| { eprintln!("cannot create target machine"); exit(1); })
 }
 
 fn main() {
@@ -235,10 +273,6 @@ fn main() {
     let mut cg = codegen::Codegen::new(&ctx);
     cg.compile_program(&stmts, &stmt_files, &imports, &std_imports).unwrap_or_else(|e| die(e, &sources));
 
-    if parsed.emit_llvm {
-        println!("{}", cg.module().print_to_string().to_string());
-    }
-
     match parsed.cmd.as_str() {
         "run" => {
             if !imports.is_empty() || !std_imports.is_empty() {
@@ -250,9 +284,22 @@ fn main() {
                 );
                 exit(1);
             }
+            // The JIT has no TargetMachine of its own, so `-O` runs the pass
+            // pipeline against a host machine before building the engine (and
+            // before printing IR, so `--emit-llvm` reflects the optimization).
+            if parsed.opt > 0 {
+                let tm = host_target_machine(parsed.opt);
+                cg.optimize(&tm, parsed.opt).unwrap_or_else(|e| {
+                    eprintln!("optimizer error: {e}");
+                    exit(1);
+                });
+            }
+            if parsed.emit_llvm {
+                println!("{}", cg.module().print_to_string().to_string());
+            }
             let ee = cg
                 .module()
-                .create_jit_execution_engine(inkwell::OptimizationLevel::None)
+                .create_jit_execution_engine(opt_level(parsed.opt))
                 .unwrap_or_else(|e| {
                     eprintln!("JIT error: {e}");
                     exit(1);
@@ -266,17 +313,23 @@ fn main() {
             }
         }
         "build" | "compile" => {
+            // AOT paths run the pass pipeline against their own (possibly
+            // cross) TargetMachine after the data layout is set, so IR emitted
+            // here is pre-optimization.
+            if parsed.emit_llvm {
+                println!("{}", cg.module().print_to_string().to_string());
+            }
             let out = parsed.out.unwrap_or_else(|| usage());
             match parsed.target.as_deref() {
-                None => build_aot_host(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
-                Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
+                None => build_aot_host(&cg, &out, &imports, &std_imports, &parsed.lib_dirs, parsed.opt),
+                Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs, parsed.opt),
                 Some(t) => {
                     let target = targets::Target::parse(t).unwrap_or_else(|e| {
                         eprintln!("error: {e}");
                         exit(2);
                     });
                     check_zig_available();
-                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &parsed.lib_dirs) {
+                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &parsed.lib_dirs, parsed.opt) {
                         eprintln!("error: {e}");
                         exit(1);
                     }
@@ -331,7 +384,7 @@ fn compile_map_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, Strin
     Ok(obj)
 }
 
-fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
+fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String], opt: u8) {
     use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
     Target::initialize_native(&InitializationConfig::default())
@@ -341,10 +394,11 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         .unwrap_or_else(|e| { eprintln!("target error: {e}"); exit(1); });
     let tm = target
         .create_target_machine(&triple, "generic", "",
-            inkwell::OptimizationLevel::Default, RelocMode::PIC, CodeModel::Default)
+            opt_level(opt), RelocMode::PIC, CodeModel::Default)
         .unwrap_or_else(|| { eprintln!("cannot create target machine"); exit(1); });
     cg.module().set_triple(&triple);
     cg.module().set_data_layout(&tm.get_target_data().get_data_layout());
+    cg.optimize(&tm, opt).unwrap_or_else(|e| { eprintln!("optimizer error: {e}"); exit(1); });
 
     let obj = format!("{out}.o");
     tm.write_to_file(cg.module(), FileType::Object, obj.as_ref())
@@ -412,6 +466,7 @@ fn build_aot_cross(
     imports: &[String],
     std_imports: &[String],
     lib_dirs: &[String],
+    opt: u8,
 ) -> Result<(), String> {
     use inkwell::targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target as LlvmTarget, TargetTriple,
@@ -432,11 +487,12 @@ fn build_aot_cross(
     let tm = llvm_target
         .create_target_machine(
             &triple, "generic", "",
-            inkwell::OptimizationLevel::Default, RelocMode::PIC, CodeModel::Default,
+            opt_level(opt), RelocMode::PIC, CodeModel::Default,
         )
         .ok_or_else(|| "cannot create target machine".to_string())?;
     cg.module().set_triple(&triple);
     cg.module().set_data_layout(&tm.get_target_data().get_data_layout());
+    cg.optimize(&tm, opt)?;
 
     let out = target.adjust_output(out);
     let obj = format!("{out}.o");
@@ -485,13 +541,13 @@ fn build_aot_cross(
     Ok(())
 }
 
-fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
+fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String], opt: u8) {
     check_zig_available();
     let mut failures = 0;
     let mut results: Vec<(String, Result<(), String>)> = Vec::new();
     for target in targets::ALL {
         let labeled_out = format!("{out}-{}", target.label());
-        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, lib_dirs);
+        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, lib_dirs, opt);
         if res.is_err() {
             failures += 1;
         }
@@ -544,6 +600,20 @@ mod tests {
         ])).unwrap();
         assert_eq!(p.files, vec!["a.verb".to_string()]);
         assert_eq!(p.lib_dirs, vec!["-L/opt/lib".to_string(), "-L./libs".to_string()]);
+    }
+
+    #[test]
+    fn opt_defaults_to_zero() {
+        let p = parse_cli(&args(&["verb", "run", "a.verb"])).unwrap();
+        assert_eq!(p.opt, 0);
+    }
+
+    #[test]
+    fn parses_opt_levels() {
+        for (flag, want) in [("-O0", 0u8), ("-O1", 1), ("-O2", 2), ("-O3", 3)] {
+            let p = parse_cli(&args(&["verb", "run", "a.verb", flag])).unwrap();
+            assert_eq!(p.opt, want, "flag {flag}");
+        }
     }
 
     #[test]
