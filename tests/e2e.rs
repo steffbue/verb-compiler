@@ -211,6 +211,62 @@ fn opt_o2_keeps_gc_release_calls() {
     assert_no_leaks_opt("gc_closures_capture", 2);
 }
 
+// ----- REPL -----
+
+/// Pipes `input` into `verb repl` and returns (stdout, success). Prompts are
+/// written to stderr, so stdout carries only the evaluated program output.
+fn repl_run(input: &str) -> (String, bool) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.success())
+}
+
+#[test]
+fn repl_scripted_session_prints_expected() {
+    let input = std::fs::read_to_string("tests/fixtures/repl_session.in").unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/repl_session.expected").unwrap();
+    let (stdout, ok) = repl_run(&input);
+    assert!(ok, "repl exited non-zero");
+    // Definition (`assign x 3;`) replays silently; only `print(x add 4)` emits.
+    assert_eq!(stdout, expected);
+}
+
+#[test]
+fn repl_auto_prints_bare_expression() {
+    // A bare expression (no `print`, no trailing `;`) is auto-printed.
+    let (stdout, ok) = repl_run("5 add 2\n:quit\n");
+    assert!(ok);
+    assert_eq!(stdout, "7\n");
+}
+
+#[test]
+fn repl_replays_multiline_function_definition() {
+    // A `make` spanning several lines is buffered until `end`, retained in
+    // history, and callable on a later turn.
+    let input = "make dbl(n) begin\n  return n times 2;\nend\ndbl(21)\n:quit\n";
+    let (stdout, ok) = repl_run(input);
+    assert!(ok);
+    assert_eq!(stdout, "42\n");
+}
+
+#[test]
+fn repl_rejects_imports_but_keeps_running() {
+    // Imports are rejected (JIT can't resolve them); the error must not be
+    // fatal -- a subsequent valid line still evaluates.
+    let (stdout, ok) = repl_run("import mod foo;\nprint(9);\n:quit\n");
+    assert!(ok);
+    assert_eq!(stdout, "9\n");
+}
+
 // ----- structs / records -----
 
 #[test]

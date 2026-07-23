@@ -238,6 +238,13 @@ fn main() {
         return;
     }
 
+    // `verb repl` reads from stdin rather than a file, so it must be handled
+    // before `parse_cli` (which requires at least one `<file.verb>`).
+    if args.get(1).map(String::as_str) == Some("repl") {
+        run_repl();
+        return;
+    }
+
     let parsed = parse_cli(&args).unwrap_or_else(|| usage());
 
     let mut sources: Vec<(String, String)> = Vec::new();
@@ -338,6 +345,211 @@ fn main() {
         }
         _ => usage(),
     }
+}
+
+// --- REPL ------------------------------------------------------------------
+//
+// Strategy: "declaration replay, fresh module per turn" (the lowest-codegen-
+// risk option in the Tier-4 plan). We keep a history of the input lines that
+// were *pure definitions* (assign/declare/reassign/make/record/choice) and
+// produced no observable output. Each turn we compile
+// `history + "\n" + new_line` from scratch into a fresh Context+Codegen, JIT
+// it like `verb run`, and call `main` WITHOUT exiting the process. Because the
+// replayed history never prints, only the new line's output appears, and all
+// program state (globals, function defs) is rebuilt deterministically every
+// turn. Bare expressions are auto-printed by wrapping them as `print(<expr>)`.
+// Imports are rejected (the JIT can't resolve `-l` libraries). Session values
+// with side effects in their initializer (e.g. `assign x read_line();`) would
+// re-run each turn -- documented as a v1 limitation.
+
+/// True for statement kinds that define/mutate state without producing output,
+/// and so are safe to replay verbatim on every REPL turn.
+fn is_definition_stmt(s: &verb::ast::Stmt) -> bool {
+    use verb::ast::Stmt::*;
+    matches!(
+        s,
+        Assign { .. } | Declare { .. } | Reassign { .. } | Fn { .. } | Record { .. } | Choice { .. }
+    )
+}
+
+/// True when `e` is already a `print(...)` call, so we don't double-wrap it.
+fn is_print_call(e: &verb::ast::Expr) -> bool {
+    if let verb::ast::Expr::Call { callee, .. } = e {
+        if let verb::ast::Expr::Var(name, ..) = callee.as_ref() {
+            return name == "print";
+        }
+    }
+    false
+}
+
+/// Wraps a bare-expression entry so its value is printed: `x add 4` -> the
+/// source `print(x add 4);`. A trailing `;` on the input is tolerated.
+fn wrap_print(line: &str) -> String {
+    format!("print({});", line.trim().trim_end_matches(';').trim())
+}
+
+/// Classifies a single REPL input line. Returns the source text to append to
+/// the program this turn plus whether the line is a *pure definition* (and so
+/// should be added to history on success). Rejects imports.
+fn classify_repl_line(line: &str) -> Result<(String, bool), String> {
+    use verb::ast::Stmt;
+    let toks = lexer::lex(line).map_err(|e| e.msg)?;
+    match parser::parse(toks) {
+        Ok(prog) => {
+            if !prog.imports.is_empty() || !prog.std_imports.is_empty() {
+                return Err(
+                    "imports are not supported in the REPL (v1); compile with `verb build` instead"
+                        .to_string(),
+                );
+            }
+            // A single bare expression that isn't already `print(...)` gets
+            // auto-printed and is never retained in history.
+            if prog.body.len() == 1 {
+                if let Stmt::ExprStmt(e) = &prog.body[0] {
+                    if !is_print_call(e) {
+                        return Ok((wrap_print(line), false));
+                    }
+                }
+            }
+            let pure = !prog.body.is_empty() && prog.body.iter().all(is_definition_stmt);
+            Ok((line.to_string(), pure))
+        }
+        Err(e1) => {
+            // A bare expression is often not a valid statement on its own
+            // (needs a trailing `;`). Retry it wrapped in `print(...)`; if that
+            // parses, treat it as an auto-printed expression.
+            let wrapped = wrap_print(line);
+            match lexer::lex(&wrapped).and_then(parser::parse) {
+                Ok(_) => Ok((wrapped, false)),
+                Err(_) => Err(e1.msg),
+            }
+        }
+    }
+}
+
+/// Compiles `source` into a fresh module and JITs it, calling `main` once
+/// (without exiting the process). Mirrors the `verb run` JIT path.
+fn compile_and_jit_run(source: &str) -> Result<(), String> {
+    let toks = lexer::lex(source).map_err(|e| e.msg)?;
+    let prog = parser::parse(toks).map_err(|e| e.msg)?;
+    let stmt_files = vec!["<repl>".to_string(); prog.body.len()];
+
+    let ctx = inkwell::context::Context::create();
+    let mut cg = codegen::Codegen::new(&ctx);
+    cg.compile_program(&prog.body, &stmt_files, &prog.imports, &prog.std_imports)
+        .map_err(|e| e.msg)?;
+
+    let ee = cg
+        .module()
+        .create_jit_execution_engine(inkwell::OptimizationLevel::None)
+        .map_err(|e| e.to_string())?;
+    register_jit_runtime_symbols(&ee, cg.module());
+    unsafe {
+        let main_fn = ee
+            .get_function::<unsafe extern "C" fn() -> i32>("main")
+            .map_err(|e| e.to_string())?;
+        main_fn.call();
+    }
+    // Flush so JIT'd C stdio output lands before the next prompt (interactive)
+    // and in order (piped).
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// True when `src` has more `begin` than `end` tokens, i.e. an open block --
+/// the REPL keeps reading continuation lines until a multi-line `make`/
+/// `record`/`match`/`check`/`repeat` is complete. On a lex error (e.g. an
+/// unterminated string mid-entry) we report the block closed and let the
+/// parser surface the error rather than looping forever.
+fn block_is_open(src: &str) -> bool {
+    use verb::lexer::TokenKind::{Begin, End};
+    match lexer::lex(src) {
+        Ok(toks) => {
+            let begins = toks.iter().filter(|t| t.kind == Begin).count();
+            let ends = toks.iter().filter(|t| t.kind == End).count();
+            begins > ends
+        }
+        Err(_) => false,
+    }
+}
+
+/// Interactive read-eval-print loop. Prompts on stderr (so piped stdout holds
+/// only program output), reads lines from stdin, and evaluates each entry with
+/// declaration replay. Multi-line entries (`begin`..`end`) are buffered until
+/// balanced. `:quit` / `:q` or EOF ends the session.
+fn run_repl() {
+    use std::io::{BufRead, Write};
+
+    let prompt = |s: &str| {
+        eprint!("{s}");
+        let _ = std::io::stderr().flush();
+    };
+
+    let stdin = std::io::stdin();
+    let mut history: Vec<String> = Vec::new();
+    let mut buffer = String::new();
+
+    prompt("verb> ");
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        // Top-level directives / blanks only apply when not mid-entry.
+        if buffer.is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                prompt("verb> ");
+                continue;
+            }
+            if trimmed == ":quit" || trimmed == ":q" {
+                break;
+            }
+        }
+
+        if !buffer.is_empty() {
+            buffer.push('\n');
+        }
+        buffer.push_str(&line);
+
+        // Keep reading continuation lines while a block is open.
+        if block_is_open(&buffer) {
+            prompt("  ... ");
+            continue;
+        }
+
+        let entry = std::mem::take(&mut buffer);
+        let entry = entry.trim().to_string();
+        if entry.is_empty() {
+            prompt("verb> ");
+            continue;
+        }
+
+        match classify_repl_line(&entry) {
+            Ok((tail, is_def)) => {
+                let program = if history.is_empty() {
+                    tail.clone()
+                } else {
+                    format!("{}\n{}", history.join("\n"), tail)
+                };
+                match compile_and_jit_run(&program) {
+                    Ok(()) => {
+                        // Retain only successful, pure definitions so the
+                        // replayed prefix stays output-free and deterministic.
+                        if is_def {
+                            history.push(entry.clone());
+                        }
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            Err(e) => eprintln!("error: {e}"),
+        }
+        prompt("verb> ");
+    }
+    eprintln!();
 }
 
 /// Absolute paths into this crate's bundled `runtime/` dir, embedded at
