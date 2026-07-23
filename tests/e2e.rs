@@ -491,6 +491,40 @@ fn foreach_over_empty_string_is_leak_free() {
     assert_no_leaks("foreach_empty_string");
 }
 
+/// Regression: `map_len(m)` after an `each` over an array/string must not
+/// declare a duplicate LLVM symbol. The `each`-over-iterable lowering emits a
+/// tag-dispatching `fe.map` block that references `map_len`; before the fix,
+/// `gen_std_io_call` deduplicated only via its own `externs` cache (missing
+/// that module-level declaration) and added a second `map_len`, which LLVM
+/// renamed to `map_len.N` -> JIT segfault. Exercises the `verb run` path.
+#[test]
+fn map_len_after_foreach_runs() {
+    run_ok("map_len_after_foreach");
+}
+
+/// Same regression under AOT: the duplicate `map_len.N` symbol is provided by
+/// no runtime unit, so `verb build` failed at link time. Build and run.
+#[test]
+fn map_len_after_foreach_builds_and_runs() {
+    let out_path = std::env::temp_dir().join("verb_test_map_len_after_foreach");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build",
+            "tests/fixtures/map_len_after_foreach.verb",
+            "-o", out_path.to_str().unwrap(),
+            "-O2",
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/map_len_after_foreach.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = std::fs::remove_file(&out_path);
+}
+
 #[test]
 fn functions() { run_ok("functions"); }
 

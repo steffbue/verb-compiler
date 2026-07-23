@@ -4038,9 +4038,19 @@ impl<'ctx> Codegen<'ctx> {
         let fnv = match self.externs.get(name).copied() {
             Some(fnv) => fnv,
             None => {
-                let param_tys: Vec<_> = (0..expected_arity).map(|_| self.value_ty.into()).collect();
-                let fnty = self.value_ty.fn_type(&param_tys, false);
-                let fnv = self.module.add_function(name, fnty, None);
+                // Another codegen path may have already declared this runtime
+                // symbol directly on the module without registering it in
+                // `self.externs` -- e.g. a collection `each` loop pre-declares
+                // `map_len`/`map_key_at` (see the ForEach map dispatch). Reuse
+                // that existing declaration; calling `add_function` again for a
+                // name the module already has mints a colliding `@<name>.N`
+                // duplicate that the runtime never provides, breaking the link
+                // (AOT) and calling a null symbol (JIT).
+                let fnv = self.module.get_function(name).unwrap_or_else(|| {
+                    let param_tys: Vec<_> = (0..expected_arity).map(|_| self.value_ty.into()).collect();
+                    let fnty = self.value_ty.fn_type(&param_tys, false);
+                    self.module.add_function(name, fnty, None)
+                });
                 self.externs.insert(name.to_string(), fnv);
                 fnv
             }
