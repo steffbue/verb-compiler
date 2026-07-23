@@ -1308,7 +1308,9 @@ impl<'ctx> Codegen<'ctx> {
     /// unless v is a heap-identity tag; on those, decrements the header
     /// and, at zero, cascades per-tag before freeing:
     /// - STR: no cascade, just free (skip entirely if static sentinel).
-    /// - CLOSURE: no cascade (`env` is always null), just free.
+    /// - CLOSURE: release the capture env (cascading into captured values and
+    ///   freeing the env block when its own refcount hits zero), then free the
+    ///   closure block. A non-capturing closure has a null env: block-only.
     /// - ARRAY: release every element 0..len (cascading into any
     ///   heap-owned element), free `elems`, free the header.
     /// - MAP: call `verb_map_destroy_contents` (defined in
@@ -1329,6 +1331,12 @@ impl<'ctx> Codegen<'ctx> {
         let clos_bb = self.ctx.append_basic_block(f, "clos");
         let clos_dec_bb = self.ctx.append_basic_block(f, "clos.dec");
         let clos_free_bb = self.ctx.append_basic_block(f, "clos.free");
+        let clos_env_live_bb = self.ctx.append_basic_block(f, "clos.env.live");
+        let clos_env_free_bb = self.ctx.append_basic_block(f, "clos.env.free");
+        let clos_env_loop_cond_bb = self.ctx.append_basic_block(f, "clos.env.loop.cond");
+        let clos_env_loop_body_bb = self.ctx.append_basic_block(f, "clos.env.loop.body");
+        let clos_env_loop_end_bb = self.ctx.append_basic_block(f, "clos.env.loop.end");
+        let clos_block_free_bb = self.ctx.append_basic_block(f, "clos.block.free");
         let arr_check_bb = self.ctx.append_basic_block(f, "arr.check");
         let arr_bb = self.ctx.append_basic_block(f, "arr");
         let arr_dec_bb = self.ctx.append_basic_block(f, "arr.dec");
@@ -1377,7 +1385,7 @@ impl<'ctx> Codegen<'ctx> {
         self.call_named("free", &[shdr.into()]);
         self.builder.build_unconditional_branch(done_bb).unwrap();
 
-        // ----- closure (env always null: no cascade) -----
+        // ----- closure: release capture env (if any), then free the block -----
         self.builder.position_at_end(clos_check_bb);
         let is_clos = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_CLOSURE, false), "is_clos").unwrap();
         self.builder.build_conditional_branch(is_clos, clos_bb, arr_check_bb).unwrap();
@@ -1393,7 +1401,51 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(clos_dec_bb);
         self.builder.build_unconditional_branch(clos_free_bb).unwrap();
 
+        // At refcount zero, reclaim the capture env before the closure block.
+        // The env is refcounted at closure-block granularity (see `make_closure`
+        // / `retain_env`): decrement it, and only cascade-release its captured
+        // values + free its block when *that* hits zero (the self-recursion cell
+        // is a second block sharing the same env).
         self.builder.position_at_end(clos_free_bb);
+        let epp = self.builder.build_struct_gep(self.closure_ty, cp, 2, "epp").unwrap();
+        let cenv = self.builder.build_load(self.ptr_ty, epp, "cenv").unwrap().into_pointer_value();
+        let cenv_addr = self.builder.build_ptr_to_int(cenv, i64t, "cenv_addr").unwrap();
+        let cenv_null = self.builder.build_int_compare(EQ, cenv_addr, i64t.const_zero(), "cenv_null").unwrap();
+        self.builder.build_conditional_branch(cenv_null, clos_block_free_bb, clos_env_live_bb).unwrap();
+
+        self.builder.position_at_end(clos_env_live_bb);
+        let ehdr = self.header_ptr(cenv);
+        let ecur = self.builder.build_load(i64t, ehdr, "ecur").unwrap().into_int_value();
+        let enext = self.builder.build_int_sub(ecur, i64t.const_int(1, false), "enext").unwrap();
+        self.builder.build_store(ehdr, enext).unwrap();
+        let ezero = self.builder.build_int_compare(EQ, enext, i64t.const_zero(), "ezero").unwrap();
+        self.builder.build_conditional_branch(ezero, clos_env_free_bb, clos_block_free_bb).unwrap();
+
+        self.builder.position_at_end(clos_env_free_bb);
+        let en = self.builder.build_load(i64t, cenv, "en").unwrap().into_int_value();
+        let eidxp = self.entry_alloca(i64t.into(), "erelidx");
+        self.builder.build_store(eidxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(clos_env_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(clos_env_loop_cond_bb);
+        let ei = self.builder.build_load(i64t, eidxp, "ei").unwrap().into_int_value();
+        let emore = self.builder.build_int_compare(SLT, ei, en, "emore").unwrap();
+        self.builder.build_conditional_branch(emore, clos_env_loop_body_bb, clos_env_loop_end_bb).unwrap();
+
+        self.builder.position_at_end(clos_env_loop_body_bb);
+        let eslot = self.env_slot(cenv, ei);
+        let ev = self.builder.build_load(self.value_ty, eslot, "ev").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[ev.into()]);
+        let einext = self.builder.build_int_add(ei, i64t.const_int(1, false), "einext").unwrap();
+        self.builder.build_store(eidxp, einext).unwrap();
+        self.builder.build_unconditional_branch(clos_env_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(clos_env_loop_end_bb);
+        self.dec_live_counter();
+        self.call_named("free", &[ehdr.into()]);
+        self.builder.build_unconditional_branch(clos_block_free_bb).unwrap();
+
+        self.builder.position_at_end(clos_block_free_bb);
         self.dec_live_counter();
         self.call_named("free", &[chdr.into()]);
         self.builder.build_unconditional_branch(done_bb).unwrap();
@@ -1726,17 +1778,56 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_return(None).unwrap();
     }
 
-    /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a tagged value.
-    fn make_closure(&self, fnv: FunctionValue<'ctx>, arity: usize) -> StructValue<'ctx> {
+    /// Heap-allocate a closure struct { fn_ptr, arity, env } and wrap it as a
+    /// tagged value. `env` is the capture block (a `verb_alloc` block laid out
+    /// `{ i64 n_captures, [n x value] }`) that the fn's body reads its captured
+    /// variables from, or a null pointer for a non-capturing fn. The env's
+    /// refcount is tracked at the granularity of *closure blocks* that point at
+    /// it: this closure consumes one reference to `env`, so a caller that wants
+    /// a *second* closure block over the same `env` (the self-recursion cell,
+    /// see `Stmt::Fn`) must bump the env header itself.
+    fn make_closure(&self, fnv: FunctionValue<'ctx>, arity: usize, env: PointerValue<'ctx>) -> StructValue<'ctx> {
         let p = self.malloc_bytes(24);
         let fp = fnv.as_global_value().as_pointer_value();
         self.builder.build_store(p, fp).unwrap();
         let ap = self.builder.build_struct_gep(self.closure_ty, p, 1, "ap").unwrap();
         self.builder.build_store(ap, self.ctx.i64_type().const_int(arity as u64, false)).unwrap();
         let ep = self.builder.build_struct_gep(self.closure_ty, p, 2, "ep").unwrap();
-        self.builder.build_store(ep, self.ptr_ty.const_null()).unwrap();
+        self.builder.build_store(ep, env).unwrap();
         let bits = self.builder.build_ptr_to_int(p, self.ctx.i64_type(), "cbits").unwrap();
         self.make_val(TAG_CLOSURE, bits)
+    }
+
+    /// Pointer to capture slot `idx` (a `value_ty`) inside an env block whose
+    /// payload pointer is `env`. Captures live inline right after the 8-byte
+    /// `{ i64 n_captures }` header, so slot `idx` is at `env + 8 + idx*16`.
+    fn env_slot(&self, env: PointerValue<'ctx>, idx: IntValue<'ctx>) -> PointerValue<'ctx> {
+        let i64t = self.ctx.i64_type();
+        let base = unsafe {
+            self.builder.build_in_bounds_gep(self.ctx.i8_type(), env, &[i64t.const_int(8, false)], "ebase")
+        }.unwrap();
+        unsafe { self.builder.build_in_bounds_gep(self.value_ty, base, &[idx], "eslot") }.unwrap()
+    }
+
+    /// Bump the refcount header of a capture block, unless it is null (a
+    /// non-capturing closure). Used when a *second* closure block starts to
+    /// share an existing env (the self-recursion cell).
+    fn retain_env(&self, env: PointerValue<'ctx>) {
+        use inkwell::IntPredicate::EQ;
+        let i64t = self.ctx.i64_type();
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let bump_bb = self.ctx.append_basic_block(f, "env.retain.bump");
+        let done_bb = self.ctx.append_basic_block(f, "env.retain.done");
+        let addr = self.builder.build_ptr_to_int(env, i64t, "envaddr").unwrap();
+        let is_null = self.builder.build_int_compare(EQ, addr, i64t.const_zero(), "envnull").unwrap();
+        self.builder.build_conditional_branch(is_null, done_bb, bump_bb).unwrap();
+        self.builder.position_at_end(bump_bb);
+        let hdr = self.header_ptr(env);
+        let cur = self.builder.build_load(i64t, hdr, "envcur").unwrap().into_int_value();
+        let next = self.builder.build_int_add(cur, i64t.const_int(1, false), "envnext").unwrap();
+        self.builder.build_store(hdr, next).unwrap();
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+        self.builder.position_at_end(done_bb);
     }
 
     /// Alloca in the current function's entry block so loops don't grow the stack.
@@ -1970,9 +2061,46 @@ impl<'ctx> Codegen<'ctx> {
                 let llname = format!("fn.{}.{}", name, self.fn_counter);
                 let fnty = self.value_ty.fn_type(&[self.ptr_ty.into(), self.ptr_ty.into()], false);
                 let fnv = self.module.add_function(&llname, fnty, None);
+
+                // Free-variable analysis (must run *before* `mem::take` below,
+                // while `self.scopes` still holds the enclosing function's
+                // frames). A candidate is captured -- by value, a snapshot --
+                // only if it resolves to an enclosing *local*; names that
+                // resolve to a global (or not at all: record types, builtins)
+                // stay as they were and are ignored here.
+                let captures: Vec<(String, PointerValue<'ctx>)> = free_vars(name, params, body)
+                    .into_iter()
+                    .filter_map(|n| {
+                        let cell = self.scopes.iter().rev().find_map(|s| s.get(&n).copied())?;
+                        Some((n, cell))
+                    })
+                    .collect();
+
+                // Build the capture env in the enclosing frame (where the
+                // captured cells are live) and snapshot each captured value into
+                // it (retained: the env now co-owns them). Empty capture -> null
+                // env, leaving non-capturing fns byte-for-byte as before.
+                let i64t = self.ctx.i64_type();
+                let env = if captures.is_empty() {
+                    self.ptr_ty.const_null()
+                } else {
+                    let bytes = 8 + captures.len() as u64 * 16;
+                    let e = self.malloc_bytes(bytes);
+                    self.builder.build_store(e, i64t.const_int(captures.len() as u64, false)).unwrap();
+                    for (i, (_, cell)) in captures.iter().enumerate() {
+                        let v = self.builder.build_load(self.value_ty, *cell, "capv").unwrap().into_struct_value();
+                        self.call_named("verb_retain_value", &[v.into()]);
+                        let slot = self.env_slot(e, i64t.const_int(i as u64, false));
+                        self.builder.build_store(slot, v).unwrap();
+                    }
+                    e
+                };
+                let capture_names: Vec<String> = captures.iter().map(|(n, _)| n.clone()).collect();
+
                 // bind the name as a first-class closure value in the enclosing
-                // scope (globals, if at top level) so callers can reference it
-                let clos = self.make_closure(fnv, params.len());
+                // scope (globals, if at top level) so callers can reference it.
+                // This closure block consumes the env's initial reference.
+                let clos = self.make_closure(fnv, params.len(), env);
                 self.bind(name, clos);
 
                 let saved_bb = self.builder.get_insert_block().unwrap();
@@ -1993,12 +2121,31 @@ impl<'ctx> Codegen<'ctx> {
                 // a malloc'd heap cell's pointer is an SSA value scoped to the
                 // function that computed it -- the outer function's, in this
                 // case -- and can't be reused inside this new function's IR.
-                let self_clos = self.make_closure(fnv, params.len());
+                // Self-recursion closure: a *separate* closure block sharing
+                // this invocation's env (arg 0), so a recursive call re-supplies
+                // the same captures. It's a second block over `env`, so bump the
+                // env header (balanced when this cell is released at fn exit).
+                let body_env = fnv.get_nth_param(0).unwrap().into_pointer_value();
+                let self_clos = self.make_closure(fnv, params.len(), body_env);
+                self.retain_env(body_env);
                 let self_cell = self.malloc_bytes(16);
                 self.builder.build_store(self_cell, self_clos).unwrap();
                 let argv = fnv.get_nth_param(1).unwrap().into_pointer_value();
                 let mut scope = HashMap::new();
                 scope.insert(name.clone(), self_cell);
+                // Re-materialize each captured variable as an ordinary local
+                // cell, loaded from the env block (slot order fixed by
+                // `capture_names`) and retained. `lookup` then resolves captures
+                // exactly like params -- which is why the `mem::take` above can
+                // stay: the enclosing frame is never consulted.
+                for (i, cn) in capture_names.iter().enumerate() {
+                    let slot = self.env_slot(body_env, i64t.const_int(i as u64, false));
+                    let v = self.builder.build_load(self.value_ty, slot, cn).unwrap().into_struct_value();
+                    self.call_named("verb_retain_value", &[v.into()]);
+                    let cell = self.malloc_bytes(16);
+                    self.builder.build_store(cell, v).unwrap();
+                    scope.insert(cn.clone(), cell);
+                }
                 for (i, p) in params.iter().enumerate() {
                     let ap = unsafe {
                         self.builder.build_in_bounds_gep(

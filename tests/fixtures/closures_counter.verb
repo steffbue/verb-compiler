@@ -1,0 +1,13 @@
+%% a returned closure keeps its captured param alive past the outer frame,
+%% and each closure gets its own independent snapshot
+make adder(n) begin
+  make add_n(x) begin
+    return x add n;
+  end
+  return add_n;
+end
+assign add5 adder(5);
+assign add10 adder(10);
+print(add5(1));
+print(add10(1));
+print(add5(100));

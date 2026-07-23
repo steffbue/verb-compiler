@@ -1,0 +1,11 @@
+%% captures are by value: mutating the inner copy leaves the outer var unchanged
+make outer() begin
+  assign x 10;
+  make inner() begin
+    x be x add 5;
+    return x;
+  end
+  assign inner_result inner();
+  return x add inner_result;
+end
+print(outer());

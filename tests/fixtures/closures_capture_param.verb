@@ -1,4 +1,4 @@
-%% nested `make` must not see the enclosing function's parameters either
+%% a nested `make` captures an enclosing parameter by value
 make outer(a) begin
   make inner() begin
     return a;

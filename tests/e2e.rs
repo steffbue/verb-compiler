@@ -208,14 +208,24 @@ fn call_non_function_aborts() { run_err("err_call_nonfn", "can only call functio
 fn nested_make_sees_own_scope_and_top_level_globals() { run_ok("closures"); }
 
 #[test]
-fn nested_make_cannot_capture_enclosing_local() {
-    compile_err("err_closure_no_capture", &["undefined variable 'local'"]);
-}
+fn nested_make_captures_enclosing_local() { run_ok("closures_capture_local"); }
 
 #[test]
-fn nested_make_cannot_capture_enclosing_param() {
-    compile_err("err_closure_no_capture_param", &["undefined variable 'a'"]);
-}
+fn nested_make_captures_enclosing_param() { run_ok("closures_capture_param"); }
+
+// A returned closure keeps its captured value alive past the frame that
+// created it, and each closure carries its own independent snapshot.
+#[test]
+fn returned_closure_captures_outlive_the_frame() { run_ok("closures_counter"); }
+
+// Capture is by value: mutating the inner copy leaves the outer var unchanged.
+#[test]
+fn captures_are_by_value_snapshots() { run_ok("closures_by_value"); }
+
+// Capturing heap values (string/array) and dropping the closures (reassign +
+// program exit) leaks nothing.
+#[test]
+fn capturing_closures_release_their_env() { assert_no_leaks("gc_closures_capture"); }
 
 #[test]
 fn wrong_arity_aborts() {
@@ -907,6 +917,8 @@ fn gc_no_leaks_across_all_heap_kinds() {
         "gc_arrays_nested", "gc_arrays_of_closures", "gc_arrays_regrow",
         "gc_map_heap_values", "gc_std_io_file_roundtrip",
         "structs_basic", "structs_nested", "gc_structs",
+        "closures_capture_local", "closures_capture_param",
+        "closures_counter", "closures_by_value", "gc_closures_capture",
     ] {
         assert_no_leaks(fixture);
     }

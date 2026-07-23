@@ -1,8 +1,8 @@
-%% nested `make` must not see the enclosing function's locals
+%% a nested `make` captures an enclosing local (and param) by value
 make outer(a) begin
   assign local 1;
   make inner() begin
-    return local;
+    return a add local;
   end
   return inner();
 end

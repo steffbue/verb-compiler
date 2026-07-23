@@ -1,0 +1,21 @@
+%% capturing heap values (a string, an array) and then dropping the closures
+%% -- via reassignment and at program exit -- must leak nothing
+make make_greeter(name) begin
+  make greet() begin
+    return "hi " join name;
+  end
+  return greet;
+end
+assign g make_greeter("wo" join "rld");
+print(g());
+g be make_greeter("th" join "ere");
+print(g());
+
+make holder(items) begin
+  make first() begin
+    return get(items, 0);
+  end
+  return first;
+end
+assign h holder(list 10, 20, 30);
+print(h());
