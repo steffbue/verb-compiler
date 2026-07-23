@@ -437,52 +437,37 @@ fn verb_std_io_cpp_compiles_standalone() {
     let _ = std::fs::remove_file(&obj);
 }
 
-// `runtime/verb_std_io.cpp` is compiled into every binary in this package
-// via build.rs, but a plain static-archive link only pulls in object files
-// that resolve an undefined symbol -- nothing in this test crate calls
-// `file_read`, so without a forcing reference `verb_std_io.o` would never
-// be linked into *this* test binary at all, regardless of the dynamic-export
-// flag (see .cargo/config.toml). build.rs forces every runtime symbol into
-// the `verb` bin specifically (via `-Wl,-u,SYMBOL`, scoped with
-// rustc-link-arg-bin); Cargo has no per-test-name equivalent of that
-// scoping, so this test binary instead mirrors the older, narrower trick
-// `src/main.rs` already uses for `verb_map_destroy_contents`: take a real
-// reference to the one symbol under test, which is enough to pull its
-// object file in via ordinary archive extraction (see the unscoped
-// `-lverb_runtime`/`-lc++` re-emitted in build.rs) and, since it's `#[used]`,
-// to survive dead-code stripping too. `file_read` itself calls `verb_alloc`
-// (defined by Verb's own generated code per runtime/verb.h); this test
-// binary has none, so it supplies a stub purely to satisfy the linker -- it
-// is never invoked, since the test only resolves `file_read`'s address,
-// never calls it.
-#[repr(C)]
-struct VerbValueAbi {
-    tag: i8,
-    payload: i64,
-}
-
-extern "C" {
-    fn file_read(path: VerbValueAbi) -> VerbValueAbi;
-}
-
-#[no_mangle]
-pub extern "C" fn verb_alloc(_n: i64) -> *mut std::ffi::c_void {
-    unreachable!("test stub: file_read is resolved via dlsym but never called");
-}
-
-#[used]
-static FORCE_LINK_FILE_READ: unsafe extern "C" fn(VerbValueAbi) -> VerbValueAbi = file_read;
-
+// `runtime/verb_std_io.cpp` (and `verb_map.cpp`) are compiled into the
+// `verb` binary via build.rs, which force-links their C-ABI symbols with a
+// bin-scoped `cargo:rustc-link-arg-bin=verb=-Wl,-u,SYMBOL` so they remain
+// present -- and dynamically exported -- in the shipped `verb` binary for
+// dlsym(RTLD_DEFAULT, ...) resolution at JIT run time. This test inspects
+// the actual shipped `verb` binary's symbol table (via `nm`) rather than
+// this test process's own, since the force-link is scoped to the `verb`
+// bin specifically and gives no guarantee about any other binary/test
+// crate in this package.
 #[test]
 fn in_binary_std_symbols_are_dynamically_resolvable() {
-    // verb_std_io.cpp must be compiled into the `verb` test binary (build.rs)
-    // and its symbols exported so dlsym(RTLD_DEFAULT, ...) can find them.
-    // This is the resolution path the JIT uses for std io / std map.
-    use std::ffi::CString;
-    let name = CString::new("file_read").unwrap();
-    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    assert!(!addr.is_null(), "file_read not resolvable via dlsym(RTLD_DEFAULT); \
-        verb_std_io.cpp not compiled in or dynamic export flag not effective");
+    let bin = env!("CARGO_BIN_EXE_verb");
+    let out = Command::new("nm")
+        .args(["-g", bin])
+        .output()
+        .expect("failed to invoke nm on the verb binary");
+    assert!(
+        out.status.success(),
+        "nm failed on {bin}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let symtab = String::from_utf8_lossy(&out.stdout);
+    for sym in ["file_read", "map_new", "verb_alloc", "verb_map_destroy_contents"] {
+        assert!(
+            symtab.contains(sym),
+            "expected runtime symbol `{sym}` in `verb` binary's global symbol \
+             table (via `nm -g {bin}`), but it was not found; verb_std_io.cpp / \
+             verb_map.cpp may not be force-linked into the `verb` bin (check \
+             build.rs's bin-scoped rustc-link-arg-bin=verb=-Wl,-u,SYMBOL flags)"
+        );
+    }
 }
 
 #[test]
