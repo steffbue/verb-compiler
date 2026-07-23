@@ -1708,6 +1708,11 @@ impl<'ctx> Codegen<'ctx> {
                 let lenp = self.builder.build_alloca(i64t, "fe.lenp").unwrap();
                 let kindp = self.builder.build_alloca(i8t, "fe.kindp").unwrap();
                 let idxp = self.builder.build_alloca(i64t, "fe.idxp").unwrap();
+                // Hoisted out of the loop body: an alloca inside `fe.body` would
+                // re-execute (and grow the stack) on every iteration under
+                // OptimizationLevel::None, since LLVM only dedupes/hoists allocas
+                // via mem2reg at higher opt levels.
+                let elemp = self.builder.build_alloca(self.value_ty, "fe.elemp").unwrap();
 
                 let arr_bb  = self.ctx.append_basic_block(f, "fe.array");
                 let bad_bb  = self.ctx.append_basic_block(f, "fe.badtype");
@@ -1749,7 +1754,6 @@ impl<'ctx> Codegen<'ctx> {
 
                 // body: fetch element by kind, store into elemp, branch to bound
                 self.builder.position_at_end(body_bb);
-                let elemp = self.builder.build_alloca(self.value_ty, "fe.elemp").unwrap();
                 let kind = self.builder.build_load(i8t, kindp, "fe.kind").unwrap().into_int_value();
                 let fetch_arr_bb = self.ctx.append_basic_block(f, "fe.fetch.array");
                 self.builder.build_switch(

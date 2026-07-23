@@ -190,6 +190,16 @@ fn foreach_over_array_is_leak_free() {
 }
 
 #[test]
+fn foreach_early_return_is_leak_free() {
+    assert_no_leaks("foreach_array_early_return");
+}
+
+#[test]
+fn foreach_early_return_output() {
+    run_ok("foreach_array_early_return");
+}
+
+#[test]
 fn foreach_over_non_iterable_is_runtime_error() {
     run_err("err_foreach_not_iterable", "cannot iterate int");
 }
