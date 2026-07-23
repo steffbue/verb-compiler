@@ -1,0 +1,7 @@
+shape Person begin name, age end
+shape Team begin lead, size end
+assign a Person("Alice", 30);
+assign t Team(a, 5);
+print(getf(a, "name"));
+print(getf(getf(t, "lead"), "name"));
+print(getf(t, "size"));

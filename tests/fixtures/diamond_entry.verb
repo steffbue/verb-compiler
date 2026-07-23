@@ -1,0 +1,4 @@
+import mod diamond_a.verb;
+import mod diamond_b.verb;
+
+print("entry");
