@@ -1,0 +1,7 @@
+assign xs list 10, 20, 30;
+assign total 0;
+each n in xs begin
+  total be total add n;
+  print(n);
+end
+print(total);

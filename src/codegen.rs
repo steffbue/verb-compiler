@@ -1678,7 +1678,115 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(end_bb);
                 Ok(())
             }
-            Stmt::ForEach { .. } => unimplemented!("for-each codegen (Task 4)"),
+            Stmt::ForEach { name, coll, body } => {
+                use crate::value::{TAG_ARRAY, TAG_INT};
+                let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let i64t = self.ctx.i64_type();
+                let i8t = self.ctx.i8_type();
+
+                // Evaluate the collection once (+1 owned). Park it in an outer
+                // scope cell so a `return` inside the body (which calls
+                // release_all_open_scopes) frees it, and so normal loop exit
+                // frees it exactly once.
+                let collv = self.gen_expr(coll)?;
+                self.scopes.push(HashMap::new());
+                self.bind("$foreach_coll", collv);
+
+                let tag = self.tag_of(collv);
+                // Reuse the collection expression's source span for error
+                // locations (ForEach carries none of its own).
+                let (el, ec) = match coll {
+                    Expr::Var(_, l, c) => (*l, *c),
+                    Expr::Binary { line, col, .. }
+                    | Expr::Unary { line, col, .. }
+                    | Expr::Call { line, col, .. } => (*line, *col),
+                    _ => (0, 0),
+                };
+                let (lc, cc) = self.loc_consts(el, ec);
+
+                // len + kind are computed in the dispatch, read in the loop.
+                let lenp = self.builder.build_alloca(i64t, "fe.lenp").unwrap();
+                let kindp = self.builder.build_alloca(i8t, "fe.kindp").unwrap();
+                let idxp = self.builder.build_alloca(i64t, "fe.idxp").unwrap();
+
+                let arr_bb  = self.ctx.append_basic_block(f, "fe.array");
+                let bad_bb  = self.ctx.append_basic_block(f, "fe.badtype");
+                let setup_bb = self.ctx.append_basic_block(f, "fe.setup");
+                let cond_bb = self.ctx.append_basic_block(f, "fe.cond");
+                let body_bb = self.ctx.append_basic_block(f, "fe.body");
+                let bound_bb = self.ctx.append_basic_block(f, "fe.bound");
+                let end_bb  = self.ctx.append_basic_block(f, "fe.end");
+
+                // dispatch on runtime tag (string/map cases inserted in Tasks 5/6)
+                self.builder.build_switch(
+                    tag, bad_bb,
+                    &[(i8t.const_int(TAG_ARRAY, false), arr_bb)],
+                ).unwrap();
+
+                // array: len = verb_array_len(coll)
+                self.builder.position_at_end(arr_bb);
+                let alen = self.call_named("verb_array_len", &[collv.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.builder.build_store(lenp, self.payload_of(alen)).unwrap();
+                self.builder.build_store(kindp, i8t.const_int(0, false)).unwrap();
+                self.builder.build_unconditional_branch(setup_bb).unwrap();
+
+                // non-iterable value: abort with its type name
+                self.builder.position_at_end(bad_bb);
+                self.abort_at(lc, cc, "cannot iterate %s", &[self.type_name(tag)]);
+
+                // setup: idx = 0
+                self.builder.position_at_end(setup_bb);
+                self.builder.build_store(idxp, i64t.const_zero()).unwrap();
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+                // cond: idx < len ?
+                self.builder.position_at_end(cond_bb);
+                let i = self.builder.build_load(i64t, idxp, "fe.i").unwrap().into_int_value();
+                let len = self.builder.build_load(i64t, lenp, "fe.len").unwrap().into_int_value();
+                let more = self.builder.build_int_compare(inkwell::IntPredicate::SLT, i, len, "fe.more").unwrap();
+                self.builder.build_conditional_branch(more, body_bb, end_bb).unwrap();
+
+                // body: fetch element by kind, store into elemp, branch to bound
+                self.builder.position_at_end(body_bb);
+                let elemp = self.builder.build_alloca(self.value_ty, "fe.elemp").unwrap();
+                let kind = self.builder.build_load(i8t, kindp, "fe.kind").unwrap().into_int_value();
+                let fetch_arr_bb = self.ctx.append_basic_block(f, "fe.fetch.array");
+                self.builder.build_switch(
+                    kind, fetch_arr_bb,
+                    &[(i8t.const_int(0, false), fetch_arr_bb)],
+                ).unwrap();
+
+                self.builder.position_at_end(fetch_arr_bb);
+                let iv = self.make_val(TAG_INT, i);
+                let elem = self.call_named("verb_array_get", &[collv.into(), iv.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.builder.build_store(elemp, elem).unwrap();
+                self.builder.build_unconditional_branch(bound_bb).unwrap();
+
+                // bound: bind element to `name` in a fresh iteration scope, run body
+                self.builder.position_at_end(bound_bb);
+                let elemv = self.builder.build_load(self.value_ty, elemp, "fe.elem").unwrap().into_struct_value();
+                self.scopes.push(HashMap::new());
+                self.bind(name, elemv);
+                self.gen_stmts(body)?;
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
+                if self.cur_block_open() {
+                    let i2 = self.builder.build_load(i64t, idxp, "fe.i2").unwrap().into_int_value();
+                    let nxt = self.builder.build_int_add(i2, i64t.const_int(1, false), "fe.next").unwrap();
+                    self.builder.build_store(idxp, nxt).unwrap();
+                    self.builder.build_unconditional_branch(cond_bb).unwrap();
+                }
+
+                // end: release the collection (outer scope cell)
+                self.builder.position_at_end(end_bb);
+                if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                Ok(())
+            }
             Stmt::Fn { name, params, body, .. } => {
                 self.fn_counter += 1;
                 let llname = format!("fn.{}.{}", name, self.fn_counter);

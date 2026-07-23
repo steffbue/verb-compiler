@@ -180,6 +180,21 @@ fn foreach_over_empty_range_runs_zero_times() {
 }
 
 #[test]
+fn foreach_over_array_visits_every_element() {
+    run_ok("foreach_array");
+}
+
+#[test]
+fn foreach_over_array_is_leak_free() {
+    assert_no_leaks("foreach_array");
+}
+
+#[test]
+fn foreach_over_non_iterable_is_runtime_error() {
+    run_err("err_foreach_not_iterable", "cannot iterate int");
+}
+
+#[test]
 fn functions() { run_ok("functions"); }
 
 #[test]
