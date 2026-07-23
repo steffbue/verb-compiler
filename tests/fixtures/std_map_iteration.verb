@@ -1,0 +1,33 @@
+import std map;
+
+%% single-entry map -> keys/values arrays are deterministic
+assign m1 map_new();
+map_set(m1, 7, 100);
+print(map_keys(m1));
+print(map_values(m1));
+
+%% empty map -> empty arrays (a valid result, not nil)
+assign e map_new();
+print(map_keys(e));
+print(map_values(e));
+print(len(map_keys(e)));
+
+%% invalid (non-map) argument -> nil, matching map_get's convention
+print(map_keys(42));
+print(map_values("nope"));
+
+%% multi-entry: element count is deterministic even though order isn't,
+%% and summing the values is order-independent
+assign m map_new();
+map_set(m, "a", 10);
+map_set(m, "b", 20);
+map_set(m, "c", 30);
+print(len(map_keys(m)));
+assign vs map_values(m);
+assign sum 0;
+assign i 0;
+repeat i trails len(vs) begin
+  sum be sum add get(vs, i);
+  i be i add 1;
+end
+print(sum);
