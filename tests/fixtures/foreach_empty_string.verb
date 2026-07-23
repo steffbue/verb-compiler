@@ -1,0 +1,5 @@
+assign s "";
+each ch in s begin
+  print(ch);
+end
+print("done");

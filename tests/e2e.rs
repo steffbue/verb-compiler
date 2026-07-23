@@ -215,6 +215,16 @@ fn foreach_over_string_is_leak_free() {
 }
 
 #[test]
+fn foreach_over_empty_string_runs_zero_times() {
+    run_ok("foreach_empty_string");
+}
+
+#[test]
+fn foreach_over_empty_string_is_leak_free() {
+    assert_no_leaks("foreach_empty_string");
+}
+
+#[test]
 fn functions() { run_ok("functions"); }
 
 #[test]
