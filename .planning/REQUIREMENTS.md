@@ -32,6 +32,7 @@ Requirements for the current milestone. Each maps to a roadmap phase.
 - [x] **FFI-01**: Developer can write `import mod <name>;` at the top of a
   program and call an extern C++ function through the shared VerbValue ABI
   when using `verb build`; `verb run` rejects any program containing imports
+  (superseded for `run` by FFI-V2-01)
 
 - [x] **FFI-02**: Developer can expose a C++ function to Verb with a single
   `VERB_EXPORT(name, arity, callable)` line in `runtime/verb.h`, instead of
@@ -47,7 +48,7 @@ Requirements for the current milestone. Each maps to a roadmap phase.
 
 - [x] **STDIO-01**: Developer can write `import std io;` and read stdin,
   read/write/append files, and use blocking TCP sockets from Verb code
-  (build-only; `verb run` rejects it)
+  (build-only; `verb run` rejects it) (superseded for `run` by FFI-V2-01)
 
 - [x] **MULTI-01**: Developer can pass multiple `.verb` files to `verb run`/
   `verb build` and have them compile and link as a single program, with

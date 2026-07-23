@@ -176,12 +176,19 @@ fn load_import_libs<'ctx>(
         if !unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }.is_null() {
             continue;
         }
+        let mut resolved = false;
         for &handle in &handles {
             let addr = unsafe { libc::dlsym(handle, cname.as_ptr()) };
             if !addr.is_null() {
                 ee.add_global_mapping(&func, addr as usize);
+                resolved = true;
                 break;
             }
+        }
+        if !resolved {
+            eprintln!("error: unresolved symbol '{name}' -- not found in any imported \
+                library ({}) or their search dirs ({})", imports.join(", "), dirs.join(", "));
+            exit(1);
         }
     }
     handles
@@ -331,6 +338,11 @@ fn main() {
     match parsed.cmd.as_str() {
         "run" => {
             let has_imports = !imports.is_empty() || !std_imports.is_empty();
+            // Defensive only: this runtime check is not the real gate. The JIT-import
+            // machinery below (load_import_libs) uses unix-only libc::dlopen/dlsym/RTLD_*,
+            // so a Windows-target build of this file fails to compile long before this
+            // guard could ever run. The actual "Windows host unsupported" gate is
+            // compile-time (this module simply won't build for target_os = "windows").
             if has_imports && cfg!(target_os = "windows") {
                 eprintln!("error: 'verb run' does not support imports on Windows; use 'verb build'");
                 exit(1);
