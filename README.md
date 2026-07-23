@@ -307,10 +307,18 @@ See `docs/superpowers/specs/2026-07-19-verb-compiler-design.md` for the spec.
     end
     print(add2(x, 1));   %% 43
 
+    %% loops: `repeat` (while) and `loop` (for), with `leave` (break)
+    %% and `next` (continue)
+    loop assign i 0; i trails 5; i be i add 1 begin
+      check i equals 2 begin next; end   %% skip 2 (increment still runs)
+      check i equals 4 begin leave; end  %% stop before 4
+      print(i);                          %% 0 1 3
+    end
+
 ## Known v1 limitations
 
 - No GC — heap allocations are never freed
-- No `break`/`continue`, no anonymous functions
+- No anonymous functions
 - No closures — a nested `make` cannot reference any variable from its
   enclosing function's scope (not even ones declared before it); it can
   only see its own parameters/locals and top-level globals

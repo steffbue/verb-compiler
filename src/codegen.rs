@@ -39,6 +39,22 @@ pub struct Codegen<'ctx> {
     cur_file: String,
     debug_hooks: bool,
     debugvar_ty: StructType<'ctx>,
+    /// Active loops, innermost last. `leave`/`next` branch to the
+    /// innermost entry's `break_bb`/`continue_bb`, releasing every scope
+    /// from `body_scope_depth` up to the current top first.
+    loops: Vec<LoopCtx<'ctx>>,
+}
+
+/// Branch targets and scope depth for one enclosing loop, so `leave`
+/// (break) and `next` (continue) know where to jump and how many scopes
+/// to release on the way out.
+#[derive(Clone, Copy)]
+struct LoopCtx<'ctx> {
+    continue_bb: inkwell::basic_block::BasicBlock<'ctx>,
+    break_bb: inkwell::basic_block::BasicBlock<'ctx>,
+    /// `self.scopes.len()` right after the loop body's own scope was
+    /// pushed; `leave`/`next` release `scopes[body_scope_depth - 1..]`.
+    body_scope_depth: usize,
 }
 
 /// Compile-time info for a declared `record`: a pointer to its static
@@ -93,6 +109,7 @@ impl<'ctx> Codegen<'ctx> {
             imports: Vec::new(), std_imports: Vec::new(), extern_sigs: HashMap::new(),
             fn_depth: 0, fn_counter: 0,
             cur_file: String::new(), debug_hooks: false,
+            loops: Vec::new(),
         };
         cg.declare_libc();
         cg.declare_gc_globals();
@@ -527,6 +544,18 @@ impl<'ctx> Codegen<'ctx> {
     /// terminated.
     fn release_all_open_scopes(&self) {
         for scope in self.scopes.iter().rev() {
+            self.release_scope(scope);
+        }
+    }
+
+    /// Releases every cell in scopes `[depth - 1 ..]` (innermost first)
+    /// without popping them -- used by `leave`/`next` to free the loop
+    /// body's locals (and any nested block/if scopes opened inside it)
+    /// before branching out of the current iteration. The Rust-side pops
+    /// still happen later, guarded by `cur_block_open`, once the branch
+    /// has closed the block.
+    fn release_scopes_to_loop(&self, depth: usize) {
+        for scope in self.scopes[depth - 1..].iter().rev() {
             self.release_scope(scope);
         }
     }
@@ -2742,7 +2771,15 @@ impl<'ctx> Codegen<'ctx> {
 
                 self.builder.position_at_end(body_bb);
                 self.scopes.push(HashMap::new());
-                self.gen_stmts(body)?;
+                // `next` re-tests the condition; `leave` exits.
+                self.loops.push(LoopCtx {
+                    continue_bb: cond_bb,
+                    break_bb: end_bb,
+                    body_scope_depth: self.scopes.len(),
+                });
+                let r = self.gen_stmts(body);
+                self.loops.pop();
+                r?;
                 if self.cur_block_open() {
                     if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
                 } else {
@@ -2752,6 +2789,69 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_unconditional_branch(cond_bb).unwrap();
                 }
                 self.builder.position_at_end(end_bb);
+                Ok(())
+            }
+            Stmt::For { init, cond, incr, body, .. } => {
+                let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                // The init binding lives in a scope wrapping the whole loop,
+                // released once at `for.end` (not per iteration).
+                self.scopes.push(HashMap::new());
+                self.gen_stmt(init)?;
+
+                let cond_bb = self.ctx.append_basic_block(f, "for.cond");
+                let body_bb = self.ctx.append_basic_block(f, "for.body");
+                let incr_bb = self.ctx.append_basic_block(f, "for.incr");
+                let end_bb = self.ctx.append_basic_block(f, "for.end");
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+                self.builder.position_at_end(cond_bb);
+                let cv = self.gen_expr(cond)?;
+                let t = self.call_named("verb_truthy", &[cv.into()]).unwrap().into_int_value();
+                self.call_named("verb_release_value", &[cv.into()]);
+                self.builder.build_conditional_branch(t, body_bb, end_bb).unwrap();
+
+                self.builder.position_at_end(body_bb);
+                self.scopes.push(HashMap::new());
+                // `next` runs the increment before re-testing; `leave` exits.
+                self.loops.push(LoopCtx {
+                    continue_bb: incr_bb,
+                    break_bb: end_bb,
+                    body_scope_depth: self.scopes.len(),
+                });
+                let r = self.gen_stmts(body);
+                self.loops.pop();
+                r?;
+                if self.cur_block_open() {
+                    if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                } else {
+                    self.scopes.pop();
+                }
+                if self.cur_block_open() {
+                    self.builder.build_unconditional_branch(incr_bb).unwrap();
+                }
+
+                self.builder.position_at_end(incr_bb);
+                self.gen_stmt(incr)?;
+                if self.cur_block_open() {
+                    self.builder.build_unconditional_branch(cond_bb).unwrap();
+                }
+
+                self.builder.position_at_end(end_bb);
+                // release the init scope (still on the stack)
+                if let Some(scope) = self.scopes.pop() { self.release_scope(&scope); }
+                Ok(())
+            }
+            Stmt::Break { .. } => {
+                // parser guarantees we're inside a loop
+                let lc = *self.loops.last().expect("'leave' outside loop reached codegen");
+                self.release_scopes_to_loop(lc.body_scope_depth);
+                self.builder.build_unconditional_branch(lc.break_bb).unwrap();
+                Ok(())
+            }
+            Stmt::Continue { .. } => {
+                let lc = *self.loops.last().expect("'next' outside loop reached codegen");
+                self.release_scopes_to_loop(lc.body_scope_depth);
+                self.builder.build_unconditional_branch(lc.continue_bb).unwrap();
                 Ok(())
             }
             Stmt::Fn { name, params, body, .. } => {
@@ -4095,6 +4195,9 @@ fn stmt_line(stmt: &Stmt) -> Option<u32> {
         Stmt::FieldSet { line, .. } => Some(*line),
         Stmt::Choice { line, .. } => Some(*line),
         Stmt::Match { line, .. } => Some(*line),
+        Stmt::For { line, .. } => Some(*line),
+        Stmt::Break { line, .. } => Some(*line),
+        Stmt::Continue { line, .. } => Some(*line),
         Stmt::Return { .. } => None,
     }
 }

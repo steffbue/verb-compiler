@@ -1,0 +1,31 @@
+%% --- leave (break) in repeat: stop before printing 3 ---
+assign i 0;
+repeat i trails 10 begin
+  i be i add 1;
+  check i equals 3 begin
+    leave;
+  end
+  print(i);
+end
+
+%% --- next (continue) in for: skip 2, increment still runs so loop ends ---
+loop assign j 0; j trails 5; j be j add 1 begin
+  check j equals 2 begin
+    next;
+  end
+  print(j);
+end
+
+%% --- nested loops: leave targets the inner loop only ---
+assign a 0;
+repeat a trails 2 begin
+  assign b 0;
+  repeat b trails 5 begin
+    check b equals 1 begin
+      leave;
+    end
+    print(a times 10 add b);
+    b be b add 1;
+  end
+  a be a add 1;
+end

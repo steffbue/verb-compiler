@@ -3,7 +3,7 @@ use crate::error::CompileError;
 use crate::lexer::{renamed_keyword, Token, TokenKind};
 
 pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
-    let mut p = Parser { toks, pos: 0, fn_depth: 0 };
+    let mut p = Parser { toks, pos: 0, fn_depth: 0, loop_depth: 0 };
     let (imports, std_imports, extern_sigs, verb_imports) = p.imports()?;
     let mut body = Vec::new();
     while !p.check(&TokenKind::Eof) {
@@ -23,7 +23,7 @@ pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
 /// keeps using `parse`, which stops at the first error like a normal
 /// compiler.
 pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
-    let mut p = Parser { toks, pos: 0, fn_depth: 0 };
+    let mut p = Parser { toks, pos: 0, fn_depth: 0, loop_depth: 0 };
     let mut imports = Vec::new();
     let mut std_imports = Vec::new();
     let mut extern_sigs = Vec::new();
@@ -54,6 +54,7 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
                 // never runs); recovery always resumes at top level, so
                 // depth tracking mid-error can't be trusted regardless.
                 p.fn_depth = 0;
+                p.loop_depth = 0;
                 p.synchronize();
                 // Some productions (e.g. `return` outside a function)
                 // fail without consuming their own token, and
@@ -85,6 +86,7 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     fn_depth: u32,
+    loop_depth: u32,
 }
 
 impl Parser {
@@ -224,7 +226,7 @@ impl Parser {
                 TokenKind::Semi | TokenKind::End => { self.advance(); return; }
                 TokenKind::Assign | TokenKind::Declare | TokenKind::Make | TokenKind::Return
                 | TokenKind::Check | TokenKind::Repeat | TokenKind::Loop | TokenKind::Begin
-                | TokenKind::Shape => return,
+                | TokenKind::Shape | TokenKind::Leave | TokenKind::Next => return,
                 _ => { self.advance(); }
             }
         }
@@ -244,12 +246,14 @@ impl Parser {
             TokenKind::Record => self.record_stmt(),
             TokenKind::Choice => self.choice_stmt(),
             TokenKind::Match => self.match_stmt(),
+            TokenKind::Leave => self.break_stmt(),
+            TokenKind::Next => self.continue_stmt(),
             TokenKind::Begin => Ok(Stmt::Block(self.block()?, line, col)),
             // `<field> of <expr> [be <value>];` — field get expr-stmt or field set
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Of => self.field_stmt(),
             // old statement keywords lex as identifiers now — catch them for a rename hint
             TokenKind::Ident(n) if *self.peek2() != TokenKind::Be
-                && matches!(n.as_str(), "if" | "else" | "while" | "for" | "fn") =>
+                && matches!(n.as_str(), "if" | "else" | "while" | "for" | "fn" | "break" | "continue") =>
             {
                 let new = renamed_keyword(n).unwrap();
                 Err(self.err(format!("unknown statement keyword '{n}'"))
@@ -301,8 +305,14 @@ impl Parser {
         }
         self.expect(&TokenKind::RParen, "')'")?;
         self.fn_depth += 1;
-        let body = self.block()?;
+        // A function body can't `leave`/`next` an enclosing loop: reset
+        // loop tracking so `leave` inside a `make` declared within a loop
+        // is still a compile error.
+        let saved_loop_depth = std::mem::take(&mut self.loop_depth);
+        let body = self.block();
+        self.loop_depth = saved_loop_depth;
         self.fn_depth -= 1;
+        let body = body?;
         Ok(Stmt::Fn { name, params, body, line, col })
     }
 
@@ -363,8 +373,10 @@ impl Parser {
     fn while_stmt(&mut self, line: u32, col: u32) -> Result<Stmt, CompileError> {
         self.advance(); // repeat
         let cond = self.expression()?;
-        let body = self.block()?;
-        Ok(Stmt::While { cond, body, line, col })
+        self.loop_depth += 1;
+        let body = self.block();
+        self.loop_depth -= 1;
+        Ok(Stmt::While { cond, body: body?, line, col })
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, CompileError> {
@@ -375,7 +387,6 @@ impl Parser {
             TokenKind::Ident(_) if *self.peek2() == TokenKind::Be => self.reassign_stmt(true)?,
             _ => return Err(self.err("expected 'assign' or reassignment in for-init")),
         };
-        let (cond_line, cond_col) = self.here();
         let cond = self.expression()?;
         self.expect(&TokenKind::Semi, "';'")?;
         let incr = match self.peek() {
@@ -385,9 +396,12 @@ impl Parser {
                 Stmt::ExprStmt(self.expression()?, eline, ecol)
             }
         };
-        let mut body = self.block()?;
-        body.push(incr);
-        Ok(Stmt::Block(vec![init, Stmt::While { cond, body, line: cond_line, col: cond_col }], line, col))
+        self.loop_depth += 1;
+        let body = self.block();
+        self.loop_depth -= 1;
+        // A real `For` node (not a desugared `while`) so `next` can run the
+        // increment before re-testing the condition.
+        Ok(Stmt::For { init: Box::new(init), cond, incr: Box::new(incr), body: body?, line, col })
     }
 
     /// `record Point begin x, y end` — a record/struct type declaration.
@@ -491,6 +505,26 @@ impl Parser {
             self.expect(&TokenKind::Semi, "';'")?;
             Ok(Stmt::ExprStmt(e, line, col))
         }
+    }
+
+    fn break_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
+        if self.loop_depth == 0 {
+            return Err(self.err("'leave' outside loop"));
+        }
+        self.advance(); // leave
+        self.expect(&TokenKind::Semi, "';'")?;
+        Ok(Stmt::Break { line, col })
+    }
+
+    fn continue_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
+        if self.loop_depth == 0 {
+            return Err(self.err("'next' outside loop"));
+        }
+        self.advance(); // next
+        self.expect(&TokenKind::Semi, "';'")?;
+        Ok(Stmt::Continue { line, col })
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, CompileError> {
@@ -751,20 +785,34 @@ mod tests {
     }
 
     #[test]
-    fn desugars_for_to_while() {
+    fn parses_for_into_for_node() {
         let p = parse(lex("loop assign i 0; i trails 10; i be i add 1 begin print(i); end").unwrap()).unwrap();
         match &p.body[0] {
-            Stmt::Block(inner, ..) => {
-                assert!(matches!(&inner[0], Stmt::Assign { name, .. } if name == "i"));
-                match &inner[1] {
-                    Stmt::While { body, .. } => {
-                        assert!(matches!(body.last().unwrap(), Stmt::Reassign { name, .. } if name == "i"));
-                    }
-                    other => panic!("{other:?}"),
-                }
+            Stmt::For { init, incr, body, .. } => {
+                assert!(matches!(init.as_ref(), Stmt::Assign { name, .. } if name == "i"));
+                assert!(matches!(incr.as_ref(), Stmt::Reassign { name, .. } if name == "i"));
+                assert!(matches!(&body[0], Stmt::ExprStmt(..)));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn break_and_continue_parse_inside_loop() {
+        let p = parse(lex("repeat 1 trails 2 begin leave; next; end").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::While { body, .. } => {
+                assert!(matches!(&body[0], Stmt::Break { .. }));
+                assert!(matches!(&body[1], Stmt::Continue { .. }));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_outside_loop_errors() {
+        assert!(parse(lex("leave;").unwrap()).is_err());
+        assert!(parse(lex("next;").unwrap()).is_err());
     }
 
     #[test]

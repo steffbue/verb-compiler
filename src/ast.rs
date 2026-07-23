@@ -27,6 +27,9 @@ pub enum Stmt {
     ExprStmt(Expr, u32, u32),
     If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>>, line: u32, col: u32 },
     While { cond: Expr, body: Vec<Stmt>, line: u32, col: u32 },
+    For { init: Box<Stmt>, cond: Expr, incr: Box<Stmt>, body: Vec<Stmt>, line: u32, col: u32 }, // loop init; cond; incr begin … end
+    Break { line: u32, col: u32 },     // leave;   -- exit innermost loop
+    Continue { line: u32, col: u32 },  // next;    -- jump to next iteration
     Fn { name: String, params: Vec<String>, body: Vec<Stmt>, line: u32, col: u32 },
     Shape { name: String, fields: Vec<String>, line: u32, col: u32 },      // shape Name begin f1, f2 end
     Return { value: Option<Expr> },
@@ -173,6 +176,18 @@ fn collect_free_stmt(
             collect_free_stmts(body, bound, out, seen);
             bound.pop();
         }
+        Stmt::For { init, cond, incr, body, .. } => {
+            // The for-loop's init binds a variable (e.g. `loop assign i 0;`)
+            // visible in the condition, increment, and body — a fresh frame.
+            bound.push(HashSet::new());
+            collect_free_stmt(init, bound, out, seen);
+            collect_free_expr(cond, bound, out, seen);
+            collect_free_stmt(incr, bound, out, seen);
+            collect_free_stmts(body, bound, out, seen);
+            bound.pop();
+        }
+        // `leave`/`next` reference no names.
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Block(stmts, ..) => {
             bound.push(HashSet::new());
             collect_free_stmts(stmts, bound, out, seen);

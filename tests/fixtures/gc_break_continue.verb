@@ -1,0 +1,24 @@
+%% repeat: each iteration allocates a heap string; next/leave must
+%% release the loop-body scope so nothing leaks.
+assign i 0;
+repeat i trails 6 begin
+  i be i add 1;
+  assign s "iter";
+  check i equals 2 begin
+    next;
+  end
+  check i equals 5 begin
+    leave;
+  end
+  print(s);
+end
+
+%% for: each iteration allocates a heap array; next still runs the
+%% increment (so the loop terminates) and releases the body scope.
+loop assign k 0; k trails 4; k be k add 1 begin
+  assign a list k, k, k;
+  check k equals 1 begin
+    next;
+  end
+  print(a);
+end

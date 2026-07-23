@@ -1,0 +1,9 @@
+%% 'leave' inside a function does not see an enclosing loop:
+%% the function boundary resets loop tracking.
+assign i 0;
+repeat i trails 2 begin
+  make f() begin
+    leave;
+  end
+  i be i add 1;
+end
