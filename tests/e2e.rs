@@ -378,16 +378,28 @@ fn build_with_l_flag_forwards_it_without_breaking_the_build() {
     let _ = std::fs::remove_file(&out_path);
 }
 
-#[test]
-fn run_rejects_programs_with_imports() {
+/// Runs `<fixture>.verb` through the JIT with `-L<lib_dir>`, asserting
+/// success and matching `<fixture>.expected`.
+fn run_with_lib_ok(fixture: &str, lib_dir: &std::path::Path) {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(["run", "tests/fixtures/import_extern_call.verb"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not yet support 'import mod'"), "stderr: {stderr}");
-    assert!(stderr.contains("mathlib"), "stderr: {stderr}");
+        .args([
+            "run",
+            &format!("tests/fixtures/{fixture}.verb"),
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .output().unwrap();
+    assert!(out.status.success(), "{fixture}: run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string(format!("tests/fixtures/{fixture}.expected")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn run_imports_a_cpp_library_and_calls_extern_functions() {
+    // import mod under the JIT: dlopen the fixture lib, resolve externs,
+    // and (via c_shout returning a string) exercise the verb_alloc forwarder.
+    let lib_dir = build_mathlib_fixture();
+    run_with_lib_ok("import_mathlib", &lib_dir);
 }
 
 /// Compiles tests/fixtures/cpp/mathlib.cpp into a shared library once per

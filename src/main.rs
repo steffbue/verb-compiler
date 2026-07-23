@@ -20,8 +20,10 @@ use verb::targets;
 // always-referenced-but-conditionally-defined runtime symbols the same way:
 // list the `.cpp` in build.rs, and add a tuple to `register_jit_runtime_symbols`.
 
-// C++ ABI mirror of `VerbValue` (`{ i8, i64 }`) — see runtime/verb.h. Only
-// used to give the host stubs below a matching signature; never populated.
+// C++ ABI mirror of `VerbValue` (`{ i8, i64 }`) — see runtime/verb.h. Gives
+// the `verb_retain_value`/`verb_release_value` forwarders below a matching
+// signature; populated on every call made under `verb run` (JIT), by the
+// module's own emitted code and by any dlopen'd `import mod` library.
 #[repr(C)]
 pub struct VerbValueAbi {
     pub tag: i8,
@@ -111,6 +113,78 @@ fn register_jit_runtime_symbols<'ctx>(
         }
         ee.add_global_mapping(&f, addr as usize);
     }
+}
+
+/// dlopen each `import mod` library, resolve every extern the module
+/// declares against the opened handles, and register the address with the
+/// engine. `lib_dirs` entries are raw `-L/path` strings. Returns the opened
+/// handles (leaked for the process lifetime). Aborts the process with a
+/// clear message on any failure.
+fn load_import_libs<'ctx>(
+    ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
+    module: &inkwell::module::Module<'ctx>,
+    imports: &[String],
+    lib_dirs: &[String],
+) -> Vec<*mut std::ffi::c_void> {
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let dirs: Vec<&str> = lib_dirs.iter().map(|d| d.trim_start_matches("-L")).collect();
+    let mut handles = Vec::new();
+
+    for name in imports {
+        // Find libNAME.<ext> in a -L dir, else fall back to the bare soname
+        // so the loader's default search path applies.
+        let mut candidate: Option<std::ffi::CString> = None;
+        for dir in &dirs {
+            let p = std::path::Path::new(dir).join(format!("lib{name}.{ext}"));
+            if p.exists() {
+                candidate = Some(std::ffi::CString::new(p.to_str().unwrap()).unwrap());
+                break;
+            }
+        }
+        let path = candidate.unwrap_or_else(|| {
+            std::ffi::CString::new(format!("lib{name}.{ext}")).unwrap()
+        });
+        // RTLD_LOCAL (not GLOBAL): keep the lib's own symbols OUT of the
+        // global namespace, so the resolution loop below can tell a genuine
+        // in-process symbol (libc / std / forwarder) from a mod extern and
+        // map the latter explicitly via dlsym(handle, ...). The lib's own
+        // undefined refs (e.g. its verb_alloc callback) still resolve against
+        // this executable's dynamically-exported forwarders regardless.
+        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if handle.is_null() {
+            let err = unsafe { libc::dlerror() };
+            let msg = if err.is_null() { String::new() }
+                else { unsafe { std::ffi::CStr::from_ptr(err) }.to_string_lossy().into_owned() };
+            eprintln!("error: cannot load import library 'lib{name}.{ext}' \
+                (searched: {}): {msg}", dirs.join(", "));
+            exit(1);
+        }
+        handles.push(handle);
+    }
+
+    // Resolve every still-unresolved external declaration in the module
+    // (the mod externs) against the opened handles.
+    let mut f = module.get_first_function();
+    while let Some(func) = f {
+        f = func.get_next_function();
+        if func.count_basic_blocks() != 0 { continue; } // has a body -> not external
+        let name = func.get_name().to_string_lossy().into_owned();
+        // Already mapped by register_jit_runtime_symbols, or resolvable by
+        // MCJIT itself (libc: malloc/printf/...). Skip anything dlsym finds
+        // in-process; only map symbols that live in the dlopen'd libs.
+        let cname = std::ffi::CString::new(name.clone()).unwrap();
+        if !unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }.is_null() {
+            continue;
+        }
+        for &handle in &handles {
+            let addr = unsafe { libc::dlsym(handle, cname.as_ptr()) };
+            if !addr.is_null() {
+                ee.add_global_mapping(&func, addr as usize);
+                break;
+            }
+        }
+    }
+    handles
 }
 
 fn check_zig_available() {
@@ -261,14 +335,6 @@ fn main() {
                 eprintln!("error: 'verb run' does not support imports on Windows; use 'verb build'");
                 exit(1);
             }
-            if !imports.is_empty() {
-                // import mod libraries land in Task 3.
-                eprintln!(
-                    "error: 'verb run' does not yet support 'import mod' ({}); use 'verb build'",
-                    imports.join(", ")
-                );
-                exit(1);
-            }
             let ee = cg
                 .module()
                 .create_jit_execution_engine(inkwell::OptimizationLevel::None)
@@ -277,6 +343,7 @@ fn main() {
                     exit(1);
                 });
             register_jit_runtime_symbols(&ee, cg.module());
+            let _import_handles = load_import_libs(&ee, cg.module(), &imports, &parsed.lib_dirs);
             install_runtime_forwarders(&ee);
             unsafe {
                 let main_fn = ee
