@@ -313,6 +313,11 @@ fn enums_reassign_and_heap_fields_leak_nothing() {
     assert_no_leaks("gc_enums");
 }
 
+// ----- result-style error handling (built-in Ok/Err + is_err/err_kind/err_msg) -----
+
+#[test]
+fn result_ok_err_construct_predicates_and_match() { run_ok("result_ok_err"); }
+
 #[test]
 fn match_no_matching_variant_aborts() {
     run_err("err_match_no_variant", "no matching variant");
@@ -920,6 +925,30 @@ fn build_links_and_runs_a_program_using_std_io_files() {
 
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file("verb_e2e_std_io_roundtrip.tmp");
+}
+
+#[test]
+fn std_io_failure_returns_err_not_nil() {
+    // The std-io failure contract: a function that fails (here `file_read` on
+    // a missing file) yields a built-in `Err`, so `is_err` is true and
+    // `err_msg` carries a message -- instead of the old nil sentinel.
+    let _ = std::fs::remove_file("verb_e2e_missing_file_should_not_exist.tmp");
+    let out_path = std::env::temp_dir().join("verb_e2e_std_io_err_file_missing_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_io_err_file_missing.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_io_err_file_missing.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
 }
 
 #[test]

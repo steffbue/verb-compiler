@@ -1,0 +1,5 @@
+import std io;
+
+assign r file_read("verb_e2e_missing_file_should_not_exist.tmp");
+print(is_err(r));
+print(err_msg(r));

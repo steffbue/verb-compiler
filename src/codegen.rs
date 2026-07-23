@@ -78,7 +78,7 @@ impl<'ctx> Codegen<'ctx> {
         // follow at byte offset 24 (see `enum_field_slot`).
         let enum_hdr_ty =
             ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into(), ctx.i64_type().into()], false);
-        let cg = Self {
+        let mut cg = Self {
             ctx, module, builder, value_ty, closure_ty, array_ty, struct_hdr_ty, enum_hdr_ty, ptr_ty,
             scopes: Vec::new(), globals: HashMap::new(), externs: HashMap::new(),
             records: HashMap::new(), variants: HashMap::new(),
@@ -120,6 +120,16 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_array_pop_fn();
         cg.build_retain_cell_fn();
         cg.build_release_cell_fn();
+        // Built-in `Result` choice: `Ok(value)` and `Err(kind, msg)` are
+        // predeclared variants, so result-style error handling reuses the
+        // whole enum machinery -- construction (`Ok(x)`/`Err(k, m)` in
+        // gen_call), `match`/`when`, printing, and GC -- with no new tag.
+        // `Err`'s variant_id backs the `is_err`/`err_kind`/`err_msg`
+        // builtins and the std-io nil->Err failure lift (see gen_std_io_call).
+        cg.gen_choice("Result", &[
+            ("Ok".to_string(), vec!["value".to_string()]),
+            ("Err".to_string(), vec!["kind".to_string(), "msg".to_string()]),
+        ]);
         cg
     }
 
@@ -2871,6 +2881,126 @@ impl<'ctx> Codegen<'ctx> {
         self.make_val(TAG_ENUM, bits)
     }
 
+    /// `is_err(v)` builtin -> a `bool` value, true iff `v` is an enum whose
+    /// variant is the built-in `Err`. Consumes (releases) `v`.
+    fn gen_is_err(&mut self, v: StructValue<'ctx>) -> StructValue<'ctx> {
+        use inkwell::IntPredicate::EQ;
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+        let err_id = self.variants.get("Err").expect("built-in Err variant").variant_id;
+        let tag = self.tag_of(v);
+        let is_enum = self.builder.build_int_compare(
+            EQ, tag, i8t.const_int(TAG_ENUM, false), "iserr.isenum").unwrap();
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let entry_bb = self.builder.get_insert_block().unwrap();
+        let load_bb = self.ctx.append_basic_block(f, "iserr.load");
+        let merge_bb = self.ctx.append_basic_block(f, "iserr.merge");
+        self.builder.build_conditional_branch(is_enum, load_bb, merge_bb).unwrap();
+
+        self.builder.position_at_end(load_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(v), self.ptr_ty, "iserr.sp").unwrap();
+        let vidp = self.builder.build_struct_gep(self.enum_hdr_ty, sp, 1, "iserr.vidp").unwrap();
+        let vid = self.builder.build_load(i64t, vidp, "iserr.vid").unwrap().into_int_value();
+        let eq = self.builder.build_int_compare(
+            EQ, vid, i64t.const_int(err_id, false), "iserr.eq").unwrap();
+        let load_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.build_phi(self.ctx.bool_type(), "iserr.phi").unwrap();
+        let false_c = self.ctx.bool_type().const_zero();
+        phi.add_incoming(&[(&false_c, entry_bb), (&eq, load_end)]);
+        let b = phi.as_basic_value().into_int_value();
+        self.call_named("verb_release_value", &[v.into()]);
+        self.bool_val(b)
+    }
+
+    /// Shared impl of `err_kind(v)` (idx 0) and `err_msg(v)` (idx 1): the
+    /// requested field of `v` if `v` is a built-in `Err` enum, else `nil`.
+    /// The returned field is retained (independently owned) and `v` is
+    /// released -- the same ownership handoff `match` arm bindings use.
+    fn gen_err_field(&mut self, v: StructValue<'ctx>, idx: u64) -> StructValue<'ctx> {
+        use inkwell::IntPredicate::EQ;
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+        let err_id = self.variants.get("Err").expect("built-in Err variant").variant_id;
+        let tag = self.tag_of(v);
+        let is_enum = self.builder.build_int_compare(
+            EQ, tag, i8t.const_int(TAG_ENUM, false), "errf.isenum").unwrap();
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let chk_bb = self.ctx.append_basic_block(f, "errf.chk");
+        let load_bb = self.ctx.append_basic_block(f, "errf.load");
+        let nil_bb = self.ctx.append_basic_block(f, "errf.nil");
+        let merge_bb = self.ctx.append_basic_block(f, "errf.merge");
+        self.builder.build_conditional_branch(is_enum, chk_bb, nil_bb).unwrap();
+
+        self.builder.position_at_end(chk_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(v), self.ptr_ty, "errf.sp").unwrap();
+        let vidp = self.builder.build_struct_gep(self.enum_hdr_ty, sp, 1, "errf.vidp").unwrap();
+        let vid = self.builder.build_load(i64t, vidp, "errf.vid").unwrap().into_int_value();
+        let is_err = self.builder.build_int_compare(
+            EQ, vid, i64t.const_int(err_id, false), "errf.iserr").unwrap();
+        self.builder.build_conditional_branch(is_err, load_bb, nil_bb).unwrap();
+
+        self.builder.position_at_end(load_bb);
+        let slot = self.enum_field_slot(sp, i64t.const_int(idx, false));
+        let fv = self.builder.build_load(self.value_ty, slot, "errf.fv").unwrap().into_struct_value();
+        self.call_named("verb_retain_value", &[fv.into()]);
+        let load_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        self.builder.position_at_end(nil_bb);
+        let nilv = self.nil_val();
+        let nil_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.build_phi(self.value_ty, "errf.phi").unwrap();
+        phi.add_incoming(&[(&fv, load_end), (&nilv, nil_end)]);
+        let result = phi.as_basic_value().into_struct_value();
+        self.call_named("verb_release_value", &[v.into()]);
+        result
+    }
+
+    /// A `value_ty` holding a static Verb string literal (mirrors `Expr::Str`
+    /// codegen). Used to build `Err` payloads from generated code.
+    fn string_value(&self, s: &str) -> StructValue<'ctx> {
+        let p = self.static_string_ptr(s);
+        let bits = self.builder.build_ptr_to_int(p, self.ctx.i64_type(), "strbits").unwrap();
+        self.make_val(TAG_STR, bits)
+    }
+
+    /// Wraps a std-io call `result` so a `nil` failure sentinel becomes a
+    /// built-in `Err("io", "<name> failed")`; any non-nil (success) value
+    /// passes through unchanged. This is where the std-io failure contract
+    /// (nil -> Err) is realized: the C++ runtime still returns nil (it has no
+    /// access to the enum descriptor globals), and codegen lifts it here.
+    fn lift_nil_to_err(&mut self, result: StructValue<'ctx>, name: &str) -> StructValue<'ctx> {
+        use inkwell::IntPredicate::EQ;
+        let i8t = self.ctx.i8_type();
+        let tag = self.tag_of(result);
+        let is_nil = self.builder.build_int_compare(
+            EQ, tag, i8t.const_int(TAG_NIL, false), "lift.isnil").unwrap();
+        let f = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let entry_bb = self.builder.get_insert_block().unwrap();
+        let err_bb = self.ctx.append_basic_block(f, "lift.err");
+        let merge_bb = self.ctx.append_basic_block(f, "lift.merge");
+        self.builder.build_conditional_branch(is_nil, err_bb, merge_bb).unwrap();
+
+        self.builder.position_at_end(err_bb);
+        let kind = self.string_value("io");
+        let msg = self.string_value(&format!("{name} failed"));
+        let info = self.variants.get("Err").expect("built-in Err variant").clone();
+        let errv = self.build_variant(&info, vec![kind, msg]);
+        let err_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.build_phi(self.value_ty, "lift.phi").unwrap();
+        phi.add_incoming(&[(&result, entry_bb), (&errv, err_end)]);
+        phi.as_basic_value().into_struct_value()
+    }
+
     /// `match` codegen: evaluate the scrutinee, then an if-chain over the arms
     /// keyed on the loaded variant_id. Each matching arm loads+retains its
     /// bound fields, releases the scrutinee temp, then binds the fields into a
@@ -3261,6 +3391,29 @@ impl<'ctx> Codegen<'ctx> {
                 self.call_named("verb_release_value", &[sep.into()]);
                 return Ok(rv);
             }
+            // result-style error handling builtins (reuse the enum machinery;
+            // `Ok`/`Err` are the built-in `Result` choice registered in `new`).
+            if name == "is_err" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("is_err takes exactly 1 argument", line, col));
+                }
+                let v = self.gen_expr(&args[0])?;
+                return Ok(self.gen_is_err(v));
+            }
+            if name == "err_kind" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("err_kind takes exactly 1 argument", line, col));
+                }
+                let v = self.gen_expr(&args[0])?;
+                return Ok(self.gen_err_field(v, 0));
+            }
+            if name == "err_msg" {
+                if args.len() != 1 {
+                    return Err(CompileError::new("err_msg takes exactly 1 argument", line, col));
+                }
+                let v = self.gen_expr(&args[0])?;
+                return Ok(self.gen_err_field(v, 1));
+            }
             // record construction: `Point(3, 4)` -> heap struct value
             if let Some(info) = self.records.get(name).cloned() {
                 let n = info.fields.len();
@@ -3308,12 +3461,12 @@ impl<'ctx> Codegen<'ctx> {
             let is_bound = self.lookup(name).is_some();
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {
                 if let Some(arity) = io_func_arity(name) {
-                    return self.gen_std_io_call(name, arity, args, line, col);
+                    return self.gen_std_io_call(name, arity, args, true, line, col);
                 }
             }
             if !is_bound && self.std_imports.iter().any(|m| m == "map") {
                 if let Some(arity) = map_func_arity(name) {
-                    return self.gen_std_io_call(name, arity, args, line, col);
+                    return self.gen_std_io_call(name, arity, args, false, line, col);
                 }
             }
             if !is_bound && !self.imports.is_empty() {
@@ -3360,7 +3513,8 @@ impl<'ctx> Codegen<'ctx> {
     /// arity is only checked against a prior call site of the same name,
     /// because generic `import mod` externs have no statically known
     /// signature to check against.
-    fn gen_std_io_call(&mut self, name: &str, expected_arity: usize, args: &[Expr], line: u32, col: u32)
+    fn gen_std_io_call(&mut self, name: &str, expected_arity: usize, args: &[Expr],
+                       lift_errors: bool, line: u32, col: u32)
         -> Result<StructValue<'ctx>, CompileError>
     {
         if args.len() != expected_arity {
@@ -3391,7 +3545,14 @@ impl<'ctx> Codegen<'ctx> {
         for v in &argvals {
             self.call_named("verb_release_value", &[(*v).into()]);
         }
-        Ok(result)
+        // `io` functions signal failure by returning nil; lift that to a
+        // built-in `Err`. `map` functions (lift_errors=false) keep nil as a
+        // legitimate value (e.g. `map_get` of a missing key), unchanged.
+        if lift_errors {
+            Ok(self.lift_nil_to_err(result, name))
+        } else {
+            Ok(result)
+        }
     }
 
     /// A call to a name that isn't a local variable or a known Verb `fn`,

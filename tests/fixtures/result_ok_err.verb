@@ -1,0 +1,14 @@
+assign ok Ok(42);
+assign er Err("io", "boom");
+print(is_err(ok));
+print(is_err(er));
+print(err_kind(er));
+print(err_msg(er));
+match ok begin
+  when Ok(v) begin print(v); end
+  when Err(k, m) begin print(m); end
+end
+match er begin
+  when Ok(v) begin print(v); end
+  when Err(k, m) begin print(k); end
+end
