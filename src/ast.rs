@@ -16,6 +16,7 @@ pub enum Expr {
     Unary { op: UnOp, expr: Box<Expr>, line: u32, col: u32 },
     Call { callee: Box<Expr>, args: Vec<Expr>, line: u32, col: u32 },
     ArrayLit(Vec<Expr>),
+    FieldGet { obj: Box<Expr>, field: String, line: u32, col: u32 }, // <field> of <expr>
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +30,8 @@ pub enum Stmt {
     Fn { name: String, params: Vec<String>, body: Vec<Stmt>, line: u32, col: u32 },
     Return { value: Option<Expr> },
     Block(Vec<Stmt>),
+    Record { name: String, fields: Vec<String>, line: u32, col: u32 }, // record Name begin f, g end
+    FieldSet { obj: Expr, field: String, value: Expr, line: u32, col: u32 }, // <field> of <expr> be <value>;
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -188,7 +188,10 @@ impl Parser {
             TokenKind::Check => self.if_stmt(),
             TokenKind::Repeat => self.while_stmt(),
             TokenKind::Loop => self.for_stmt(),
+            TokenKind::Record => self.record_stmt(),
             TokenKind::Begin => Ok(Stmt::Block(self.block()?)),
+            // `<field> of <expr> [be <value>];` — field get expr-stmt or field set
+            TokenKind::Ident(_) if *self.peek2() == TokenKind::Of => self.field_stmt(),
             // old statement keywords lex as identifiers now — catch them for a rename hint
             TokenKind::Ident(n) if *self.peek2() != TokenKind::Be
                 && matches!(n.as_str(), "if" | "else" | "while" | "for" | "fn") =>
@@ -297,6 +300,43 @@ impl Parser {
         let mut body = self.block()?;
         body.push(incr);
         Ok(Stmt::Block(vec![init, Stmt::While { cond, body }]))
+    }
+
+    /// `record Point begin x, y end` — a record/struct type declaration.
+    fn record_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let (line, col) = self.here();
+        self.advance(); // record
+        let (name, _, _) = self.expect_ident("record name")?;
+        self.expect(&TokenKind::Begin, "'begin'")?;
+        let mut fields = Vec::new();
+        if !self.check(&TokenKind::End) {
+            loop {
+                fields.push(self.expect_ident("field name")?.0);
+                if !self.matches(&TokenKind::Comma) { break; }
+            }
+        }
+        self.expect(&TokenKind::End, "'end'")?;
+        Ok(Stmt::Record { name, fields, line, col })
+    }
+
+    /// A statement starting `<field> of <expr>`: either a field-set
+    /// (`x of p be 10;`) or a bare field-get expression statement
+    /// (`x of p;`). Parses the leading field-access expression, then
+    /// dispatches on a trailing `be`.
+    fn field_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let e = self.expression()?;
+        if self.matches(&TokenKind::Be) {
+            let value = self.expression()?;
+            self.expect(&TokenKind::Semi, "';'")?;
+            match e {
+                Expr::FieldGet { obj, field, line, col } =>
+                    Ok(Stmt::FieldSet { obj: *obj, field, value, line, col }),
+                _ => Err(self.err("'be' assignment target must be a variable or a field")),
+            }
+        } else {
+            self.expect(&TokenKind::Semi, "';'")?;
+            Ok(Stmt::ExprStmt(e))
+        }
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, CompileError> {
@@ -408,7 +448,28 @@ impl Parser {
             let e = self.unary()?;
             return Ok(Expr::Unary { op, expr: Box::new(e), line, col });
         }
-        self.call()
+        self.field_expr()
+    }
+    /// Field access `<field> of <expr>`. The field name is a bare
+    /// identifier on the left of `of`; the object is parsed to the right
+    /// at this same level, making `of` right-associative
+    /// (`z of y of p` == `z of (y of p)`) and binding tighter than any
+    /// binary operator but looser than a call, so `x of get(a, 0)` reads
+    /// as `x of (get(a, 0))`.
+    fn field_expr(&mut self) -> Result<Expr, CompileError> {
+        let e = self.call()?;
+        if self.check(&TokenKind::Of) {
+            match e {
+                Expr::Var(field, line, col) => {
+                    self.advance(); // of
+                    let obj = self.field_expr()?;
+                    Ok(Expr::FieldGet { obj: Box::new(obj), field, line, col })
+                }
+                _ => Err(self.err_found("field access 'of' requires a field name on its left")),
+            }
+        } else {
+            Ok(e)
+        }
     }
     fn call(&mut self) -> Result<Expr, CompileError> {
         let mut e = self.primary()?;
@@ -621,6 +682,83 @@ mod tests {
             Expr::ArrayLit(elems) => {
                 assert_eq!(elems.len(), 1);
                 assert!(matches!(&elems[0], Expr::ArrayLit(inner) if inner.len() == 3));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_record_declaration() {
+        let p = parse(lex("record Point begin x, y end").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::Record { name, fields, .. } => {
+                assert_eq!(name, "Point");
+                assert_eq!(fields, &vec!["x".to_string(), "y".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_field_get_field_name_is_left_operand() {
+        match expr("x of p") {
+            Expr::FieldGet { obj, field, .. } => {
+                assert_eq!(field, "x");
+                assert!(matches!(*obj, Expr::Var(ref n, ..) if n == "p"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_get_of_is_right_associative() {
+        // `x of a of ln` == `x of (a of ln)`
+        match expr("x of a of ln") {
+            Expr::FieldGet { obj, field, .. } => {
+                assert_eq!(field, "x");
+                match *obj {
+                    Expr::FieldGet { field: inner_field, obj: inner_obj, .. } => {
+                        assert_eq!(inner_field, "a");
+                        assert!(matches!(*inner_obj, Expr::Var(ref n, ..) if n == "ln"));
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_get_binds_tighter_than_binary_op() {
+        // `x of p add 1` == `(x of p) add 1`
+        match expr("x of p add 1") {
+            Expr::Binary { op: BinOp::Add, lhs, .. } => {
+                assert!(matches!(*lhs, Expr::FieldGet { .. }));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_get_object_can_be_a_call() {
+        // `x of make_point()` == `x of (make_point())`
+        match expr("x of make_point()") {
+            Expr::FieldGet { obj, field, .. } => {
+                assert_eq!(field, "x");
+                assert!(matches!(*obj, Expr::Call { .. }));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_field_set() {
+        let p = parse(lex("x of p be 10;").unwrap()).unwrap();
+        match &p.body[0] {
+            Stmt::FieldSet { obj, field, value, .. } => {
+                assert_eq!(field, "x");
+                assert!(matches!(obj, Expr::Var(n, ..) if n == "p"));
+                assert_eq!(*value, Expr::Int(10));
             }
             other => panic!("{other:?}"),
         }

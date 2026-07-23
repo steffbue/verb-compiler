@@ -1,0 +1,11 @@
+record Point begin x, y end
+record Line begin a, b end
+assign p1 Point(1, 2);
+assign p2 Point(3, 4);
+assign ln Line(p1, p2);
+print(x of a of ln);
+print(y of b of ln);
+record Box begin items end
+assign bx Box(list 10, 20, 30);
+print(get(items of bx, 2));
+print(ln);

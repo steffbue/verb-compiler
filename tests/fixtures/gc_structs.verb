@@ -1,0 +1,5 @@
+record Box begin s end
+assign b Box("hello" join "!");
+b be Box("world" join "!");
+s of b be "again" join "!";
+print(s of b);

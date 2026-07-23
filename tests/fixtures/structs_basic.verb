@@ -1,0 +1,7 @@
+record Point begin x, y end
+assign p Point(3, 4);
+print(x of p);
+print(y of p);
+x of p be 10;
+print(x of p);
+print(p);

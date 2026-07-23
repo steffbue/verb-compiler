@@ -1,0 +1,2 @@
+record Point begin x, y end
+assign p Point(1);
