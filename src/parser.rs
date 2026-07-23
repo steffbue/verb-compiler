@@ -152,9 +152,9 @@ impl Parser {
         // time), `std` module names are first-party and fully known ahead
         // of time, so an unrecognized one is rejected here rather than at
         // link time.
-        if name != "io" && name != "map" {
+        if name != "io" && name != "map" && name != "net" {
             return Err(CompileError::new(
-                format!("unknown std module '{name}' (known std modules: io, map)"),
+                format!("unknown std module '{name}' (known std modules: io, map, net)"),
                 l, c,
             ));
         }

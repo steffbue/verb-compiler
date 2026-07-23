@@ -3469,6 +3469,11 @@ impl<'ctx> Codegen<'ctx> {
                     return self.gen_std_io_call(name, arity, args, false, line, col);
                 }
             }
+            if !is_bound && self.std_imports.iter().any(|m| m == "net") {
+                if let Some(arity) = net_func_arity(name) {
+                    return self.gen_std_io_call(name, arity, args, false, line, col);
+                }
+            }
             if !is_bound && !self.imports.is_empty() {
                 return self.gen_extern_call(name, args, line, col);
             }
@@ -3644,6 +3649,21 @@ const MAP_FUNCS: &[(&str, usize)] = &[
 
 fn map_func_arity(name: &str) -> Option<usize> {
     MAP_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
+}
+
+/// Fixed name -> arity table for the `net` module's built-in functions
+/// (see runtime/verb_std_net.cpp and the design spec). Blocking UDP
+/// datagram helpers over POSIX sockets. Like `map`, failures return nil
+/// (lift_errors=false), not a lifted `Err`. See `IO_FUNCS`.
+const NET_FUNCS: &[(&str, usize)] = &[
+    ("udp_socket", 0),
+    ("udp_bind", 2),
+    ("udp_send", 4),
+    ("udp_recv", 1),
+];
+
+fn net_func_arity(name: &str) -> Option<usize> {
+    NET_FUNCS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {

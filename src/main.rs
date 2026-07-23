@@ -558,6 +558,7 @@ fn run_repl() {
 /// only works when run from the repo root.
 const RUNTIME_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime");
 const STD_IO_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_io.cpp");
+const STD_NET_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_net.cpp");
 const MAP_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_map.cpp");
 
 /// Compiles the bundled `runtime/verb_std_io.cpp` into an object file with
@@ -575,6 +576,23 @@ fn compile_std_io_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, St
         .map_err(|e| format!("failed to run '{compiler}' to compile {STD_IO_CPP}: {e}"))?;
     if !status.success() {
         return Err(format!("failed to compile {STD_IO_CPP}"));
+    }
+    Ok(obj)
+}
+
+/// Compiles the bundled `runtime/verb_std_net.cpp` into an object file.
+/// See `compile_std_io_obj`.
+fn compile_net_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, String> {
+    let obj = std::env::temp_dir().join(format!("verb_std_net_{}.o", std::process::id()));
+    let mut cmd = Command::new(compiler);
+    cmd.args(extra_args);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-c", STD_NET_CPP, "-o"]);
+    cmd.arg(&obj);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile {STD_NET_CPP}: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to compile {STD_NET_CPP}"));
     }
     Ok(obj)
 }
@@ -617,6 +635,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_net = std_imports.iter().any(|m| m == "net");
     // `runtime/verb_map.cpp` is now linked into every build, not just ones that
     // `import std map`: codegen's `verb_release_value` references
     // `verb_map_destroy_contents` unconditionally and nothing strips it. Since a
@@ -633,9 +652,20 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     } else {
         None
     };
+    let net_obj = if wants_net {
+        Some(compile_net_obj(linker, &[]).unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&obj);
+            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            eprintln!("error: {e}");
+            exit(1);
+        }))
+    } else {
+        None
+    };
     let map_obj = compile_map_obj(linker, &[]).unwrap_or_else(|e| {
         let _ = std::fs::remove_file(&obj);
         if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+        if let Some(p) = &net_obj { let _ = std::fs::remove_file(p); }
         eprintln!("error: {e}");
         exit(1);
     });
@@ -643,6 +673,9 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     let mut cmd = Command::new(linker);
     cmd.arg(&obj).arg("-o").arg(out);
     if let Some(p) = &std_io_obj {
+        cmd.arg(p);
+    }
+    if let Some(p) = &net_obj {
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
@@ -657,6 +690,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         Err(e) => {
             let _ = std::fs::remove_file(&obj);
             if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            if let Some(p) = &net_obj { let _ = std::fs::remove_file(p); }
             let _ = std::fs::remove_file(&map_obj);
             eprintln!("error: failed to run linker '{linker}': {e}");
             exit(1);
@@ -664,6 +698,7 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     };
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &net_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
     if !status.success() {
         eprintln!("link failed");
@@ -685,11 +720,19 @@ fn build_aot_cross(
     };
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_net = std_imports.iter().any(|m| m == "net");
     if wants_std_io && target.is_windows() {
         return Err(
             "'import std io' is not supported when cross-compiling to a Windows target in v1 \
              (POSIX socket APIs aren't available under the mingw cross toolchain) -- build \
              natively on Windows instead, or drop 'import std io'".to_string(),
+        );
+    }
+    if wants_net && target.is_windows() {
+        return Err(
+            "'import std net' is not supported when cross-compiling to a Windows target in v1 \
+             (POSIX socket APIs aren't available under the mingw cross toolchain) -- build \
+             natively on Windows instead, or drop 'import std net'".to_string(),
         );
     }
 
@@ -716,6 +759,11 @@ fn build_aot_cross(
     } else {
         None
     };
+    let net_obj = if wants_net {
+        Some(compile_net_obj("zig", &["c++", "-target", target.zig_triple()])?)
+    } else {
+        None
+    };
     // Always linked now — see build_aot_host for why verb_map.cpp is unconditional.
     let map_obj = compile_map_obj("zig", &["c++", "-target", target.zig_triple()])?;
 
@@ -728,6 +776,9 @@ fn build_aot_cross(
     let mut cmd = Command::new("zig");
     cmd.args([linker_subcmd, "-target", target.zig_triple(), obj.as_str(), "-o", out.as_str()]);
     if let Some(p) = &std_io_obj {
+        cmd.arg(p);
+    }
+    if let Some(p) = &net_obj {
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
@@ -746,6 +797,7 @@ fn build_aot_cross(
     let status = cmd.status().map_err(|e| format!("zig failed to start: {e}"))?;
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &net_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
     if !status.success() {
         return Err("link failed".to_string());

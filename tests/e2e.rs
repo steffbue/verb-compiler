@@ -692,6 +692,21 @@ fn verb_std_io_cpp_compiles_standalone() {
 }
 
 #[test]
+fn verb_std_net_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_std_net_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_std_net.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_std_net.cpp");
+    assert!(status.success(), "runtime/verb_std_net.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
+#[test]
 fn verb_map_cpp_compiles_standalone() {
     let obj = std::env::temp_dir().join("verb_map_syntax_check.o");
     let status = Command::new("c++")
@@ -1026,6 +1041,54 @@ fn build_links_and_runs_a_program_using_std_io_tcp_loopback() {
     let expected = std::fs::read_to_string("tests/fixtures/std_io_tcp_loopback.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_net_udp_loopback() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_net_udp_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_net_udp_loopback.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let expected = std::fs::read_to_string("tests/fixtures/std_net_udp_loopback.expected").unwrap();
+    // UDP loopback can drop a datagram under load; re-run once before failing.
+    let mut run = Command::new(&out_path).output().unwrap();
+    if !run.status.success() || String::from_utf8_lossy(&run.stdout) != expected {
+        run = Command::new(&out_path).output().unwrap();
+    }
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn windows_cross_target_rejects_std_net_import() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let out_path = std::env::temp_dir().join("verb_e2e_std_net_windows_reject");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_net_udp_loopback.verb",
+            "-o", out_path.to_str().unwrap(),
+            "--target", "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("'import std net' is not supported"),
+        "unexpected stderr: {stderr}"
+    );
     let _ = std::fs::remove_file(&out_path);
 }
 

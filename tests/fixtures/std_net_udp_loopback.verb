@@ -1,0 +1,10 @@
+import std net;
+
+assign server udp_socket();
+udp_bind(server, 58713);
+assign client udp_socket();
+udp_bind(client, 58714);
+udp_send(client, "127.0.0.1", 58713, "ping");
+print(udp_recv(server));
+udp_send(server, "127.0.0.1", 58714, "pong");
+print(udp_recv(client));
