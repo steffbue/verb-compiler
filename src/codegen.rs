@@ -70,6 +70,7 @@ impl<'ctx> Codegen<'ctx> {
         cg.build_array_set_fn();
         cg.build_array_push_fn();
         cg.build_array_pop_fn();
+        cg.build_char_at_fn();
         cg.build_retain_cell_fn();
         cg.build_release_cell_fn();
         cg
@@ -939,6 +940,46 @@ impl<'ctx> Codegen<'ctx> {
 
     // ----- generated runtime helper: verb_array_get(arr, idx, line, col) -> value -----
 
+    /// Generated runtime helper: verb_char_at(VerbValue s, VerbValue idx)
+    /// -> VerbValue. Reads byte `idx` of the string payload and returns a
+    /// fresh +1-owned 1-char TAG_STR string allocated through `verb_alloc`,
+    /// so it carries the same 8-byte refcount header (payload-8) as every
+    /// other heap string and is tracked by retain/release and the GC live
+    /// counter. Bounds are guaranteed by the for-each loop that calls it.
+    fn build_char_at_fn(&self) {
+        let f = self.module.add_function(
+            "verb_char_at",
+            self.value_ty.fn_type(&[self.value_ty.into(), self.value_ty.into()], false),
+            None,
+        );
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let i8t = self.ctx.i8_type();
+        let i64t = self.ctx.i64_type();
+
+        let s = f.get_nth_param(0).unwrap().into_struct_value();
+        let idxv = f.get_nth_param(1).unwrap().into_struct_value();
+        let i = self.payload_of(idxv); // TAG_INT payload = i64 index
+        let sptr = self.builder.build_int_to_ptr(self.payload_of(s), self.ptr_ty, "sptr").unwrap();
+        let bytep = unsafe {
+            self.builder.build_in_bounds_gep(i8t, sptr, &[i], "bytep").unwrap()
+        };
+        let byte = self.builder.build_load(i8t, bytep, "byte").unwrap().into_int_value();
+
+        // allocate a 2-byte NUL-terminated string via the GC alloc path
+        let buf = self.call_named("verb_alloc", &[i64t.const_int(2, false).into()])
+            .unwrap().into_pointer_value();
+        self.builder.build_store(buf, byte).unwrap();
+        let secondp = unsafe {
+            self.builder.build_in_bounds_gep(i8t, buf, &[i64t.const_int(1, false)], "secondp").unwrap()
+        };
+        self.builder.build_store(secondp, i8t.const_zero()).unwrap();
+
+        let payload = self.builder.build_ptr_to_int(buf, i64t, "cp").unwrap();
+        let out = self.make_val(crate::value::TAG_STR, payload);
+        self.builder.build_return(Some(&out)).unwrap();
+    }
+
     fn build_array_get_fn(&self) {
         let i32t = self.ctx.i32_type();
         let f = self.module.add_function(
@@ -1715,6 +1756,7 @@ impl<'ctx> Codegen<'ctx> {
                 let elemp = self.builder.build_alloca(self.value_ty, "fe.elemp").unwrap();
 
                 let arr_bb  = self.ctx.append_basic_block(f, "fe.array");
+                let str_bb  = self.ctx.append_basic_block(f, "fe.string");
                 let bad_bb  = self.ctx.append_basic_block(f, "fe.badtype");
                 let setup_bb = self.ctx.append_basic_block(f, "fe.setup");
                 let cond_bb = self.ctx.append_basic_block(f, "fe.cond");
@@ -1722,10 +1764,13 @@ impl<'ctx> Codegen<'ctx> {
                 let bound_bb = self.ctx.append_basic_block(f, "fe.bound");
                 let end_bb  = self.ctx.append_basic_block(f, "fe.end");
 
-                // dispatch on runtime tag (string/map cases inserted in Tasks 5/6)
+                // dispatch on runtime tag (map case inserted in Task 6)
                 self.builder.build_switch(
                     tag, bad_bb,
-                    &[(i8t.const_int(TAG_ARRAY, false), arr_bb)],
+                    &[
+                        (i8t.const_int(TAG_ARRAY, false), arr_bb),
+                        (i8t.const_int(crate::value::TAG_STR, false), str_bb),
+                    ],
                 ).unwrap();
 
                 // array: len = verb_array_len(coll)
@@ -1734,6 +1779,14 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap().into_struct_value();
                 self.builder.build_store(lenp, self.payload_of(alen)).unwrap();
                 self.builder.build_store(kindp, i8t.const_int(0, false)).unwrap();
+                self.builder.build_unconditional_branch(setup_bb).unwrap();
+
+                // string: len = strlen(payload), kind = 1
+                self.builder.position_at_end(str_bb);
+                let sptr = self.builder.build_int_to_ptr(self.payload_of(collv), self.ptr_ty, "fe.sptr").unwrap();
+                let slen = self.call_named("strlen", &[sptr.into()]).unwrap().into_int_value();
+                self.builder.build_store(lenp, slen).unwrap();
+                self.builder.build_store(kindp, i8t.const_int(1, false)).unwrap();
                 self.builder.build_unconditional_branch(setup_bb).unwrap();
 
                 // non-iterable value: abort with its type name
@@ -1756,9 +1809,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(body_bb);
                 let kind = self.builder.build_load(i8t, kindp, "fe.kind").unwrap().into_int_value();
                 let fetch_arr_bb = self.ctx.append_basic_block(f, "fe.fetch.array");
+                let fetch_str_bb = self.ctx.append_basic_block(f, "fe.fetch.string");
                 self.builder.build_switch(
                     kind, fetch_arr_bb,
-                    &[(i8t.const_int(0, false), fetch_arr_bb)],
+                    &[
+                        (i8t.const_int(0, false), fetch_arr_bb),
+                        (i8t.const_int(1, false), fetch_str_bb),
+                    ],
                 ).unwrap();
 
                 self.builder.position_at_end(fetch_arr_bb);
@@ -1766,6 +1823,14 @@ impl<'ctx> Codegen<'ctx> {
                 let elem = self.call_named("verb_array_get", &[collv.into(), iv.into(), lc.into(), cc.into()])
                     .unwrap().into_struct_value();
                 self.builder.build_store(elemp, elem).unwrap();
+                self.builder.build_unconditional_branch(bound_bb).unwrap();
+
+                // string: fetch the idx-th char as a fresh +1 1-char string
+                self.builder.position_at_end(fetch_str_bb);
+                let ivs = self.make_val(TAG_INT, i);
+                let selem = self.call_named("verb_char_at", &[collv.into(), ivs.into()])
+                    .unwrap().into_struct_value();
+                self.builder.build_store(elemp, selem).unwrap();
                 self.builder.build_unconditional_branch(bound_bb).unwrap();
 
                 // bound: bind element to `name` in a fresh iteration scope, run body

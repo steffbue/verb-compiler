@@ -1,0 +1,4 @@
+assign s "abc";
+each ch in s begin
+  print(ch);
+end

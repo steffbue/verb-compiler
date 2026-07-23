@@ -205,6 +205,16 @@ fn foreach_over_non_iterable_is_runtime_error() {
 }
 
 #[test]
+fn foreach_over_string_visits_each_char() {
+    run_ok("foreach_string");
+}
+
+#[test]
+fn foreach_over_string_is_leak_free() {
+    assert_no_leaks("foreach_string");
+}
+
+#[test]
 fn functions() { run_ok("functions"); }
 
 #[test]
