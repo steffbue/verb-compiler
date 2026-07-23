@@ -48,10 +48,27 @@ pub struct MatchArm {
     pub body: Vec<Stmt>,
 }
 
+/// A native scalar type usable in a typed extern signature
+/// (`import mod ... exposing f(float) -> float;`). Scalars only in v1 —
+/// `Str` is parsed but not yet marshalled by codegen (documented).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Ty { Int, Float, Str, Bool }
+
+/// A declared typed signature for an external (FFI) function, carried on
+/// an `import mod` statement. When present, codegen lowers calls to `name`
+/// as native (unboxed) LLVM calls instead of the default tagged-value path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternSig {
+    pub name: String,
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub imports: Vec<String>,
     pub std_imports: Vec<String>,
+    pub extern_sigs: Vec<ExternSig>,
     pub body: Vec<Stmt>,
 }
 

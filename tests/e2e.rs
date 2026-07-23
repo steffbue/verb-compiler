@@ -568,6 +568,15 @@ fn extern_arity_mismatch_across_call_sites_is_a_compile_error() {
 }
 
 #[test]
+fn typed_extern_arity_mismatch_is_a_compile_error() {
+    // A declared `exposing` signature is checked statically against the call:
+    // one declared parameter, two supplied arguments -> compile error.
+    compile_err("err_typed_extern_arity", &[
+        "extern fn 'c_native_sqrt' declared with 1 parameter(s) but called with 2",
+    ]);
+}
+
+#[test]
 fn build_produces_a_runnable_binary_for_import_free_programs() {
     let out_path = std::env::temp_dir().join("verb_test_build_literals");
     let build = Command::new(env!("CARGO_BIN_EXE_verb"))
@@ -674,6 +683,16 @@ fn build_and_run_ok(name: &str, lib_dir: &std::path::Path) {
 fn imports_cpp_library_and_calls_extern_functions() {
     let lib_dir = build_mathlib_fixture();
     build_and_run_ok("import_mathlib", &lib_dir);
+}
+
+#[test]
+fn typed_extern_signatures_marshal_native_scalars() {
+    // `exposing c_native_sqrt(float) -> float, c_native_muladd(int, int) -> int`
+    // targets raw native (non-VerbValue) C symbols: args are unboxed to
+    // double/i64, the result reboxed. The third call passes an int (16) where
+    // a float is declared, exercising the int->float coercion in the unbox.
+    let lib_dir = build_mathlib_fixture();
+    build_and_run_ok("import_typed_extern", &lib_dir);
 }
 
 #[test]

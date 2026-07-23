@@ -1,0 +1,5 @@
+import mod mathlib exposing c_native_sqrt(float) -> float, c_native_muladd(int, int) -> int;
+
+print(c_native_sqrt(9.0));
+print(c_native_muladd(2, 3));
+print(c_native_sqrt(16));

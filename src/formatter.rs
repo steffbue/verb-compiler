@@ -226,6 +226,7 @@ fn token_text(tok: &Token) -> String {
         RParen => ")".into(),
         Semi => ";".into(),
         Comma => ",".into(),
+        Arrow => "->".into(),
         Eof => String::new(),
     }
 }

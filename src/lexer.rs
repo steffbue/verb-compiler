@@ -9,7 +9,7 @@ pub enum TokenKind {
     Add, Sub, Neg, Times, Div,
     Equals, Differs, Trails, Beats, Atmost, Atleast,
     And, Or, Not, Join,
-    LParen, RParen, Semi, Comma,
+    LParen, RParen, Semi, Comma, Arrow,
     Eof,
 }
 
@@ -108,6 +108,10 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), Compil
             ')' => { toks.push(Token { kind: TokenKind::RParen, line: tl, col: tc }); i += 1; col += 1; }
             ';' => { toks.push(Token { kind: TokenKind::Semi, line: tl, col: tc }); i += 1; col += 1; }
             ',' => { toks.push(Token { kind: TokenKind::Comma, line: tl, col: tc }); i += 1; col += 1; }
+            '-' if chars.get(i + 1) == Some(&'>') => {
+                toks.push(Token { kind: TokenKind::Arrow, line: tl, col: tc });
+                i += 2; col += 2;
+            }
             '"' => {
                 i += 1; col += 1;
                 let mut s = String::new();

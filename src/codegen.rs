@@ -30,6 +30,10 @@ pub struct Codegen<'ctx> {
     variants: HashMap<String, VariantInfo<'ctx>>,
     imports: Vec<String>,
     std_imports: Vec<String>,
+    /// Declared typed FFI signatures, keyed by extern function name. When a
+    /// call targets a name in here, codegen emits a native (unboxed) call
+    /// instead of the default tagged-value extern path.
+    extern_sigs: HashMap<String, ExternSig>,
     fn_depth: u32,
     fn_counter: u32,
     cur_file: String,
@@ -82,7 +86,8 @@ impl<'ctx> Codegen<'ctx> {
             ctx, module, builder, value_ty, closure_ty, array_ty, struct_hdr_ty, enum_hdr_ty, ptr_ty,
             scopes: Vec::new(), globals: HashMap::new(), externs: HashMap::new(),
             records: HashMap::new(), variants: HashMap::new(),
-            imports: Vec::new(), std_imports: Vec::new(), fn_depth: 0, fn_counter: 0,
+            imports: Vec::new(), std_imports: Vec::new(), extern_sigs: HashMap::new(),
+            fn_depth: 0, fn_counter: 0,
             cur_file: String::new(),
         };
         cg.declare_libc();
@@ -2436,9 +2441,10 @@ impl<'ctx> Codegen<'ctx> {
 
     // ----- program -----
 
-    pub fn compile_program(&mut self, stmts: &[Stmt], stmt_files: &[String], imports: &[String], std_imports: &[String]) -> Result<(), CompileError> {
+    pub fn compile_program(&mut self, stmts: &[Stmt], stmt_files: &[String], imports: &[String], std_imports: &[String], extern_sigs: &[ExternSig]) -> Result<(), CompileError> {
         self.imports = imports.to_vec();
         self.std_imports = std_imports.to_vec();
+        self.extern_sigs = extern_sigs.iter().map(|s| (s.name.clone(), s.clone())).collect();
         let main_ty = self.ctx.i32_type().fn_type(&[], false);
         let main = self.module.add_function("main", main_ty, None);
         let entry = self.ctx.append_basic_block(main, "entry");
@@ -3572,6 +3578,12 @@ impl<'ctx> Codegen<'ctx> {
     {
         let argvals: Vec<StructValue<'ctx>> =
             args.iter().map(|a| self.gen_expr(a)).collect::<Result<_, _>>()?;
+        // A declared typed signature switches this call to the native
+        // (unboxed) marshalling path; otherwise fall through to the default
+        // tagged-value extern path below (fully backward compatible).
+        if let Some(sig) = self.extern_sigs.get(name).cloned() {
+            return self.gen_typed_extern_call(name, &sig, &argvals, line, col);
+        }
         let fnv = match self.externs.get(name).copied() {
             Some(fnv) => {
                 if fnv.count_params() as usize != argvals.len() {
@@ -3608,6 +3620,118 @@ impl<'ctx> Codegen<'ctx> {
         let result = self.builder.build_call(fnv, &args_bv, "extern_call")
             .unwrap().try_as_basic_value().basic().unwrap().into_struct_value();
         for v in &argvals {
+            self.call_named("verb_release_value", &[(*v).into()]);
+        }
+        Ok(result)
+    }
+
+    /// LLVM native type for a signature scalar. `Str` maps to a pointer but
+    /// is rejected before this is reached in v1 (no string marshalling yet).
+    fn native_ty(&self, t: Ty) -> inkwell::types::BasicMetadataTypeEnum<'ctx> {
+        match t {
+            Ty::Int => self.ctx.i64_type().into(),
+            Ty::Float => self.ctx.f64_type().into(),
+            Ty::Bool => self.ctx.bool_type().into(),
+            Ty::Str => self.ptr_ty.into(),
+        }
+    }
+
+    /// Branch on `ok`; on the failing edge abort with a source-located type
+    /// error naming the extern, the expected type, and the actual (`%s` via
+    /// the runtime tag). Positions the builder on the success block.
+    fn ffi_tag_guard(&self, ok: IntValue<'ctx>, tag: IntValue<'ctx>,
+                     line: IntValue<'ctx>, col: IntValue<'ctx>, fname: &str, expected: &str) {
+        let cur = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let bad = self.ctx.append_basic_block(cur, "ffi.bad");
+        let good = self.ctx.append_basic_block(cur, "ffi.ok");
+        self.builder.build_conditional_branch(ok, good, bad).unwrap();
+        self.builder.position_at_end(bad);
+        self.abort_at(line, col,
+            &format!("extern fn '{fname}' expected a {expected} argument, got %s"),
+            &[self.type_name(tag)]);
+        self.builder.position_at_end(good);
+    }
+
+    /// Unbox a tagged VerbValue to a native scalar for a typed FFI call,
+    /// emitting a runtime tag-check that aborts on mismatch. Float params
+    /// accept an int arg (widened), mirroring Verb's numeric coercions.
+    fn unbox_scalar(&self, v: StructValue<'ctx>, ty: Ty,
+                    line: IntValue<'ctx>, col: IntValue<'ctx>, fname: &str)
+        -> inkwell::values::BasicMetadataValueEnum<'ctx>
+    {
+        use inkwell::IntPredicate::EQ;
+        let i8t = self.ctx.i8_type();
+        let tag = self.tag_of(v);
+        let pay = self.payload_of(v);
+        match ty {
+            Ty::Int => {
+                let ok = self.builder.build_int_compare(EQ, tag, i8t.const_int(TAG_INT, false), "isint").unwrap();
+                self.ffi_tag_guard(ok, tag, line, col, fname, "int");
+                pay.into()
+            }
+            Ty::Bool => {
+                let ok = self.builder.build_int_compare(EQ, tag, i8t.const_int(TAG_BOOL, false), "isbool").unwrap();
+                self.ffi_tag_guard(ok, tag, line, col, fname, "bool");
+                self.builder.build_int_truncate(pay, self.ctx.bool_type(), "bt").unwrap().into()
+            }
+            Ty::Float => {
+                let ok = self.is_numeric(tag);
+                self.ffi_tag_guard(ok, tag, line, col, fname, "float");
+                self.to_f64(tag, pay).into()
+            }
+            Ty::Str => unreachable!("str marshalling rejected before unbox in v1"),
+        }
+    }
+
+    /// Native (unboxed) lowering of a call to an extern with a declared
+    /// `exposing ...` signature: compile-time arity/type check, native LLVM
+    /// fn type from the `Ty`s, per-arg unbox with runtime tag guards, and a
+    /// reboxed tagged result. v1 is scalar-only (int/float/bool).
+    fn gen_typed_extern_call(&mut self, name: &str, sig: &ExternSig,
+                             argvals: &[StructValue<'ctx>], line: u32, col: u32)
+        -> Result<StructValue<'ctx>, CompileError>
+    {
+        if sig.params.len() != argvals.len() {
+            return Err(CompileError::new(format!(
+                "extern fn '{name}' declared with {} parameter(s) but called with {}",
+                sig.params.len(), argvals.len()), line, col));
+        }
+        if sig.params.iter().any(|t| matches!(t, Ty::Str)) || matches!(sig.ret, Ty::Str) {
+            return Err(CompileError::new(format!(
+                "extern fn '{name}': 'str' in typed FFI signatures is not supported in v1 \
+                 (scalars only: int, float, bool)"), line, col));
+        }
+        let param_tys: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
+            sig.params.iter().map(|t| self.native_ty(*t)).collect();
+        let fnty = match sig.ret {
+            Ty::Int => self.ctx.i64_type().fn_type(&param_tys, false),
+            Ty::Float => self.ctx.f64_type().fn_type(&param_tys, false),
+            Ty::Bool => self.ctx.bool_type().fn_type(&param_tys, false),
+            Ty::Str => unreachable!(),
+        };
+        let fnv = match self.externs.get(name).copied() {
+            Some(f) => f,
+            None => {
+                let f = self.module.add_function(name, fnty, None);
+                self.externs.insert(name.to_string(), f);
+                f
+            }
+        };
+        let linev = self.ctx.i32_type().const_int(line as u64, false);
+        let colv = self.ctx.i32_type().const_int(col as u64, false);
+        let nargs: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> = argvals.iter()
+            .zip(&sig.params)
+            .map(|(v, t)| self.unbox_scalar(*v, *t, linev, colv, name))
+            .collect();
+        let raw = self.builder.build_call(fnv, &nargs, "extern_typed_call")
+            .unwrap().try_as_basic_value().basic().unwrap();
+        let result = match sig.ret {
+            Ty::Int => self.make_val(TAG_INT, raw.into_int_value()),
+            Ty::Float => self.f64_val(raw.into_float_value()),
+            Ty::Bool => self.bool_val(raw.into_int_value()),
+            Ty::Str => unreachable!(),
+        };
+        for v in argvals {
             self.call_named("verb_release_value", &[(*v).into()]);
         }
         Ok(result)
@@ -3695,7 +3819,7 @@ mod tests {
         ];
         let stmt_files = vec!["a.verb".to_string(), "b.verb".to_string()];
 
-        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[], &[]).unwrap_err();
 
         assert_eq!(err.file, Some("b.verb".to_string()));
         assert_eq!(err.line, 3);
@@ -3708,7 +3832,7 @@ mod tests {
         let stmts = vec![Stmt::Assign { name: "x".to_string(), value: Expr::Int(1) }];
         let stmt_files = vec!["a.verb".to_string()];
 
-        assert!(cg.compile_program(&stmts, &stmt_files, &[], &[]).is_ok());
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &[], &[]).is_ok());
     }
 
     #[test]
@@ -3724,7 +3848,7 @@ mod tests {
             },
         }];
         let stmt_files = vec!["a.verb".to_string()];
-        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["io".to_string()]).is_ok());
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["io".to_string()], &[]).is_ok());
     }
 
     #[test]
@@ -3738,7 +3862,7 @@ mod tests {
         })];
         let stmt_files = vec!["a.verb".to_string()];
         let err = cg
-            .compile_program(&stmts, &stmt_files, &[], &["io".to_string()])
+            .compile_program(&stmts, &stmt_files, &[], &["io".to_string()], &[])
             .unwrap_err();
         assert!(err.msg.contains("read_line"), "{}", err.msg);
         assert!(err.msg.contains("takes 0 argument"), "{}", err.msg);
@@ -3756,7 +3880,7 @@ mod tests {
             line: 1, col: 1,
         })];
         let stmt_files = vec!["a.verb".to_string()];
-        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[], &[]).unwrap_err();
         assert!(err.msg.contains("undefined variable"), "{}", err.msg);
     }
 
@@ -3770,7 +3894,7 @@ mod tests {
             line: 1, col: 1,
         })];
         let stmt_files = vec!["a.verb".to_string()];
-        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["map".to_string()]).is_ok());
+        assert!(cg.compile_program(&stmts, &stmt_files, &[], &["map".to_string()], &[]).is_ok());
     }
 
     #[test]
@@ -3784,7 +3908,7 @@ mod tests {
         })];
         let stmt_files = vec!["a.verb".to_string()];
         let err = cg
-            .compile_program(&stmts, &stmt_files, &[], &["map".to_string()])
+            .compile_program(&stmts, &stmt_files, &[], &["map".to_string()], &[])
             .unwrap_err();
         assert!(err.msg.contains("map_get"), "{}", err.msg);
         assert!(err.msg.contains("takes 2 argument"), "{}", err.msg);
@@ -3800,7 +3924,7 @@ mod tests {
             line: 1, col: 1,
         })];
         let stmt_files = vec!["a.verb".to_string()];
-        let err = cg.compile_program(&stmts, &stmt_files, &[], &[]).unwrap_err();
+        let err = cg.compile_program(&stmts, &stmt_files, &[], &[], &[]).unwrap_err();
         assert!(err.msg.contains("undefined variable"), "{}", err.msg);
     }
 }

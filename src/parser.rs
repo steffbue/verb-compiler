@@ -4,7 +4,7 @@ use crate::lexer::{renamed_keyword, Token, TokenKind};
 
 pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
-    let (imports, std_imports) = p.imports()?;
+    let (imports, std_imports, extern_sigs) = p.imports()?;
     let mut body = Vec::new();
     while !p.check(&TokenKind::Eof) {
         if p.check(&TokenKind::Import) {
@@ -12,7 +12,7 @@ pub fn parse(toks: Vec<Token>) -> Result<Program, CompileError> {
         }
         body.push(p.statement()?);
     }
-    Ok(Program { imports, std_imports, body })
+    Ok(Program { imports, std_imports, extern_sigs, body })
 }
 
 /// Same grammar as `parse`, but doesn't stop at the first syntax error:
@@ -26,10 +26,11 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
     let mut p = Parser { toks, pos: 0, fn_depth: 0 };
     let mut imports = Vec::new();
     let mut std_imports = Vec::new();
+    let mut extern_sigs = Vec::new();
     let mut errors = Vec::new();
     while p.check(&TokenKind::Import) {
         match p.import_stmt() {
-            Ok(ImportStmt::Mod(name)) => dedup_push(&mut imports, name),
+            Ok(ImportStmt::Mod(name, sigs)) => { dedup_push(&mut imports, name); extern_sigs.extend(sigs); }
             Ok(ImportStmt::Std(name)) => dedup_push(&mut std_imports, name),
             Err(e) => { errors.push(e); p.synchronize(); }
         }
@@ -65,11 +66,11 @@ pub fn parse_recovering(toks: Vec<Token>) -> (Program, Vec<CompileError>) {
             }
         }
     }
-    (Program { imports, std_imports, body }, errors)
+    (Program { imports, std_imports, extern_sigs, body }, errors)
 }
 
 enum ImportStmt {
-    Mod(String),
+    Mod(String, Vec<ExternSig>),
     Std(String),
 }
 
@@ -127,24 +128,65 @@ impl Parser {
         }
     }
 
-    fn imports(&mut self) -> Result<(Vec<String>, Vec<String>), CompileError> {
+    fn imports(&mut self) -> Result<(Vec<String>, Vec<String>, Vec<ExternSig>), CompileError> {
         let mut imports = Vec::new();
         let mut std_imports = Vec::new();
+        let mut extern_sigs = Vec::new();
         while self.check(&TokenKind::Import) {
             match self.import_stmt()? {
-                ImportStmt::Mod(name) => dedup_push(&mut imports, name),
+                ImportStmt::Mod(name, sigs) => { dedup_push(&mut imports, name); extern_sigs.extend(sigs); }
                 ImportStmt::Std(name) => dedup_push(&mut std_imports, name),
             }
         }
-        Ok((imports, std_imports))
+        Ok((imports, std_imports, extern_sigs))
+    }
+
+    /// A native scalar type name in an `exposing` signature.
+    fn parse_ty(&mut self) -> Result<Ty, CompileError> {
+        let (w, l, c) = self.expect_ident("a type (int, float, bool, str)")?;
+        Ok(match w.as_str() {
+            "int" => Ty::Int,
+            "float" => Ty::Float,
+            "bool" => Ty::Bool,
+            "str" => Ty::Str,
+            _ => return Err(CompileError::new(
+                format!("unknown extern type '{w}' (known: int, float, bool, str)"), l, c)),
+        })
+    }
+
+    /// Optional `exposing name(t, ..) -> t, name2(..) -> t` signature list
+    /// following an `import mod <lib>`. Returns an empty vec when absent.
+    fn extern_sigs(&mut self) -> Result<Vec<ExternSig>, CompileError> {
+        let has = matches!(self.peek(), TokenKind::Ident(w) if w == "exposing");
+        if !has { return Ok(Vec::new()); }
+        self.advance(); // 'exposing'
+        let mut sigs = Vec::new();
+        loop {
+            let (name, ..) = self.expect_ident("extern function name after 'exposing'")?;
+            self.expect(&TokenKind::LParen, "'(' after extern function name")?;
+            let mut params = Vec::new();
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_ty()?);
+                    if !self.matches(&TokenKind::Comma) { break; }
+                }
+            }
+            self.expect(&TokenKind::RParen, "')'")?;
+            self.expect(&TokenKind::Arrow, "'->'")?;
+            let ret = self.parse_ty()?;
+            sigs.push(ExternSig { name, params, ret });
+            if !self.matches(&TokenKind::Comma) { break; }
+        }
+        Ok(sigs)
     }
 
     fn import_stmt(&mut self) -> Result<ImportStmt, CompileError> {
         self.advance(); // 'import'
         if self.matches(&TokenKind::Mod) {
             let (name, ..) = self.expect_ident("library name after 'mod'")?;
+            let sigs = self.extern_sigs()?;
             self.expect(&TokenKind::Semi, "';'")?;
-            return Ok(ImportStmt::Mod(name));
+            return Ok(ImportStmt::Mod(name, sigs));
         }
         self.expect(&TokenKind::Std, "'mod' or 'std'")?;
         let (name, l, c) = self.expect_ident("module name after 'std'")?;
@@ -841,6 +883,24 @@ mod tests {
         let p = parse(lex("import mod mathlib;").unwrap()).unwrap();
         assert_eq!(p.imports, vec!["mathlib".to_string()]);
         assert!(p.body.is_empty());
+    }
+
+    #[test]
+    fn parses_typed_extern_signature() {
+        let p = parse(lex(
+            "import mod mathlib exposing c_sqrt(float) -> float, c_add(int, int) -> int;"
+        ).unwrap()).unwrap();
+        assert_eq!(p.imports, vec!["mathlib".to_string()]);
+        assert_eq!(p.extern_sigs, vec![
+            ExternSig { name: "c_sqrt".into(), params: vec![Ty::Float], ret: Ty::Float },
+            ExternSig { name: "c_add".into(), params: vec![Ty::Int, Ty::Int], ret: Ty::Int },
+        ]);
+    }
+
+    #[test]
+    fn rejects_unknown_extern_type() {
+        let err = parse(lex("import mod m exposing f(number) -> int;").unwrap()).unwrap_err();
+        assert!(err.msg.contains("unknown extern type 'number'"), "{}", err.msg);
     }
 
     #[test]

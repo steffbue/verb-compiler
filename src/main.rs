@@ -252,6 +252,7 @@ fn main() {
     let mut stmt_files = Vec::new();
     let mut imports: Vec<String> = Vec::new();
     let mut std_imports: Vec<String> = Vec::new();
+    let mut extern_sigs: Vec<verb::ast::ExternSig> = Vec::new();
 
     for file in &parsed.files {
         let src = match std::fs::read_to_string(file) {
@@ -274,11 +275,12 @@ fn main() {
         stmts.extend(prog.body);
         imports.extend(prog.imports);
         std_imports.extend(prog.std_imports);
+        extern_sigs.extend(prog.extern_sigs);
     }
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
-    cg.compile_program(&stmts, &stmt_files, &imports, &std_imports).unwrap_or_else(|e| die(e, &sources));
+    cg.compile_program(&stmts, &stmt_files, &imports, &std_imports, &extern_sigs).unwrap_or_else(|e| die(e, &sources));
 
     match parsed.cmd.as_str() {
         "run" => {
@@ -436,7 +438,7 @@ fn compile_and_jit_run(source: &str) -> Result<(), String> {
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
-    cg.compile_program(&prog.body, &stmt_files, &prog.imports, &prog.std_imports)
+    cg.compile_program(&prog.body, &stmt_files, &prog.imports, &prog.std_imports, &prog.extern_sigs)
         .map_err(|e| e.msg)?;
 
     let ee = cg

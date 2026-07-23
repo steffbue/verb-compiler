@@ -31,3 +31,10 @@ VERB_EXPORT(c_add_int, 2, add_int)
 VERB_EXPORT(c_shout, 1, shout_impl)
 VERB_EXPORT(c_hello, 0, say_hello)
 VERB_EXPORT(c_is_positive, 1, is_positive)
+
+// Raw, natively-typed exports (no VerbValue wrapper) — targets of the
+// *typed* extern signature path (`import mod mathlib exposing ...`). Verb
+// calls these with a native `double(double)` / `int64_t(int64_t,int64_t)`
+// ABI, unboxing args and reboxing the result at the call site.
+extern "C" double c_native_sqrt(double x) { return std::sqrt(x); }
+extern "C" int64_t c_native_muladd(int64_t a, int64_t b) { return a * b + 1; }
