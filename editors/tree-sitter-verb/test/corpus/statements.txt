@@ -114,6 +114,73 @@ end
             (identifier)))))))
 
 ==================
+for-each over integer range
+==================
+
+each n in 0 to 5 begin
+  print(n);
+end
+
+---
+
+(source_file
+  (foreach_statement
+    (identifier)
+    (int)
+    (int)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier)))))))
+
+==================
+for-each over array, string, and map
+==================
+
+each item in fruits begin
+  print(item);
+end
+each ch in "hi" begin
+  print(ch);
+end
+each k in scores begin
+  print(k);
+end
+
+---
+
+(source_file
+  (foreach_statement
+    (identifier)
+    (identifier)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier))))))
+  (foreach_statement
+    (identifier)
+    (string)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier))))))
+  (foreach_statement
+    (identifier)
+    (identifier)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier)))))))
+
+==================
 function definition and call
 ==================
 

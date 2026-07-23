@@ -34,6 +34,8 @@ const KEYWORD_LITERALS = new Set([
   "orelse",
   "repeat",
   "loop",
+  "each",
+  "in",
   "begin",
   "end",
   "import",
@@ -57,6 +59,7 @@ const OPERATOR_LITERALS = new Set([
   "not",
   "neg",
   "join",
+  "to",
 ]);
 
 // The grammar WASM (and the web-tree-sitter runtime WASM it depends on) is

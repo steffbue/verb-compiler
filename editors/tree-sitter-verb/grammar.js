@@ -49,6 +49,7 @@ module.exports = grammar({
         $.if_statement,
         $.while_statement,
         $.for_statement,
+        $.foreach_statement,
         $.block,
         $.reassign_statement,
         $.expression_statement,
@@ -113,6 +114,21 @@ module.exports = grammar({
         field("condition", $._expression),
         ";",
         field("update", choice($._reassign_no_semi, $._expression)),
+        field("body", $.block),
+      ),
+
+    // `each <var> in <collection> begin ... end` iterates an array/string/map;
+    // `each <var> in <start> to <end> begin ... end` is a half-open integer
+    // range (`start` up to, but not including, `end`). Mirrors src/parser.rs
+    // `foreach_stmt` — the range form desugars to a `repeat` in the compiler,
+    // but is written with `to` in source.
+    foreach_statement: ($) =>
+      seq(
+        "each",
+        field("variable", $.identifier),
+        "in",
+        field("iterable", $._expression),
+        optional(seq("to", field("range_end", $._expression))),
         field("body", $.block),
       ),
 
