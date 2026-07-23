@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::process::{exit, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use verb::codegen;
+use verb::debugger;
 use verb::error::CompileError;
-use verb::lexer;
-use verb::parser;
+use verb::resolve;
 use verb::targets;
 
 // --- JIT runtime symbol resolution -----------------------------------------
@@ -20,32 +21,52 @@ use verb::targets;
 // always-referenced-but-conditionally-defined runtime symbols the same way:
 // list the `.cpp` in build.rs, and add a tuple to `register_jit_runtime_symbols`.
 
-// C++ ABI mirror of `VerbValue` (`{ i8, i64 }`) — see runtime/verb.h. Gives
-// the `verb_retain_value`/`verb_release_value` forwarders below a matching
-// signature; populated on every call made under `verb run` (JIT), by the
-// module's own emitted code and by any dlopen'd `import mod` library.
+// C++ ABI mirror of `VerbValue` (`{ i8, i64 }`) — see runtime/verb.h. Only
+// used to give the host stubs below a matching signature; never populated.
 #[repr(C)]
 pub struct VerbValueAbi {
     pub tag: i8,
     pub payload: i64,
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+extern "C" {
+    /// Defined in `runtime/verb_map.cpp`, compiled into this binary by build.rs.
+    fn verb_map_destroy_contents(payload: *mut std::ffi::c_void);
+    fn map_new() -> VerbValueAbi;
+    fn map_set(m: VerbValueAbi, k: VerbValueAbi, v: VerbValueAbi) -> VerbValueAbi;
+    fn map_get(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
+    fn map_has(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
+    fn map_remove(m: VerbValueAbi, k: VerbValueAbi) -> VerbValueAbi;
+    fn map_len(m: VerbValueAbi) -> VerbValueAbi;
+    fn read_line() -> VerbValueAbi;
+    fn file_read(path: VerbValueAbi) -> VerbValueAbi;
+    fn file_write(path: VerbValueAbi, contents: VerbValueAbi) -> VerbValueAbi;
+    fn file_append(path: VerbValueAbi, contents: VerbValueAbi) -> VerbValueAbi;
+    fn tcp_connect(host: VerbValueAbi, port: VerbValueAbi) -> VerbValueAbi;
+    fn tcp_listen(port: VerbValueAbi) -> VerbValueAbi;
+    fn tcp_accept(fd: VerbValueAbi) -> VerbValueAbi;
+    fn send_line(fd: VerbValueAbi, s: VerbValueAbi) -> VerbValueAbi;
+    fn recv_line(fd: VerbValueAbi) -> VerbValueAbi;
+    fn close_conn(fd: VerbValueAbi) -> VerbValueAbi;
+}
 
-// Set once, at JIT startup, to the addresses of the module's emitted
-// verb_alloc/verb_retain_value/verb_release_value. The C++ runtime units
-// compiled into this binary (verb_map.cpp, verb_std_io.cpp) and any dlopen'd
-// import-mod library call these forwarder symbols; the forwarders hop into
-// the JIT-compiled helpers. Under AOT these forwarders are never linked
-// (the object file carries its own emitted helpers), so AOT is unaffected.
-static VERB_ALLOC_FP: AtomicUsize = AtomicUsize::new(0);
-static VERB_RETAIN_FP: AtomicUsize = AtomicUsize::new(0);
-static VERB_RELEASE_FP: AtomicUsize = AtomicUsize::new(0);
+// Under `verb run` the program module (src/codegen.rs) emits the real
+// verb_alloc/verb_retain_value/verb_release_value bodies. The C++ runtime
+// units linked into this binary (verb_map.cpp, verb_std_io.cpp) call these
+// symbols, and those calls bind here at host link time — so we forward them
+// to the module's JIT-compiled definitions, whose addresses are stored below
+// at JIT init (see the `run` arm) before `main` is ever called. This keeps a
+// single source of truth for the value runtime and keeps `verb_gc_live`
+// consistent regardless of whether an alloc/release originates in module code
+// or in host C++.
+static VERB_ALLOC_ADDR: AtomicUsize = AtomicUsize::new(0);
+static VERB_RETAIN_ADDR: AtomicUsize = AtomicUsize::new(0);
+static VERB_RELEASE_ADDR: AtomicUsize = AtomicUsize::new(0);
 
-fn forwarder_addr(slot: &AtomicUsize, name: &str) -> usize {
-    let a = slot.load(Ordering::Acquire);
+fn thunk_target(slot: &AtomicUsize, name: &str) -> usize {
+    let a = slot.load(Ordering::Relaxed);
     if a == 0 {
-        eprintln!("internal error: {name} forwarder called before JIT runtime init");
+        eprintln!("internal error: host {name} thunk called before JIT init");
         std::process::abort();
     }
     a
@@ -54,144 +75,54 @@ fn forwarder_addr(slot: &AtomicUsize, name: &str) -> usize {
 #[no_mangle]
 pub extern "C" fn verb_alloc(n: i64) -> *mut std::ffi::c_void {
     let f: extern "C" fn(i64) -> *mut std::ffi::c_void =
-        unsafe { std::mem::transmute(forwarder_addr(&VERB_ALLOC_FP, "verb_alloc")) };
+        unsafe { std::mem::transmute(thunk_target(&VERB_ALLOC_ADDR, "verb_alloc")) };
     f(n)
 }
 #[no_mangle]
 pub extern "C" fn verb_retain_value(v: VerbValueAbi) {
     let f: extern "C" fn(VerbValueAbi) =
-        unsafe { std::mem::transmute(forwarder_addr(&VERB_RETAIN_FP, "verb_retain_value")) };
+        unsafe { std::mem::transmute(thunk_target(&VERB_RETAIN_ADDR, "verb_retain_value")) };
     f(v)
 }
 #[no_mangle]
 pub extern "C" fn verb_release_value(v: VerbValueAbi) {
     let f: extern "C" fn(VerbValueAbi) =
-        unsafe { std::mem::transmute(forwarder_addr(&VERB_RELEASE_FP, "verb_release_value")) };
+        unsafe { std::mem::transmute(thunk_target(&VERB_RELEASE_ADDR, "verb_release_value")) };
     f(v)
 }
 
-/// Point the forwarders at the module's JIT-compiled helpers. Must run after
-/// engine creation and before any Verb or C++ runtime code executes. Codegen
-/// emits all three helpers into every module, so lookups always succeed.
-fn install_runtime_forwarders(ee: &inkwell::execution_engine::ExecutionEngine) {
-    for (slot, name) in [
-        (&VERB_ALLOC_FP, "verb_alloc"),
-        (&VERB_RETAIN_FP, "verb_retain_value"),
-        (&VERB_RELEASE_FP, "verb_release_value"),
-    ] {
-        let addr = ee.get_function_address(name)
-            .unwrap_or_else(|e| { eprintln!("JIT error: cannot resolve {name}: {e}"); exit(1); });
-        slot.store(addr as usize, Ordering::Release);
-    }
-}
-
-/// Registers the first-party std runtime symbols (io + map + the map
-/// destructor) that codegen emits as external declarations. Their code is
-/// compiled into this binary (build.rs) and exported dynamically, so
-/// dlsym(RTLD_DEFAULT, name) yields the address. Only symbols the module
-/// actually declares are registered.
+/// Registers runtime symbols that codegen references unconditionally but whose
+/// definitions live in C++ runtime units compiled into this binary, so MCJIT
+/// can resolve the reference for every `run` — including programs that never
+/// exercise the symbol. Extend the array to add more such symbols.
 fn register_jit_runtime_symbols<'ctx>(
     ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
     module: &inkwell::module::Module<'ctx>,
 ) {
-    const STD_SYMBOLS: &[&str] = &[
-        // io
-        "read_line", "file_read", "file_write", "file_append",
-        "tcp_connect", "tcp_listen", "tcp_accept", "send_line", "recv_line", "close_conn",
-        // map
-        "map_new", "map_set", "map_get", "map_has", "map_remove", "map_len",
-        // always emitted by codegen's release path
-        "verb_map_destroy_contents",
+    let symbols: [(&str, usize); 17] = [
+        ("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize),
+        ("map_new", map_new as *const () as usize),
+        ("map_set", map_set as *const () as usize),
+        ("map_get", map_get as *const () as usize),
+        ("map_has", map_has as *const () as usize),
+        ("map_remove", map_remove as *const () as usize),
+        ("map_len", map_len as *const () as usize),
+        ("read_line", read_line as *const () as usize),
+        ("file_read", file_read as *const () as usize),
+        ("file_write", file_write as *const () as usize),
+        ("file_append", file_append as *const () as usize),
+        ("tcp_connect", tcp_connect as *const () as usize),
+        ("tcp_listen", tcp_listen as *const () as usize),
+        ("tcp_accept", tcp_accept as *const () as usize),
+        ("send_line", send_line as *const () as usize),
+        ("recv_line", recv_line as *const () as usize),
+        ("close_conn", close_conn as *const () as usize),
     ];
-    for name in STD_SYMBOLS {
-        let Some(f) = module.get_function(name) else { continue };
-        let cname = std::ffi::CString::new(*name).unwrap();
-        let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
-        if addr.is_null() {
-            eprintln!("internal error: std runtime symbol '{name}' not found in process");
-            exit(1);
-        }
-        ee.add_global_mapping(&f, addr as usize);
-    }
-}
-
-/// dlopen each `import mod` library, resolve every extern the module
-/// declares against the opened handles, and register the address with the
-/// engine. `lib_dirs` entries are raw `-L/path` strings. Returns the opened
-/// handles (leaked for the process lifetime). Aborts the process with a
-/// clear message on any failure.
-fn load_import_libs<'ctx>(
-    ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
-    module: &inkwell::module::Module<'ctx>,
-    imports: &[String],
-    lib_dirs: &[String],
-) -> Vec<*mut std::ffi::c_void> {
-    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
-    let dirs: Vec<&str> = lib_dirs.iter().map(|d| d.trim_start_matches("-L")).collect();
-    let mut handles = Vec::new();
-
-    for name in imports {
-        // Find libNAME.<ext> in a -L dir, else fall back to the bare soname
-        // so the loader's default search path applies.
-        let mut candidate: Option<std::ffi::CString> = None;
-        for dir in &dirs {
-            let p = std::path::Path::new(dir).join(format!("lib{name}.{ext}"));
-            if p.exists() {
-                candidate = Some(std::ffi::CString::new(p.to_str().unwrap()).unwrap());
-                break;
-            }
-        }
-        let path = candidate.unwrap_or_else(|| {
-            std::ffi::CString::new(format!("lib{name}.{ext}")).unwrap()
-        });
-        // RTLD_LOCAL (not GLOBAL): keep the lib's own symbols OUT of the
-        // global namespace, so the resolution loop below can tell a genuine
-        // in-process symbol (libc / std / forwarder) from a mod extern and
-        // map the latter explicitly via dlsym(handle, ...). The lib's own
-        // undefined refs (e.g. its verb_alloc callback) still resolve against
-        // this executable's dynamically-exported forwarders regardless.
-        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        if handle.is_null() {
-            let err = unsafe { libc::dlerror() };
-            let msg = if err.is_null() { String::new() }
-                else { unsafe { std::ffi::CStr::from_ptr(err) }.to_string_lossy().into_owned() };
-            eprintln!("error: cannot load import library 'lib{name}.{ext}' \
-                (searched: {}): {msg}", dirs.join(", "));
-            exit(1);
-        }
-        handles.push(handle);
-    }
-
-    // Resolve every still-unresolved external declaration in the module
-    // (the mod externs) against the opened handles.
-    let mut f = module.get_first_function();
-    while let Some(func) = f {
-        f = func.get_next_function();
-        if func.count_basic_blocks() != 0 { continue; } // has a body -> not external
-        let name = func.get_name().to_string_lossy().into_owned();
-        // Already mapped by register_jit_runtime_symbols, or resolvable by
-        // MCJIT itself (libc: malloc/printf/...). Skip anything dlsym finds
-        // in-process; only map symbols that live in the dlopen'd libs.
-        let cname = std::ffi::CString::new(name.clone()).unwrap();
-        if !unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) }.is_null() {
-            continue;
-        }
-        let mut resolved = false;
-        for &handle in &handles {
-            let addr = unsafe { libc::dlsym(handle, cname.as_ptr()) };
-            if !addr.is_null() {
-                ee.add_global_mapping(&func, addr as usize);
-                resolved = true;
-                break;
-            }
-        }
-        if !resolved {
-            eprintln!("error: unresolved symbol '{name}' -- not found in any imported \
-                library ({}) or their search dirs ({})", imports.join(", "), dirs.join(", "));
-            exit(1);
+    for (name, addr) in symbols {
+        if let Some(f) = module.get_function(name) {
+            ee.add_global_mapping(&f, addr);
         }
     }
-    handles
 }
 
 fn check_zig_available() {
@@ -210,11 +141,16 @@ fn check_zig_available() {
 
 struct ParsedArgs {
     cmd: String,
-    files: Vec<String>,
+    file: String,
     out: Option<String>,
     emit_llvm: bool,
     target: Option<String>,
+    /// Global library search dirs (`-L<dir>`), applied to every target.
     lib_dirs: Vec<String>,
+    /// Per-target library search dirs (`-L<label>=<dir>`), each applied only
+    /// to the matching `--target` label — lets a single `--target all` run
+    /// supply a different, arch-matched library per target (INTEG-02).
+    target_lib_dirs: Vec<(String, String)>,
 }
 
 fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
@@ -227,6 +163,7 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
     let mut emit_llvm = false;
     let mut target = None;
     let mut lib_dirs = Vec::new();
+    let mut target_lib_dirs = Vec::new();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -251,7 +188,18 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
                 i += 1;
             }
             a if a.starts_with("-L") && a.len() > 2 => {
-                lib_dirs.push(a.to_string());
+                // `-L<label>=<dir>` scopes a search dir to one `--target` label;
+                // a plain `-L<dir>` (or any `=`-form whose prefix isn't a valid
+                // target) stays global and applies to every target.
+                match a[2..].split_once('=') {
+                    Some((label, dir))
+                        if !dir.is_empty() && targets::Target::parse(label).is_ok() =>
+                    {
+                        let canon = targets::Target::parse(label).unwrap().label();
+                        target_lib_dirs.push((canon, format!("-L{dir}")));
+                    }
+                    _ => lib_dirs.push(a.to_string()),
+                }
                 i += 1;
             }
             f => {
@@ -260,10 +208,11 @@ fn parse_cli(args: &[String]) -> Option<ParsedArgs> {
             }
         }
     }
-    if files.is_empty() {
+    if files.len() != 1 {
         return None;
     }
-    Some(ParsedArgs { cmd, files, out, emit_llvm, target, lib_dirs })
+    let file = files.remove(0);
+    Some(ParsedArgs { cmd, file, out, emit_llvm, target, lib_dirs, target_lib_dirs })
 }
 
 fn die(e: CompileError, sources: &[(String, String)]) -> ! {
@@ -287,48 +236,79 @@ fn die(e: CompileError, sources: &[(String, String)]) -> ! {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: verb run <file.verb>... [--emit-llvm]");
-    eprintln!("       verb build <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]");
-    eprintln!("       verb compile <file.verb>... -o <out> [--target <os>-<arch>|all] [-L<dir>]... [--emit-llvm]  (alias for build)");
+    eprintln!("usage: verb run <file.verb> [-L<dir>]... [--emit-llvm]");
+    eprintln!("       verb debug <file.verb>");
+    eprintln!("       verb build <file.verb> -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]");
+    eprintln!("       verb compile <file.verb> -o <out> [--target <os>-<arch>|all] [-L<dir>]... [-L<target>=<dir>]... [--emit-llvm]  (alias for build)");
     eprintln!("       targets: linux-x86_64 linux-arm64 macos-x86_64 macos-arm64 windows-x86_64 windows-arm64");
+    eprintln!("       -L<dir>            library search dir applied to every target");
+    eprintln!("       -L<target>=<dir>   library search dir applied only to that --target (e.g. -Llinux-arm64=./libs/arm); use with --target all to supply arch-matched libs per target");
+    eprintln!("       use 'import mod <name>.verb;' inside <file.verb> to pull in other Verb source files");
     exit(2)
+}
+
+/// Resolves an `import mod <name>` to a shared library file for the JIT to
+/// dlopen. Searches each `-L<dir>` (prefix stripped) for `lib<name>.dylib`
+/// (macOS) / `lib<name>.so` (Linux); if none exists on disk, returns the bare
+/// filename so the OS loader can search its default paths. Static `.a`
+/// archives are intentionally unsupported under `verb run` — use `verb build`.
+///
+/// Side effect: in the fallback branch, "resolving" the bare filename probes
+/// for its existence by calling `load_library_permanently` on it, which — if
+/// the library is found — permanently loads it into this process for the
+/// remainder of its lifetime. This is idempotent (loading an already-loaded
+/// library again is a no-op), and the `run` arm loads the resolved path again
+/// for real afterward, so the extra load here is harmless, just a side effect
+/// worth knowing about when reasoning about process state.
+fn resolve_mod_lib(name: &str, lib_dirs: &[String]) -> Result<PathBuf, String> {
+    let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+    let filename = format!("lib{name}.{ext}");
+    let dirs: Vec<&str> = lib_dirs.iter().map(|d| d.trim_start_matches("-L")).collect();
+    for dir in &dirs {
+        let candidate = PathBuf::from(dir).join(&filename);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Fall back to the bare name only if the loader can find it on its default
+    // search path; otherwise report a clear error naming the searched dirs.
+    let bare = PathBuf::from(&filename);
+    if inkwell::support::load_library_permanently(&bare).is_ok() {
+        return Ok(bare);
+    }
+    Err(format!(
+        "cannot find shared library for 'import mod {name}' ({filename}); searched: [{}]. \
+         'verb run' can only load shared libraries — use 'verb build' for static linking.",
+        dirs.join(", ")
+    ))
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let parsed = parse_cli(&args).unwrap_or_else(|| usage());
 
-    let mut sources: Vec<(String, String)> = Vec::new();
-    let mut stmts = Vec::new();
-    let mut stmt_files = Vec::new();
-    let mut imports: Vec<String> = Vec::new();
-    let mut std_imports: Vec<String> = Vec::new();
-
-    for file in &parsed.files {
-        let src = match std::fs::read_to_string(file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: cannot read {file}: {e}");
-                exit(1);
-            }
-        };
-        sources.push((file.clone(), src.clone()));
-
-        let toks = lexer::lex(&src)
-            .map_err(|e| e.with_file(file.clone()))
-            .unwrap_or_else(|e| die(e, &sources));
-        let prog = parser::parse(toks)
-            .map_err(|e| e.with_file(file.clone()))
-            .unwrap_or_else(|e| die(e, &sources));
-
-        stmt_files.extend(std::iter::repeat(file.clone()).take(prog.body.len()));
-        stmts.extend(prog.body);
-        imports.extend(prog.imports);
-        std_imports.extend(prog.std_imports);
-    }
+    let resolved = resolve::resolve(&parsed.file).unwrap_or_else(|e| match e.kind {
+        resolve::ResolveErrorKind::Compile(err) => die(err, &e.sources),
+        resolve::ResolveErrorKind::Cycle(msg) => {
+            eprintln!("error: {msg}");
+            exit(1);
+        }
+        resolve::ResolveErrorKind::Io { path, message } => {
+            eprintln!("error: cannot read {path}: {message}");
+            exit(1);
+        }
+    });
+    let sources = resolved.sources;
+    let stmts = resolved.stmts;
+    let stmt_files = resolved.stmt_files;
+    let imports = resolved.imports;
+    let std_imports = resolved.std_imports;
 
     let ctx = inkwell::context::Context::create();
     let mut cg = codegen::Codegen::new(&ctx);
+    if parsed.cmd == "debug" {
+        cg.enable_debug_hooks();
+    }
     cg.compile_program(&stmts, &stmt_files, &imports, &std_imports).unwrap_or_else(|e| die(e, &sources));
 
     if parsed.emit_llvm {
@@ -337,14 +317,22 @@ fn main() {
 
     match parsed.cmd.as_str() {
         "run" => {
-            let has_imports = !imports.is_empty() || !std_imports.is_empty();
-            // Defensive only: this runtime check is not the real gate. The JIT-import
-            // machinery below (load_import_libs) uses unix-only libc::dlopen/dlsym/RTLD_*,
-            // so a Windows-target build of this file fails to compile long before this
-            // guard could ever run. The actual "Windows host unsupported" gate is
-            // compile-time (this module simply won't build for target_os = "windows").
-            if has_imports && cfg!(target_os = "windows") {
-                eprintln!("error: 'verb run' does not support imports on Windows; use 'verb build'");
+            // `verb run` executes via JIT: it can wire `std io`/`std map`
+            // runtime thunks (register_jit_runtime_symbols) and dlopen
+            // `import mod` shared libraries, but it cannot link the C++
+            // runtimes required by other std modules (e.g. `std thread`,
+            // `std time`). Reject those with a clear message instead of
+            // failing later during JIT symbol resolution.
+            let unsupported: Vec<String> = std_imports
+                .iter()
+                .filter(|m| *m != "io" && *m != "map")
+                .map(|m| format!("std {m}"))
+                .collect();
+            if !unsupported.is_empty() {
+                eprintln!(
+                    "error: 'verb run' does not support imports ({}); use 'verb build' instead",
+                    unsupported.join(", ")
+                );
                 exit(1);
             }
             let ee = cg
@@ -354,9 +342,94 @@ fn main() {
                     eprintln!("JIT error: {e}");
                     exit(1);
                 });
+            // Make the host process's own symbols searchable by MCJIT, then
+            // dlopen each `import mod` shared library so its symbols resolve
+            // during module finalization.
+            inkwell::support::load_visible_symbols();
+            for lib in &imports {
+                let path = resolve_mod_lib(lib, &parsed.lib_dirs).unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    exit(1);
+                });
+                if inkwell::support::load_library_permanently(&path).is_err() {
+                    eprintln!("error: failed to load shared library {}", path.display());
+                    exit(1);
+                }
+            }
+            // Map/io entry points must be wired before the module is finalized
+            // (finalization happens on the first get_function_address below).
             register_jit_runtime_symbols(&ee, cg.module());
-            let _import_handles = load_import_libs(&ee, cg.module(), &imports, &parsed.lib_dirs);
-            install_runtime_forwarders(&ee);
+            // Point the host verb_alloc/retain/release thunks at the module's
+            // JIT-compiled definitions. Only read at runtime (during main), so
+            // it is fine that get_function_address finalizes the module here.
+            //
+            // Load-bearing invariant: codegen (src/codegen.rs build_alloc_fn /
+            // build_retain_value_fn / build_release_value_fn) MUST emit a real
+            // *body* for each of these three functions into every module, not
+            // just a declaration. If codegen ever emitted only a declaration,
+            // get_function_address would resolve the symbol back to this very
+            // host thunk (since the thunk itself is exported under the same
+            // name for AOT builds), and the thunk would call itself forever —
+            // infinite recursion, stack overflow, with no diagnostic pointing
+            // at the real cause.
+            for (name, slot) in [
+                ("verb_alloc", &VERB_ALLOC_ADDR),
+                ("verb_retain_value", &VERB_RETAIN_ADDR),
+                ("verb_release_value", &VERB_RELEASE_ADDR),
+            ] {
+                let addr = ee.get_function_address(name).unwrap_or_else(|e| {
+                    eprintln!("JIT error: cannot resolve {name}: {e:?}");
+                    exit(1);
+                });
+                slot.store(addr, Ordering::Relaxed);
+            }
+            unsafe {
+                let main_fn = ee
+                    .get_function::<unsafe extern "C" fn() -> i32>("main")
+                    .expect("no main");
+                exit(main_fn.call());
+            }
+        }
+        "debug" => {
+            if !imports.is_empty() || !std_imports.is_empty() {
+                let mut names = imports.clone();
+                names.extend(std_imports.iter().map(|m| format!("std {m}")));
+                eprintln!(
+                    "error: 'verb debug' does not support imports ({}); use 'verb build' instead",
+                    names.join(", ")
+                );
+                exit(1);
+            }
+            let ee = cg
+                .module()
+                .create_jit_execution_engine(inkwell::OptimizationLevel::None)
+                .unwrap_or_else(|e| {
+                    eprintln!("JIT error: {e}");
+                    exit(1);
+                });
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_checkpoint").unwrap(),
+                debugger::verb_debug_checkpoint as *const () as usize,
+            );
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_push_frame").unwrap(),
+                debugger::verb_debug_push_frame as *const () as usize,
+            );
+            ee.add_global_mapping(
+                &cg.module().get_function("verb_debug_pop_frame").unwrap(),
+                debugger::verb_debug_pop_frame as *const () as usize,
+            );
+            let print_value_addr = ee.get_function_address("verb_print_value").unwrap_or_else(|e| {
+                eprintln!("JIT error resolving verb_print_value: {e}");
+                exit(1);
+            });
+            debugger::set_print_value_fn(print_value_addr);
+            // Matches `stmt_files`' entry for every top-level statement in
+            // the entry file verbatim (see `resolve::resolve`), so an
+            // unqualified `break <line>` resolves to this file -- see
+            // `DebuggerState::add_breakpoint`.
+            debugger::set_main_file(parsed.file.clone());
+            debugger::run_pre_start_console();
             unsafe {
                 let main_fn = ee
                     .get_function::<unsafe extern "C" fn() -> i32>("main")
@@ -368,14 +441,15 @@ fn main() {
             let out = parsed.out.unwrap_or_else(|| usage());
             match parsed.target.as_deref() {
                 None => build_aot_host(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
-                Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs),
+                Some("all") => build_aot_all(&cg, &out, &imports, &std_imports, &parsed.lib_dirs, &parsed.target_lib_dirs),
                 Some(t) => {
                     let target = targets::Target::parse(t).unwrap_or_else(|e| {
                         eprintln!("error: {e}");
                         exit(2);
                     });
                     check_zig_available();
-                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &parsed.lib_dirs) {
+                    let lib_dirs = resolve_lib_dirs(&parsed.lib_dirs, &parsed.target_lib_dirs, &target.label());
+                    if let Err(e) = build_aot_cross(&cg, &out, &target, &imports, &std_imports, &lib_dirs) {
                         eprintln!("error: {e}");
                         exit(1);
                     }
@@ -393,6 +467,8 @@ fn main() {
 const RUNTIME_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime");
 const STD_IO_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_io.cpp");
 const MAP_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_map.cpp");
+const STD_THREAD_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_std_thread.cpp");
+const TIME_CPP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/verb_time.cpp");
 
 /// Compiles the bundled `runtime/verb_std_io.cpp` into an object file with
 /// `compiler` (`"cc"`/`"c++"` for the host, `"zig"` for cross targets),
@@ -430,6 +506,47 @@ fn compile_map_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, Strin
     Ok(obj)
 }
 
+/// Compiles the bundled `runtime/verb_std_thread.cpp` into an object
+/// file. See `compile_std_io_obj`. `-pthread` is required by
+/// `std::thread`/`std::mutex`/`std::condition_variable` on Linux
+/// (glibc splits pthread symbols into a separate archive there); macOS's
+/// libc++ links threading support unconditionally, so the flag is a
+/// harmless no-op there, and is applied unconditionally rather than
+/// gated on host OS to keep this function symmetric with its zig-cross
+/// caller in `build_aot_cross`, which cannot check the *host*'s OS
+/// (only the *target*'s).
+fn compile_std_thread_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, String> {
+    let obj = std::env::temp_dir().join(format!("verb_std_thread_{}.o", std::process::id()));
+    let mut cmd = Command::new(compiler);
+    cmd.args(extra_args);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-pthread", "-c", STD_THREAD_CPP, "-o"]);
+    cmd.arg(&obj);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile {STD_THREAD_CPP}: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to compile {STD_THREAD_CPP}"));
+    }
+    Ok(obj)
+}
+
+/// Compiles the bundled `runtime/verb_time.cpp` into an object file. See
+/// `compile_std_io_obj`.
+fn compile_time_obj(compiler: &str, extra_args: &[&str]) -> Result<PathBuf, String> {
+    let obj = std::env::temp_dir().join(format!("verb_time_{}.o", std::process::id()));
+    let mut cmd = Command::new(compiler);
+    cmd.args(extra_args);
+    cmd.args(["-std=c++17", "-I", RUNTIME_DIR, "-c", TIME_CPP, "-o"]);
+    cmd.arg(&obj);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run '{compiler}' to compile {TIME_CPP}: {e}"))?;
+    if !status.success() {
+        return Err(format!("failed to compile {TIME_CPP}"));
+    }
+    Ok(obj)
+}
+
 fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
     use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
@@ -450,6 +567,8 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         .unwrap_or_else(|e| { eprintln!("object emit error: {e}"); exit(1); });
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_std_thread = std_imports.iter().any(|m| m == "thread");
+    let wants_time = std_imports.iter().any(|m| m == "time");
     // `runtime/verb_map.cpp` is now linked into every build, not just ones that
     // `import std map`: codegen's `verb_release_value` references
     // `verb_map_destroy_contents` unconditionally and nothing strips it. Since a
@@ -472,6 +591,30 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         eprintln!("error: {e}");
         exit(1);
     });
+    let std_thread_obj = if wants_std_thread {
+        let extra_link_args: &[&str] = if cfg!(target_os = "linux") { &["-pthread"] } else { &[] };
+        Some(compile_std_thread_obj(linker, extra_link_args).unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&obj);
+            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            let _ = std::fs::remove_file(&map_obj);
+            eprintln!("error: {e}");
+            exit(1);
+        }))
+    } else {
+        None
+    };
+    let time_obj = if wants_time {
+        Some(compile_time_obj(linker, &[]).unwrap_or_else(|e| {
+            let _ = std::fs::remove_file(&obj);
+            if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
+            let _ = std::fs::remove_file(&map_obj);
+            if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+            eprintln!("error: {e}");
+            exit(1);
+        }))
+    } else {
+        None
+    };
 
     let mut cmd = Command::new(linker);
     cmd.arg(&obj).arg("-o").arg(out);
@@ -479,6 +622,15 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
+    if let Some(p) = &std_thread_obj {
+        cmd.arg(p);
+    }
+    if wants_std_thread && cfg!(target_os = "linux") {
+        cmd.arg("-pthread");
+    }
+    if let Some(p) = &time_obj {
+        cmd.arg(p);
+    }
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -491,6 +643,8 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
             let _ = std::fs::remove_file(&obj);
             if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
             let _ = std::fs::remove_file(&map_obj);
+            if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+            if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
             eprintln!("error: failed to run linker '{linker}': {e}");
             exit(1);
         }
@@ -498,6 +652,8 @@ fn build_aot_host(cg: &codegen::Codegen, out: &str, imports: &[String], std_impo
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
+    if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         eprintln!("link failed");
         exit(1);
@@ -517,11 +673,20 @@ fn build_aot_cross(
     };
 
     let wants_std_io = std_imports.iter().any(|m| m == "io");
+    let wants_std_thread = std_imports.iter().any(|m| m == "thread");
+    let wants_time = std_imports.iter().any(|m| m == "time");
     if wants_std_io && target.is_windows() {
         return Err(
             "'import std io' is not supported when cross-compiling to a Windows target in v1 \
              (POSIX socket APIs aren't available under the mingw cross toolchain) -- build \
              natively on Windows instead, or drop 'import std io'".to_string(),
+        );
+    }
+    if wants_std_thread && target.is_windows() {
+        return Err(
+            "'import std thread' is not supported when cross-compiling to a Windows target in v1 \
+             (std::thread isn't available under the mingw cross toolchain used here) -- build \
+             natively on Windows instead, or drop 'import std thread'".to_string(),
         );
     }
 
@@ -549,6 +714,21 @@ fn build_aot_cross(
     };
     // Always linked now — see build_aot_host for why verb_map.cpp is unconditional.
     let map_obj = compile_map_obj("zig", &["c++", "-target", target.zig_triple()])?;
+    let std_thread_obj = if wants_std_thread {
+        let extra: Vec<&str> = if target.os == targets::Os::Linux {
+            vec!["c++", "-target", target.zig_triple(), "-pthread"]
+        } else {
+            vec!["c++", "-target", target.zig_triple()]
+        };
+        Some(compile_std_thread_obj("zig", &extra)?)
+    } else {
+        None
+    };
+    let time_obj = if wants_time {
+        Some(compile_time_obj("zig", &["c++", "-target", target.zig_triple()])?)
+    } else {
+        None
+    };
 
     // Imports/lib_dirs are forwarded to zig c++ so cross-linking works when the imported
     // C++ libraries are available for the chosen target via -L<dir>. Host-built .o/.a
@@ -562,6 +742,15 @@ fn build_aot_cross(
         cmd.arg(p);
     }
     cmd.arg(&map_obj);
+    if let Some(p) = &std_thread_obj {
+        cmd.arg(p);
+    }
+    if wants_std_thread && target.os == targets::Os::Linux {
+        cmd.arg("-pthread");
+    }
+    if let Some(p) = &time_obj {
+        cmd.arg(p);
+    }
     for dir in lib_dirs {
         cmd.arg(dir);
     }
@@ -572,19 +761,35 @@ fn build_aot_cross(
     let _ = std::fs::remove_file(&obj);
     if let Some(p) = &std_io_obj { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_file(&map_obj);
+    if let Some(p) = &std_thread_obj { let _ = std::fs::remove_file(p); }
+    if let Some(p) = &time_obj { let _ = std::fs::remove_file(p); }
     if !status.success() {
         return Err("link failed".to_string());
     }
     Ok(())
 }
 
-fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String]) {
+/// Effective library search dirs for one target: the global `-L<dir>` set plus
+/// any `-L<label>=<dir>` scoped to this target's label. Lets `--target all`
+/// cross-link an FFI import against a different, arch-matched library per target.
+fn resolve_lib_dirs(global: &[String], scoped: &[(String, String)], label: &str) -> Vec<String> {
+    let mut dirs = global.to_vec();
+    for (l, dir) in scoped {
+        if l == label {
+            dirs.push(dir.clone());
+        }
+    }
+    dirs
+}
+
+fn build_aot_all(cg: &codegen::Codegen, out: &str, imports: &[String], std_imports: &[String], lib_dirs: &[String], target_lib_dirs: &[(String, String)]) {
     check_zig_available();
     let mut failures = 0;
     let mut results: Vec<(String, Result<(), String>)> = Vec::new();
     for target in targets::ALL {
         let labeled_out = format!("{out}-{}", target.label());
-        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, lib_dirs);
+        let effective = resolve_lib_dirs(lib_dirs, target_lib_dirs, &target.label());
+        let res = build_aot_cross(cg, &labeled_out, &target, imports, std_imports, &effective);
         if res.is_err() {
             failures += 1;
         }
@@ -611,21 +816,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiple_files() {
-        let p = parse_cli(&args(&["verb", "run", "a.verb", "b.verb"])).unwrap();
+    fn parses_a_single_file() {
+        let p = parse_cli(&args(&["verb", "run", "a.verb"])).unwrap();
         assert_eq!(p.cmd, "run");
-        assert_eq!(p.files, vec!["a.verb".to_string(), "b.verb".to_string()]);
+        assert_eq!(p.file, "a.verb".to_string());
         assert!(!p.emit_llvm);
         assert_eq!(p.out, None);
     }
 
     #[test]
-    fn parses_flags_interleaved_with_files() {
+    fn rejects_multiple_files() {
+        assert!(parse_cli(&args(&["verb", "run", "a.verb", "b.verb"])).is_none());
+    }
+
+    #[test]
+    fn parses_flags_around_a_single_file() {
         let p = parse_cli(&args(&[
-            "verb", "build", "a.verb", "-o", "out", "b.verb", "--emit-llvm",
+            "verb", "build", "a.verb", "-o", "out", "--emit-llvm",
         ])).unwrap();
         assert_eq!(p.cmd, "build");
-        assert_eq!(p.files, vec!["a.verb".to_string(), "b.verb".to_string()]);
+        assert_eq!(p.file, "a.verb".to_string());
         assert_eq!(p.out, Some("out".to_string()));
         assert!(p.emit_llvm);
     }
@@ -635,8 +845,60 @@ mod tests {
         let p = parse_cli(&args(&[
             "verb", "build", "a.verb", "-o", "out", "-L/opt/lib", "-L./libs",
         ])).unwrap();
-        assert_eq!(p.files, vec!["a.verb".to_string()]);
+        assert_eq!(p.file, "a.verb".to_string());
         assert_eq!(p.lib_dirs, vec!["-L/opt/lib".to_string(), "-L./libs".to_string()]);
+        assert!(p.target_lib_dirs.is_empty());
+    }
+
+    #[test]
+    fn parses_per_target_lib_dirs() {
+        let p = parse_cli(&args(&[
+            "verb", "build", "a.verb", "-o", "out",
+            "-L/opt/lib",                      // global
+            "-Llinux-arm64=./libs/arm",        // scoped
+            "-Lmacos-x86_64=/opt/mac",         // scoped
+            "-Llinux-x86=./libs/x86",          // scoped, x86 alias -> canonical label
+        ])).unwrap();
+        // Global stays in lib_dirs.
+        assert_eq!(p.lib_dirs, vec!["-L/opt/lib".to_string()]);
+        // Scoped land in target_lib_dirs, labels canonicalized (x86 -> x86_64).
+        assert_eq!(
+            p.target_lib_dirs,
+            vec![
+                ("linux-arm64".to_string(), "-L./libs/arm".to_string()),
+                ("macos-x86_64".to_string(), "-L/opt/mac".to_string()),
+                ("linux-x86_64".to_string(), "-L./libs/x86".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_target_prefix_before_equals_stays_global() {
+        // A dir path that happens to contain '=' but whose prefix isn't a valid
+        // target label must remain a global search dir, verbatim.
+        let p = parse_cli(&args(&[
+            "verb", "build", "a.verb", "-o", "out", "-L/weird=path/lib",
+        ])).unwrap();
+        assert_eq!(p.lib_dirs, vec!["-L/weird=path/lib".to_string()]);
+        assert!(p.target_lib_dirs.is_empty());
+    }
+
+    #[test]
+    fn resolve_lib_dirs_merges_global_and_matching_scoped() {
+        let global = vec!["-L/opt/lib".to_string()];
+        let scoped = vec![
+            ("linux-arm64".to_string(), "-L./arm".to_string()),
+            ("macos-arm64".to_string(), "-L./mac".to_string()),
+        ];
+        assert_eq!(
+            resolve_lib_dirs(&global, &scoped, "linux-arm64"),
+            vec!["-L/opt/lib".to_string(), "-L./arm".to_string()]
+        );
+        // No scoped match -> global only.
+        assert_eq!(
+            resolve_lib_dirs(&global, &scoped, "linux-x86_64"),
+            vec!["-L/opt/lib".to_string()]
+        );
     }
 
     #[test]
@@ -652,5 +914,32 @@ mod tests {
     #[test]
     fn rejects_no_command() {
         assert!(parse_cli(&args(&["verb"])).is_none());
+    }
+
+    #[test]
+    fn resolve_mod_lib_finds_shared_lib_in_l_dir() {
+        let dir = std::env::temp_dir().join(format!("verb_resolve_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
+        let lib = dir.join(format!("libwidget.{ext}"));
+        std::fs::write(&lib, b"").unwrap();
+
+        let found = resolve_mod_lib("widget", &[format!("-L{}", dir.display())]).unwrap();
+        assert_eq!(found, lib);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_mod_lib_missing_reports_name_and_dirs() {
+        let err = resolve_mod_lib("nope", &["-L/does/not/exist".to_string()]).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(err.contains("/does/not/exist"), "{err}");
+    }
+
+    #[test]
+    fn parses_debug_command() {
+        let p = parse_cli(&args(&["verb", "debug", "a.verb"])).unwrap();
+        assert_eq!(p.cmd, "debug");
+        assert_eq!(p.file, "a.verb".to_string());
     }
 }

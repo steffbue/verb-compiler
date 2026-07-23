@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 fn run_ok(name: &str) {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
@@ -66,21 +67,21 @@ fn assert_no_leaks(fixture: &str) {
     let _ = std::fs::remove_file(&out_path);
 }
 
-/// Like `assert_no_leaks`, but drives the program through the JIT
-/// (`verb run`) instead of a built binary. Proves the run-mode refcount
-/// forwarders (verb_alloc/retain/release) reclaim every heap value.
-fn assert_no_leaks_run(fixture: &str, lib_dirs: &[String]) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_verb"));
-    cmd.arg("run").arg(format!("tests/fixtures/{fixture}.verb"));
-    for d in lib_dirs { cmd.arg(d); }
-    cmd.env("VERB_GC_DEBUG", "1");
-    let out = cmd.output().unwrap();
-    assert!(out.status.success(), "{fixture}: run failed:\n{}",
-        String::from_utf8_lossy(&out.stderr));
+/// Like `assert_no_leaks`, but exercises the JIT `run` path instead of AOT.
+/// Runs the fixture under `verb run` with `VERB_GC_DEBUG=1` and asserts the
+/// program reports `verb_gc_live=0` at exit — proving the host alloc/retain/
+/// release thunks forward to the module's counter-touching implementations.
+fn assert_no_leaks_under_run(fixture: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", &format!("tests/fixtures/{fixture}.verb")])
+        .env("VERB_GC_DEBUG", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{fixture}: run failed: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
         .unwrap_or_else(|| panic!("{fixture}: no verb_gc_live line in stdout:\n{stdout}"));
-    assert_eq!(live_line, "verb_gc_live=0", "{fixture}: leaked heap objects:\n{stdout}");
+    assert_eq!(live_line, "verb_gc_live=0", "{fixture}: leaked under run:\n{stdout}");
 }
 
 #[test]
@@ -133,6 +134,30 @@ fn array_of_arrays() { run_ok("arrays_of_arrays"); }
 
 #[test]
 fn array_of_closures() { run_ok("arrays_of_closures"); }
+
+// ----- structs (`shape`) -----
+
+#[test]
+fn struct_construct_get_set_print() { run_ok("structs"); }
+
+#[test]
+fn struct_leaks_nothing() { assert_no_leaks("structs"); }
+
+#[test]
+fn struct_heap_fields_and_nesting() { run_ok("structs_heap"); }
+
+#[test]
+fn struct_heap_fields_leak_nothing() { assert_no_leaks("structs_heap"); }
+
+#[test]
+fn struct_construct_arity_mismatch_is_compile_error() {
+    compile_err("structs_arity", &["Point", "2", "1"]);
+}
+
+#[test]
+fn struct_unknown_field_aborts() {
+    run_err("structs_badfield", "no field 'z'");
+}
 
 #[test]
 fn nested_arrays_retain_and_release_correctly() { run_ok("gc_arrays_nested"); }
@@ -378,64 +403,76 @@ fn build_with_l_flag_forwards_it_without_breaking_the_build() {
     let _ = std::fs::remove_file(&out_path);
 }
 
-/// Runs `<fixture>.verb` through the JIT with `-L<lib_dir>`, asserting
-/// success and matching `<fixture>.expected`.
-fn run_with_lib_ok(fixture: &str, lib_dir: &std::path::Path) {
+/// Compiles tests/fixtures/cpp/mathlib.cpp into a shared library once per
+/// test run and returns the directory it landed in (for `-L`).
+fn build_mathlib_fixture() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("verb_e2e_cpp_libs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib_path = dir.join("libmathlib.dylib");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17",
+            "-Iruntime",
+            "-dynamiclib",
+            "-o", lib_path.to_str().unwrap(),
+            "tests/fixtures/cpp/mathlib.cpp",
+        ])
+        .status()
+        .expect("failed to invoke c++ to build the mathlib test fixture");
+    assert!(status.success(), "failed to compile tests/fixtures/cpp/mathlib.cpp");
+    dir
+}
+
+#[test]
+fn run_executes_mod_import() {
+    let lib_dir = build_mathlib_fixture();
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args([
             "run",
-            &format!("tests/fixtures/{fixture}.verb"),
+            "tests/fixtures/import_mathlib.verb",
             &format!("-L{}", lib_dir.display()),
         ])
-        .output().unwrap();
-    assert!(out.status.success(), "{fixture}: run failed:\n{}",
-        String::from_utf8_lossy(&out.stderr));
-    let expected = std::fs::read_to_string(format!("tests/fixtures/{fixture}.expected")).unwrap();
+        .env("DYLD_LIBRARY_PATH", &lib_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/import_mathlib.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
 #[test]
-fn run_imports_a_cpp_library_and_calls_extern_functions() {
-    // import mod under the JIT: dlopen the fixture lib, resolve every one of
-    // its five mod externs, and call each one successfully.
-    let lib_dir = build_mathlib_fixture();
-    run_with_lib_ok("import_mathlib", &lib_dir);
+fn run_mod_import_missing_library_errors_clearly() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/import_mathlib.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("mathlib"), "stderr: {stderr}");
+    assert!(stderr.contains("verb build"), "stderr: {stderr}");
 }
 
 #[test]
 fn run_mixes_mod_std_io_and_std_map_imports() {
+    // Combined JIT-import path: one `verb run` that pulls in an `import mod`
+    // C++ FFI library, `import std io`, and `import std map` at once, proving
+    // the mod extern, std-io and std-map runtime symbols all resolve and the
+    // refcount forwarders stay consistent across all three.
     let _ = std::fs::remove_file("verb_jit_all_imports.tmp");
     let lib_dir = build_mathlib_fixture();
-    run_with_lib_ok("jit_all_imports", &lib_dir);
-}
-
-/// Compiles tests/fixtures/cpp/mathlib.cpp into a shared library once per
-/// test run and returns the directory it landed in (for `-L`).
-///
-/// Several tests in this file call this helper, and `cargo test` runs them
-/// concurrently on multiple threads by default. Without memoizing the build,
-/// concurrent calls would race to write the same `libmathlib.dylib` path,
-/// letting one test dlopen a half-written/truncated library. `OnceLock`
-/// ensures the `c++` invocation happens exactly once per process.
-fn build_mathlib_fixture() -> std::path::PathBuf {
-    static LIB_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    LIB_DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join("verb_e2e_cpp_libs");
-        std::fs::create_dir_all(&dir).unwrap();
-        let lib_path = dir.join("libmathlib.dylib");
-        let status = Command::new("c++")
-            .args([
-                "-std=c++17",
-                "-Iruntime",
-                "-dynamiclib",
-                "-o", lib_path.to_str().unwrap(),
-                "tests/fixtures/cpp/mathlib.cpp",
-            ])
-            .status()
-            .expect("failed to invoke c++ to build the mathlib test fixture");
-        assert!(status.success(), "failed to compile tests/fixtures/cpp/mathlib.cpp");
-        dir
-    }).clone()
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "run",
+            "tests/fixtures/jit_all_imports.verb",
+            &format!("-L{}", lib_dir.display()),
+        ])
+        .env("DYLD_LIBRARY_PATH", &lib_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/jit_all_imports.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    let _ = std::fs::remove_file("verb_jit_all_imports.tmp");
 }
 
 fn build_and_run_ok(name: &str, lib_dir: &std::path::Path) {
@@ -482,39 +519,6 @@ fn verb_std_io_cpp_compiles_standalone() {
     let _ = std::fs::remove_file(&obj);
 }
 
-// `runtime/verb_std_io.cpp` (and `verb_map.cpp`) are compiled into the
-// `verb` binary via build.rs, which force-links their C-ABI symbols with a
-// bin-scoped `cargo:rustc-link-arg-bin=verb=-Wl,-u,SYMBOL` so they remain
-// present -- and dynamically exported -- in the shipped `verb` binary for
-// dlsym(RTLD_DEFAULT, ...) resolution at JIT run time. This test inspects
-// the actual shipped `verb` binary's symbol table (via `nm`) rather than
-// this test process's own, since the force-link is scoped to the `verb`
-// bin specifically and gives no guarantee about any other binary/test
-// crate in this package.
-#[test]
-fn in_binary_std_symbols_are_dynamically_resolvable() {
-    let bin = env!("CARGO_BIN_EXE_verb");
-    let out = Command::new("nm")
-        .args(["-g", bin])
-        .output()
-        .expect("failed to invoke nm on the verb binary");
-    assert!(
-        out.status.success(),
-        "nm failed on {bin}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let symtab = String::from_utf8_lossy(&out.stdout);
-    for sym in ["file_read", "map_new", "verb_alloc", "verb_map_destroy_contents"] {
-        assert!(
-            symtab.contains(sym),
-            "expected runtime symbol `{sym}` in `verb` binary's global symbol \
-             table (via `nm -g {bin}`), but it was not found; verb_std_io.cpp / \
-             verb_map.cpp may not be force-linked into the `verb` bin (check \
-             build.rs's bin-scoped rustc-link-arg-bin=verb=-Wl,-u,SYMBOL flags)"
-        );
-    }
-}
-
 #[test]
 fn verb_map_cpp_compiles_standalone() {
     let obj = std::env::temp_dir().join("verb_map_syntax_check.o");
@@ -527,6 +531,36 @@ fn verb_map_cpp_compiles_standalone() {
         .status()
         .expect("failed to invoke c++ to compile runtime/verb_map.cpp");
     assert!(status.success(), "runtime/verb_map.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
+#[test]
+fn verb_std_thread_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_std_thread_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-pthread", "-c",
+            "runtime/verb_std_thread.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_std_thread.cpp");
+    assert!(status.success(), "runtime/verb_std_thread.cpp failed to compile");
+    let _ = std::fs::remove_file(&obj);
+}
+
+#[test]
+fn verb_time_cpp_compiles_standalone() {
+    let obj = std::env::temp_dir().join("verb_time_syntax_check.o");
+    let status = Command::new("c++")
+        .args([
+            "-std=c++17", "-Iruntime", "-c",
+            "runtime/verb_time.cpp",
+            "-o", obj.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to invoke c++ to compile runtime/verb_time.cpp");
+    assert!(status.success(), "runtime/verb_time.cpp failed to compile");
     let _ = std::fs::remove_file(&obj);
 }
 
@@ -629,15 +663,10 @@ fn no_files_given_shows_usage() {
     assert!(stderr.contains("usage:"), "stderr: {stderr}");
 }
 
-fn run_ok_multi(names: &[&str], expected_name: &str) {
-    let files: Vec<String> = names
-        .iter()
-        .map(|n| format!("tests/fixtures/{n}.verb"))
-        .collect();
-    let mut args = vec!["run".to_string()];
-    args.extend(files);
+#[test]
+fn verb_file_import_links_and_runs() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(&args)
+        .args(["run", "tests/fixtures/multifile_b.verb"])
         .output()
         .unwrap();
     assert!(
@@ -646,24 +675,14 @@ fn run_ok_multi(names: &[&str], expected_name: &str) {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
-    let expected = std::fs::read_to_string(format!("tests/fixtures/{expected_name}.expected")).unwrap();
+    let expected = std::fs::read_to_string("tests/fixtures/multifile.expected").unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
 #[test]
-fn multi_file_links_and_runs() {
-    run_ok_multi(&["multifile_a", "multifile_b"], "multifile");
-}
-
-#[test]
-fn multi_file_emits_single_merged_llvm_module() {
+fn verb_file_import_emits_a_single_merged_llvm_module() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "run",
-            "tests/fixtures/multifile_a.verb",
-            "tests/fixtures/multifile_b.verb",
-            "--emit-llvm",
-        ])
+        .args(["run", "tests/fixtures/multifile_b.verb", "--emit-llvm"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -672,13 +691,9 @@ fn multi_file_emits_single_merged_llvm_module() {
 }
 
 #[test]
-fn multi_file_error_names_the_correct_file() {
+fn verb_file_import_error_names_the_importing_file_not_the_imported_one() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "run",
-            "tests/fixtures/multifile_err_a.verb",
-            "tests/fixtures/multifile_err_b.verb",
-        ])
+        .args(["run", "tests/fixtures/multifile_err_b.verb"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -695,18 +710,12 @@ fn multi_file_error_names_the_correct_file() {
 }
 
 #[test]
-fn multi_file_build_path_accepts_multiple_files() {
-    let dir = std::env::temp_dir().join("verb_multifile_build_test");
+fn verb_file_import_build_path_links_and_runs() {
+    let dir = std::env::temp_dir().join("verb_import_build_test");
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("multifile_bin");
+    let bin = dir.join("verb_file_import_bin");
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args([
-            "build",
-            "tests/fixtures/multifile_a.verb",
-            "tests/fixtures/multifile_b.verb",
-            "-o",
-            bin.to_str().unwrap(),
-        ])
+        .args(["build", "tests/fixtures/multifile_b.verb", "-o", bin.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success(), "build failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -715,18 +724,62 @@ fn multi_file_build_path_accepts_multiple_files() {
     assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
 }
 
+#[test]
+fn cli_rejects_more_than_one_entry_file() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/multifile_a.verb", "tests/fixtures/multifile_b.verb"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage:"), "stderr: {stderr}");
+}
+
+#[test]
+fn verb_file_import_dedups_a_diamond_dependency() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/diamond_entry.verb"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/diamond.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn verb_file_import_cycle_is_a_compile_error() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/cycle_a.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("import cycle"), "stderr: {stderr}");
+}
+
+#[test]
+fn verb_file_import_missing_file_is_a_clear_error() {
+    let dir = std::env::temp_dir().join("verb_missing_import_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = dir.join("entry.verb");
+    std::fs::write(&entry, "import mod nope.verb;\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", entry.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nope.verb"), "stderr: {stderr}");
+}
+
 // ----- std io -----
 
 #[test]
-fn run_executes_a_program_using_std_io_files() {
-    // std io file round-trip under the JIT must match its build-mode output.
-    let _ = std::fs::remove_file("verb_e2e_std_io_run.tmp");
-    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(["run", "tests/fixtures/std_io_file_roundtrip.verb"])
-        .output().unwrap();
-    assert!(out.status.success(), "run failed:\n{}", String::from_utf8_lossy(&out.stderr));
-    let expected = std::fs::read_to_string("tests/fixtures/std_io_file_roundtrip.expected").unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+fn run_executes_std_io_file_roundtrip() {
+    let _ = std::fs::remove_file("verb_e2e_std_io_roundtrip.tmp");
+    run_ok("std_io_file_roundtrip");
+    let _ = std::fs::remove_file("verb_e2e_std_io_roundtrip.tmp");
 }
 
 #[test]
@@ -855,20 +908,15 @@ fn windows_cross_target_rejects_std_io_import() {
 // ----- std map -----
 
 #[test]
-fn run_executes_a_program_using_std_map() {
-    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
-        .args(["run", "tests/fixtures/std_map_basic.verb"])
-        .output().unwrap();
-    assert!(out.status.success(), "run failed:\n{}", String::from_utf8_lossy(&out.stderr));
-    let expected = std::fs::read_to_string("tests/fixtures/std_map_basic.expected").unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+fn run_executes_std_map_import() {
+    run_ok("std_map_basic");
+    assert_no_leaks_under_run("std_map_basic");
 }
 
 #[test]
-fn run_std_map_with_heap_values_leaks_nothing() {
-    // The critical forwarder path: map retains/releases heap VerbValues via
-    // the JIT-compiled helpers. gc_live must return to 0.
-    assert_no_leaks_run("gc_map_heap_values", &[]);
+fn run_executes_std_map_import_with_nested_containers() {
+    run_ok("gc_run_nested_map");
+    assert_no_leaks_under_run("gc_run_nested_map");
 }
 
 #[test]
@@ -938,6 +986,72 @@ fn cross_build_links_a_program_using_std_map_for_a_non_host_target() {
     assert!(meta.len() > 0, "empty output for {label}");
 }
 
+fn run_debug_session(prog: &str, script: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // parallel test threads share this process's pid, so the pid alone isn't
+    // a unique directory name -- an earlier version of this helper collided
+    // across concurrently-running debug_* tests, each clobbering the others'
+    // t.verb mid-run.
+    let dir = std::env::temp_dir().join(format!("verb_dbg_test_{}_{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.verb");
+    std::fs::write(&file, prog).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .arg("debug")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn debug_breakpoint_and_print_variable() {
+    let prog = "assign x 1;\nassign y 2;\nprint(x add y);\n";
+    let out = run_debug_session(prog, "break 2\nrun\nprint x\ncontinue\nquit\n");
+    assert!(out.contains("stopped at line 2"), "{out}");
+    // "(vdb) 1" is the prompt immediately followed by `print x`'s output --
+    // a bare `out.contains('1')` would also pass on "line 1" and give no
+    // real signal that `print x` printed anything at all.
+    assert!(out.contains("(vdb) 1"), "{out}");
+}
+
+#[test]
+fn debug_step_through_statements() {
+    let prog = "assign x 1;\nassign y 2;\nprint(x add y);\n";
+    // `run` alone doesn't pause execution -- an initial breakpoint is
+    // needed to get the first stop, exactly like gdb requires a
+    // breakpoint before `run` if you want to stop at the very start.
+    let out = run_debug_session(prog, "break 1\nrun\nstep\nstep\nquit\n");
+    assert!(out.contains("stopped at line 1"), "{out}");
+    assert!(out.contains("stopped at line 2"), "{out}");
+}
+
+#[test]
+fn debug_backtrace_across_nested_call() {
+    let prog = "make inner()\nbegin\n  print(1);\nend\nmake outer()\nbegin\n  inner();\nend\nouter();\n";
+    // line 3 is 'print(1);' inside inner()
+    let out = run_debug_session(prog, "break 3\nrun\nbacktrace\ncontinue\nquit\n");
+    assert!(out.contains("stopped at line 3"), "{out}");
+    assert!(out.contains("inner"), "{out}");
+    assert!(out.contains("outer"), "{out}");
+}
+
+#[test]
+fn debug_quit_mid_session_exits_cleanly() {
+    let prog = "assign x 1;\nprint(x);\n";
+    let out = run_debug_session(prog, "break 1\nrun\nquit\n");
+    assert!(out.contains("stopped at line 1"), "{out}");
+}
+
 #[test]
 fn reassign_and_short_circuit_release_correctly() { run_ok("gc_reassign_and_or"); }
 
@@ -954,7 +1068,7 @@ fn gc_no_leaks_across_all_heap_kinds() {
         "arrays_of_arrays", "arrays_of_closures", "std_map_basic",
         "gc_reassign_and_or", "gc_global_reassign", "gc_early_return_nested",
         "gc_arrays_nested", "gc_arrays_of_closures", "gc_arrays_regrow",
-        "gc_map_heap_values", "gc_std_io_file_roundtrip",
+        "gc_map_heap_values", "gc_std_io_file_roundtrip", "std_thread_spawn_join",
     ] {
         assert_no_leaks(fixture);
     }
@@ -1045,7 +1159,12 @@ fn integration_example_zero_leaks() {
 /// libmathlib built with the same zig triple used for the program link.
 /// Callers must guard with `zig_available()` before invoking this.
 fn build_mathlib_for_target(label: &str, zig_triple: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("verb_e2e_cross_libs_{label}"));
+    // Unique per call so concurrently-running tests (each cross-building the
+    // same set of labels) never share a lib dir and race on `mathlib.o`.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NONCE: AtomicUsize = AtomicUsize::new(0);
+    let n = NONCE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("verb_e2e_cross_libs_{label}_{n}"));
     std::fs::create_dir_all(&dir).unwrap();
 
     let obj_path = dir.join("mathlib.o");
@@ -1150,4 +1269,329 @@ fn integration_example_cross_builds_all_targets() {
             .unwrap_or_else(|e| panic!("missing output for {label} at {expected_path:?}: {e}"));
         assert!(meta.len() > 0, "empty output for {label}");
     }
+}
+
+/// Proves the literal `verb build --target all` invocation named in ROADMAP
+/// Success Criterion 2 (INTEG-02): a SINGLE `--target all` run cross-links an
+/// FFI-importing program for all 6 targets, each against its own arch-matched
+/// libmathlib supplied via the `-L<target>=<dir>` per-target convention.
+///
+/// Uses `examples/integration_all_windows.verb` (no `std io`) so all 6 targets
+/// are linkable in one program -- the full `integration_all.verb` carries
+/// `import std io`, which by design cannot cross-compile to Windows, and that
+/// pre-existing exception is covered by the per-target-loop test above. Here we
+/// want a clean all-6-succeed summary that isolates the per-target-lib fix.
+///
+/// Before this fix, `--target all` broadcast one shared `-L` set to every
+/// target, so at most one target's library was arch-compatible and the rest
+/// failed with linker architecture-mismatch errors. Build-only (D-05).
+#[test]
+fn target_all_resolves_per_target_libs() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_e2e_target_all_per_lib");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // (label, zig_triple) matching src/targets.rs::ALL / Target::zig_triple().
+    let targets: [(&str, &str); 6] = [
+        ("linux-x86_64", "x86_64-linux-gnu"),
+        ("linux-arm64", "aarch64-linux-gnu"),
+        ("macos-x86_64", "x86_64-macos-none"),
+        ("macos-arm64", "aarch64-macos-none"),
+        ("windows-x86_64", "x86_64-windows-gnu"),
+        ("windows-arm64", "aarch64-windows-gnu"),
+    ];
+
+    let out = dir.join("intg_all");
+
+    // One arch-matched libmathlib per target, each scoped via `-L<label>=<dir>`.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_verb"));
+    cmd.args([
+        "build",
+        "examples/integration_all_windows.verb",
+        "-o",
+        out.to_str().unwrap(),
+        "--target",
+        "all",
+    ]);
+    for (label, zig_triple) in targets {
+        let lib_dir = build_mathlib_for_target(label, zig_triple);
+        cmd.arg(format!("-L{label}={}", lib_dir.display()));
+    }
+
+    let res = cmd.output().unwrap();
+    assert!(
+        res.status.success(),
+        "`--target all` with per-target libs failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&res.stdout),
+        String::from_utf8_lossy(&res.stderr),
+    );
+
+    // Every target's labeled artifact exists and is non-empty (build_aot_all
+    // writes `<out>-<label>`; windows gets `.exe` appended by adjust_output).
+    for (label, _) in targets {
+        let path = if label.starts_with("windows") {
+            dir.join(format!("intg_all-{label}.exe"))
+        } else {
+            dir.join(format!("intg_all-{label}"))
+        };
+        let meta = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("missing --target all output for {label} at {path:?}: {e}"));
+        assert!(meta.len() > 0, "empty --target all output for {label}");
+    }
+}
+
+// ----- std thread -----
+
+#[test]
+fn run_rejects_programs_with_std_thread_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_thread_spawn_join.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std thread"), "stderr: {stderr}");
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_thread_spawn_join() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_thread_spawn_join_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_spawn_join.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_thread_spawn_join.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_thread_mutex() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_thread_mutex_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_mutex.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_thread_mutex.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_thread_channel() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_thread_channel_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_channel.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_thread_channel.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn channel_send_rejects_a_non_primitive_value() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_thread_channel_reject_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_channel_rejects_non_primitive.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_thread_channel_rejects_non_primitive.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_thread_sleep() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_thread_sleep_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_sleep.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_thread_sleep.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn cross_build_rejects_std_thread_import_for_windows_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_thread_windows_reject_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_thread_windows");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_thread_spawn_join.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("import std thread"), "stderr: {stderr}");
+    assert!(stderr.contains("Windows"), "stderr: {stderr}");
+}
+
+// ----- std time -----
+
+#[test]
+fn run_rejects_programs_with_std_time_import() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["run", "tests/fixtures/std_time_basic.verb"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("std time"), "stderr: {stderr}");
+}
+
+#[test]
+fn build_links_and_runs_a_program_using_std_time() {
+    let out_path = std::env::temp_dir().join("verb_e2e_std_time_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_basic.verb",
+            "-o", out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_time_basic.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn cross_build_links_a_program_using_std_time_for_a_non_host_target() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    // Like std map, std time has no Windows restriction (no POSIX-only
+    // deps -- <chrono>/<thread> are portable), so this also covers a
+    // Windows target rather than needing a separate rejection test.
+    let label = if cfg!(target_arch = "x86_64") { "linux-arm64" } else { "linux-x86_64" };
+    let dir = std::env::temp_dir().join("verb_std_time_cross_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join(format!("std_time_basic_{label}"));
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_basic.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", label,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "target {label} failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output for {label} at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for {label}");
+}
+
+// `linux_*`/`win_*` are only defined in runtime/verb_time.cpp under
+// __linux__/_WIN32 respectively (see TIME_FUNCS's doc comment in
+// src/codegen.rs) -- these two tests cross-build (via zig, whose clang
+// frontend sets the right predefined macros for -target regardless of
+// host OS) to confirm each platform's functions actually compile and
+// link for that platform. Not run, same as the other cross-build tests
+// (foreign arch/OS binaries can't execute on this host).
+
+#[test]
+fn cross_build_links_a_program_using_linux_only_time_functions() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_time_linux_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_time_linux_x86_64");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_linux.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "linux-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "linux-x86_64 build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let meta = std::fs::metadata(&bin)
+        .unwrap_or_else(|e| panic!("missing output at {bin:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for linux-x86_64");
+}
+
+#[test]
+fn cross_build_links_a_program_using_windows_only_time_functions() {
+    if !zig_available() {
+        eprintln!("skipping: zig not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("verb_std_time_windows_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("std_time_windows_x86_64");
+    let out = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args([
+            "build", "tests/fixtures/std_time_windows.verb",
+            "-o", bin.to_str().unwrap(),
+            "--target", "windows-x86_64",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "windows-x86_64 build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let expected_path = dir.join("std_time_windows_x86_64.exe");
+    let meta = std::fs::metadata(&expected_path)
+        .unwrap_or_else(|e| panic!("missing output at {expected_path:?}: {e}"));
+    assert!(meta.len() > 0, "empty output for windows-x86_64");
 }

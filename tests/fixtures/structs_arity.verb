@@ -1,0 +1,3 @@
+shape Point begin x, y end
+assign p Point(1);
+print(p);
