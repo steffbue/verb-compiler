@@ -26,6 +26,9 @@ pub enum Stmt {
     ExprStmt(Expr),
     If { cond: Expr, then_body: Vec<Stmt>, else_body: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
+    For { init: Box<Stmt>, cond: Expr, incr: Box<Stmt>, body: Vec<Stmt> }, // loop init; cond; incr begin … end
+    Break { line: u32, col: u32 },     // leave;   -- exit innermost loop
+    Continue { line: u32, col: u32 },  // next;    -- jump to next iteration
     Fn { name: String, params: Vec<String>, body: Vec<Stmt>, line: u32, col: u32 },
     Return { value: Option<Expr> },
     Block(Vec<Stmt>),

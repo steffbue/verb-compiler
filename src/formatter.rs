@@ -1,10 +1,9 @@
 //! Formatter for Verb source, driven by the token+comment stream rather
 //! than the AST — `ast::Stmt` carries no comment info (the lexer used to
-//! discard comments entirely) and `parser.rs` desugars `loop init; cond;
-//! update begin...end` into `Stmt::Block([Assign, Stmt::While{..}])`, so
-//! unparsing the AST would rewrite every `loop` into a fabricated
-//! `assign`+`repeat` and drop every comment. Working from tokens avoids
-//! both problems by construction.
+//! discard comments entirely), so unparsing the AST would drop every
+//! comment. Working from tokens avoids that by construction, and also
+//! keeps the formatter oblivious to AST shape (e.g. `loop … begin … end`
+//! parsing to a `Stmt::For`): it just echoes the tokens it sees.
 //!
 //! Turns out spacing/newline placement don't need a full grammar walk
 //! either: every rule below is a pure function of the current token kind
@@ -192,6 +191,8 @@ fn token_text(tok: &Token) -> String {
         Orelse => "orelse".into(),
         Repeat => "repeat".into(),
         Loop => "loop".into(),
+        Leave => "leave".into(),
+        Next => "next".into(),
         True => "true".into(),
         False => "false".into(),
         Nil => "nil".into(),

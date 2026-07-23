@@ -170,6 +170,32 @@ fn declare_vars() { run_ok("declare"); }
 fn control() { run_ok("control"); }
 
 #[test]
+fn break_and_continue() { run_ok("break_continue"); }
+
+#[test]
+fn break_and_continue_release_loop_scopes() { assert_no_leaks("gc_break_continue"); }
+
+#[test]
+fn break_outside_loop_is_compile_error() {
+    compile_err("err_break_outside", &["'leave' outside loop"]);
+}
+
+#[test]
+fn continue_outside_loop_is_compile_error() {
+    compile_err("err_continue_outside", &["'next' outside loop"]);
+}
+
+#[test]
+fn break_in_fn_does_not_see_enclosing_loop() {
+    compile_err("err_break_in_fn", &["'leave' outside loop"]);
+}
+
+#[test]
+fn break_word_gets_rename_hint() {
+    compile_err("err_break_word", &["'break' was renamed to 'leave'"]);
+}
+
+#[test]
 fn functions() { run_ok("functions"); }
 
 #[test]

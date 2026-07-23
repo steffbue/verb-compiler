@@ -445,8 +445,13 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
                 }
             }
             Stmt::While { body, .. } => collect_from_stmts(body, out),
+            Stmt::For { init, body, .. } => {
+                collect_from_stmts(std::slice::from_ref(init), out);
+                collect_from_stmts(body, out);
+            }
             Stmt::Block(inner) => collect_from_stmts(inner, out),
-            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_) => {}
+            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_)
+            | Stmt::Break { .. } | Stmt::Continue { .. } => {}
         }
     }
 }
