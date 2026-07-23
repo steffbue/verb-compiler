@@ -27,6 +27,8 @@
 "orelse" @keyword.conditional
 "repeat" @keyword.repeat
 "loop" @keyword.repeat
+"leave" @keyword.repeat
+"next" @keyword.repeat
 "begin" @keyword
 "end" @keyword
 "import" @keyword.import

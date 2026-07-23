@@ -142,3 +142,30 @@ print(square(7));
           (identifier)
           (arguments
             (int)))))))
+
+==================
+leave (break) and next (continue) in loops
+==================
+
+repeat count trails 3 begin
+  check count equals 1 begin
+    leave;
+  end
+  next;
+end
+
+---
+
+(source_file
+  (while_statement
+    (binary_expression
+      (identifier)
+      (int))
+    (block
+      (if_statement
+        (binary_expression
+          (identifier)
+          (int))
+        (block
+          (break_statement)))
+      (continue_statement))))

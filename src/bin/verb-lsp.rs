@@ -320,6 +320,8 @@ fn keyword_doc(word: &str) -> Option<&'static str> {
         "orelse" => "`orelse` — else / else-if branch attached to a `check`.",
         "repeat" => "`repeat cond begin ... end` — while-loop.",
         "loop" => "`loop init; cond; update begin ... end` — C-style for-loop (desugars to a `repeat`).",
+        "leave" => "`leave;` — break out of the innermost loop (error outside a loop).",
+        "next" => "`next;` — skip to the next iteration of the innermost loop (error outside a loop).",
         "begin" => "opens a block (Verb has no `{ }`).",
         "end" => "closes a block opened by `begin`.",
         "import" => "`import mod <lib>;` / `import std <module>;` — must appear before any other top-level statement.",
@@ -358,7 +360,7 @@ fn completion_items(src: &str) -> Value {
     let mut items: Vec<Value> = Vec::new();
 
     for word in [
-        "assign", "declare", "be", "make", "return", "check", "orelse", "repeat", "loop", "begin",
+        "assign", "declare", "be", "make", "return", "check", "orelse", "repeat", "loop", "leave", "next", "begin",
         "end", "import", "std", "true", "false", "nil", "add", "sub", "neg", "times", "div", "mod",
         "equals", "differs", "trails", "beats", "atmost", "atleast", "and", "or", "not", "join", "list",
     ] {

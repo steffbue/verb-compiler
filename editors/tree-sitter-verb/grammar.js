@@ -49,6 +49,8 @@ module.exports = grammar({
         $.if_statement,
         $.while_statement,
         $.for_statement,
+        $.break_statement,
+        $.continue_statement,
         $.block,
         $.reassign_statement,
         $.expression_statement,
@@ -115,6 +117,13 @@ module.exports = grammar({
         field("update", choice($._reassign_no_semi, $._expression)),
         field("body", $.block),
       ),
+
+    // `leave;` / `next;` — break out of / skip to the next iteration of the
+    // innermost loop. The grammar accepts them as bare statements; the
+    // "must be inside a loop" rule is enforced by src/parser.rs, not here.
+    break_statement: ($) => seq("leave", ";"),
+
+    continue_statement: ($) => seq("next", ";"),
 
     block: ($) => seq("begin", repeat($._statement), "end"),
 

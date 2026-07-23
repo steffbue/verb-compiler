@@ -34,6 +34,8 @@ const KEYWORD_LITERALS = new Set([
   "orelse",
   "repeat",
   "loop",
+  "leave",
+  "next",
   "begin",
   "end",
   "import",
