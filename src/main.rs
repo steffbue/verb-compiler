@@ -28,49 +28,88 @@ pub struct VerbValueAbi {
     pub payload: i64,
 }
 
-extern "C" {
-    /// Defined in `runtime/verb_map.cpp`, compiled into this binary by build.rs.
-    fn verb_map_destroy_contents(payload: *mut std::ffi::c_void);
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// Set once, at JIT startup, to the addresses of the module's emitted
+// verb_alloc/verb_retain_value/verb_release_value. The C++ runtime units
+// compiled into this binary (verb_map.cpp, verb_std_io.cpp) and any dlopen'd
+// import-mod library call these forwarder symbols; the forwarders hop into
+// the JIT-compiled helpers. Under AOT these forwarders are never linked
+// (the object file carries its own emitted helpers), so AOT is unaffected.
+static VERB_ALLOC_FP: AtomicUsize = AtomicUsize::new(0);
+static VERB_RETAIN_FP: AtomicUsize = AtomicUsize::new(0);
+static VERB_RELEASE_FP: AtomicUsize = AtomicUsize::new(0);
+
+fn forwarder_addr(slot: &AtomicUsize, name: &str) -> usize {
+    let a = slot.load(Ordering::Acquire);
+    if a == 0 {
+        eprintln!("internal error: {name} forwarder called before JIT runtime init");
+        std::process::abort();
+    }
+    a
 }
 
-// `runtime/verb_map.cpp` (linked into this binary) references these three
-// symbols, but they are emitted into each *JIT module* by codegen, not the
-// host — so the host linker has nothing to resolve them against. These
-// definitions satisfy the link. They are never reached at runtime under
-// `verb run`, which rejects imports (so no map value can exist, so
-// `verb_map_destroy_contents` — the only host code that would call them —
-// never runs). They abort loudly rather than silently corrupt state if that
-// invariant is ever broken.
 #[no_mangle]
-pub extern "C" fn verb_alloc(_n: i64) -> *mut std::ffi::c_void {
-    eprintln!("internal error: host verb_alloc stub called (verb run cannot use maps)");
-    std::process::abort();
+pub extern "C" fn verb_alloc(n: i64) -> *mut std::ffi::c_void {
+    let f: extern "C" fn(i64) -> *mut std::ffi::c_void =
+        unsafe { std::mem::transmute(forwarder_addr(&VERB_ALLOC_FP, "verb_alloc")) };
+    f(n)
 }
 #[no_mangle]
-pub extern "C" fn verb_retain_value(_v: VerbValueAbi) {
-    eprintln!("internal error: host verb_retain_value stub called (verb run cannot use maps)");
-    std::process::abort();
+pub extern "C" fn verb_retain_value(v: VerbValueAbi) {
+    let f: extern "C" fn(VerbValueAbi) =
+        unsafe { std::mem::transmute(forwarder_addr(&VERB_RETAIN_FP, "verb_retain_value")) };
+    f(v)
 }
 #[no_mangle]
-pub extern "C" fn verb_release_value(_v: VerbValueAbi) {
-    eprintln!("internal error: host verb_release_value stub called (verb run cannot use maps)");
-    std::process::abort();
+pub extern "C" fn verb_release_value(v: VerbValueAbi) {
+    let f: extern "C" fn(VerbValueAbi) =
+        unsafe { std::mem::transmute(forwarder_addr(&VERB_RELEASE_FP, "verb_release_value")) };
+    f(v)
 }
 
-/// Registers runtime symbols that codegen references unconditionally but whose
-/// definitions live in C++ runtime units compiled into this binary, so MCJIT
-/// can resolve the reference for every `run` — including programs that never
-/// exercise the symbol. Extend the array to add more such symbols.
+/// Point the forwarders at the module's JIT-compiled helpers. Must run after
+/// engine creation and before any Verb or C++ runtime code executes. Codegen
+/// emits all three helpers into every module, so lookups always succeed.
+fn install_runtime_forwarders(ee: &inkwell::execution_engine::ExecutionEngine) {
+    for (slot, name) in [
+        (&VERB_ALLOC_FP, "verb_alloc"),
+        (&VERB_RETAIN_FP, "verb_retain_value"),
+        (&VERB_RELEASE_FP, "verb_release_value"),
+    ] {
+        let addr = ee.get_function_address(name)
+            .unwrap_or_else(|e| { eprintln!("JIT error: cannot resolve {name}: {e}"); exit(1); });
+        slot.store(addr as usize, Ordering::Release);
+    }
+}
+
+/// Registers the first-party std runtime symbols (io + map + the map
+/// destructor) that codegen emits as external declarations. Their code is
+/// compiled into this binary (build.rs) and exported dynamically, so
+/// dlsym(RTLD_DEFAULT, name) yields the address. Only symbols the module
+/// actually declares are registered.
 fn register_jit_runtime_symbols<'ctx>(
     ee: &inkwell::execution_engine::ExecutionEngine<'ctx>,
     module: &inkwell::module::Module<'ctx>,
 ) {
-    let symbols: [(&str, usize); 1] =
-        [("verb_map_destroy_contents", verb_map_destroy_contents as *const () as usize)];
-    for (name, addr) in symbols {
-        if let Some(f) = module.get_function(name) {
-            ee.add_global_mapping(&f, addr);
+    const STD_SYMBOLS: &[&str] = &[
+        // io
+        "read_line", "file_read", "file_write", "file_append",
+        "tcp_connect", "tcp_listen", "tcp_accept", "send_line", "recv_line", "close_conn",
+        // map
+        "map_new", "map_set", "map_get", "map_has", "map_remove", "map_len",
+        // always emitted by codegen's release path
+        "verb_map_destroy_contents",
+    ];
+    for name in STD_SYMBOLS {
+        let Some(f) = module.get_function(name) else { continue };
+        let cname = std::ffi::CString::new(*name).unwrap();
+        let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
+        if addr.is_null() {
+            eprintln!("internal error: std runtime symbol '{name}' not found in process");
+            exit(1);
         }
+        ee.add_global_mapping(&f, addr as usize);
     }
 }
 
@@ -217,12 +256,16 @@ fn main() {
 
     match parsed.cmd.as_str() {
         "run" => {
-            if !imports.is_empty() || !std_imports.is_empty() {
-                let mut names = imports.clone();
-                names.extend(std_imports.iter().map(|m| format!("std {m}")));
+            let has_imports = !imports.is_empty() || !std_imports.is_empty();
+            if has_imports && cfg!(target_os = "windows") {
+                eprintln!("error: 'verb run' does not support imports on Windows; use 'verb build'");
+                exit(1);
+            }
+            if !imports.is_empty() {
+                // import mod libraries land in Task 3.
                 eprintln!(
-                    "error: 'verb run' does not support imports ({}); use 'verb build' instead",
-                    names.join(", ")
+                    "error: 'verb run' does not yet support 'import mod' ({}); use 'verb build'",
+                    imports.join(", ")
                 );
                 exit(1);
             }
@@ -234,6 +277,7 @@ fn main() {
                     exit(1);
                 });
             register_jit_runtime_symbols(&ee, cg.module());
+            install_runtime_forwarders(&ee);
             unsafe {
                 let main_fn = ee
                     .get_function::<unsafe extern "C" fn() -> i32>("main")

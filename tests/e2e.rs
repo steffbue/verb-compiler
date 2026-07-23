@@ -66,6 +66,23 @@ fn assert_no_leaks(fixture: &str) {
     let _ = std::fs::remove_file(&out_path);
 }
 
+/// Like `assert_no_leaks`, but drives the program through the JIT
+/// (`verb run`) instead of a built binary. Proves the run-mode refcount
+/// forwarders (verb_alloc/retain/release) reclaim every heap value.
+fn assert_no_leaks_run(fixture: &str, lib_dirs: &[String]) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_verb"));
+    cmd.arg("run").arg(format!("tests/fixtures/{fixture}.verb"));
+    for d in lib_dirs { cmd.arg(d); }
+    cmd.env("VERB_GC_DEBUG", "1");
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{fixture}: run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let live_line = stdout.lines().find(|l| l.starts_with("verb_gc_live="))
+        .unwrap_or_else(|| panic!("{fixture}: no verb_gc_live line in stdout:\n{stdout}"));
+    assert_eq!(live_line, "verb_gc_live=0", "{fixture}: leaked heap objects:\n{stdout}");
+}
+
 #[test]
 fn literals() { run_ok("literals"); }
 
@@ -369,7 +386,7 @@ fn run_rejects_programs_with_imports() {
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
+    assert!(stderr.contains("does not yet support 'import mod'"), "stderr: {stderr}");
     assert!(stderr.contains("mathlib"), "stderr: {stderr}");
 }
 
@@ -673,15 +690,15 @@ fn multi_file_build_path_accepts_multiple_files() {
 // ----- std io -----
 
 #[test]
-fn run_rejects_programs_with_std_io_import() {
+fn run_executes_a_program_using_std_io_files() {
+    // std io file round-trip under the JIT must match its build-mode output.
+    let _ = std::fs::remove_file("verb_e2e_std_io_run.tmp");
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run", "tests/fixtures/std_io_file_roundtrip.verb"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
-    assert!(stderr.contains("std io"), "stderr: {stderr}");
+        .output().unwrap();
+    assert!(out.status.success(), "run failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_io_file_roundtrip.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
 }
 
 #[test]
@@ -810,15 +827,20 @@ fn windows_cross_target_rejects_std_io_import() {
 // ----- std map -----
 
 #[test]
-fn run_rejects_programs_with_std_map_import() {
+fn run_executes_a_program_using_std_map() {
     let out = Command::new(env!("CARGO_BIN_EXE_verb"))
         .args(["run", "tests/fixtures/std_map_basic.verb"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("does not support imports"), "stderr: {stderr}");
-    assert!(stderr.contains("std map"), "stderr: {stderr}");
+        .output().unwrap();
+    assert!(out.status.success(), "run failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/std_map_basic.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+}
+
+#[test]
+fn run_std_map_with_heap_values_leaks_nothing() {
+    // The critical forwarder path: map retains/releases heap VerbValues via
+    // the JIT-compiled helpers. gc_live must return to 0.
+    assert_no_leaks_run("gc_map_heap_values", &[]);
 }
 
 #[test]
