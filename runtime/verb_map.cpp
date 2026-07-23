@@ -18,6 +18,7 @@
 #include "verb.h"
 
 #include <cstring>
+#include <iterator>
 #include <new>
 #include <unordered_map>
 
@@ -136,6 +137,22 @@ extern "C" VerbValue map_len(VerbValue m) {
     VerbMapImpl* impl = as_impl(m);
     if (!impl) return verb_int(0);
     return verb_int(static_cast<int64_t>(impl->size()));
+}
+
+// Returns the i-th key in iteration order (std::unordered_map order is
+// unspecified but stable between calls when unmodified). O(i) per call via
+// std::next -> O(n^2) over a full loop; acceptable for v1's scope. The
+// caller (for-each codegen) only ever passes 0 <= i < map_len(m).
+extern "C" VerbValue map_key_at(VerbValue m, VerbValue i) {
+    VerbMapImpl* impl = as_impl(m);
+    if (!impl || i.tag != VERB_INT) return verb_nil();
+    int64_t idx = i.payload;
+    if (idx < 0 || static_cast<size_t>(idx) >= impl->size()) return verb_nil();
+    auto it = std::next(impl->begin(), idx);
+    // The map keeps its own stored copy of the key; retain before handing
+    // back an independent one, mirroring map_get on the value side.
+    verb_retain_value(it->first);
+    return it->first;
 }
 
 // Called by the LLVM-defined verb_release_value (src/codegen.rs) when a

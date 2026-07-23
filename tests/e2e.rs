@@ -864,6 +864,27 @@ fn build_links_and_runs_a_program_using_std_map() {
 }
 
 #[test]
+fn build_runs_foreach_over_map_keys() {
+    let out_path = std::env::temp_dir().join("verb_e2e_foreach_map_bin");
+    let build = Command::new(env!("CARGO_BIN_EXE_verb"))
+        .args(["build", "tests/fixtures/foreach_map.verb", "-o", out_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "build failed: {}", String::from_utf8_lossy(&build.stderr));
+    let run = Command::new(&out_path).output().unwrap();
+    assert!(run.status.success(), "run failed: {}", String::from_utf8_lossy(&run.stderr));
+    let expected = std::fs::read_to_string("tests/fixtures/foreach_map.expected").unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn foreach_over_map_is_leak_free() {
+    assert_no_leaks("foreach_map");
+}
+
+#[test]
 fn map_with_heap_valued_entries_retains_and_releases_correctly() {
     let out_path = std::env::temp_dir().join("verb_e2e_gc_map_heap_values_bin");
     let build = Command::new(env!("CARGO_BIN_EXE_verb"))

@@ -1755,8 +1755,23 @@ impl<'ctx> Codegen<'ctx> {
                 // via mem2reg at higher opt levels.
                 let elemp = self.builder.build_alloca(self.value_ty, "fe.elemp").unwrap();
 
+                // Maps can only exist under `import std map`; only then is
+                // verb_map.cpp linked and `map_key_at` resolvable. Gating the
+                // whole map case on the import keeps non-map programs from
+                // referencing a symbol that isn't linked into them.
+                let has_map = self.std_imports.iter().any(|m| m == "map");
+                if has_map {
+                    for (fname, arity) in [("map_len", 1usize), ("map_key_at", 2usize)] {
+                        if self.module.get_function(fname).is_none() {
+                            let ptys: Vec<_> = (0..arity).map(|_| self.value_ty.into()).collect();
+                            self.module.add_function(fname, self.value_ty.fn_type(&ptys, false), None);
+                        }
+                    }
+                }
+
                 let arr_bb  = self.ctx.append_basic_block(f, "fe.array");
                 let str_bb  = self.ctx.append_basic_block(f, "fe.string");
+                let map_bb  = self.ctx.append_basic_block(f, "fe.map");
                 let bad_bb  = self.ctx.append_basic_block(f, "fe.badtype");
                 let setup_bb = self.ctx.append_basic_block(f, "fe.setup");
                 let cond_bb = self.ctx.append_basic_block(f, "fe.cond");
@@ -1764,14 +1779,15 @@ impl<'ctx> Codegen<'ctx> {
                 let bound_bb = self.ctx.append_basic_block(f, "fe.bound");
                 let end_bb  = self.ctx.append_basic_block(f, "fe.end");
 
-                // dispatch on runtime tag (map case inserted in Task 6)
-                self.builder.build_switch(
-                    tag, bad_bb,
-                    &[
-                        (i8t.const_int(TAG_ARRAY, false), arr_bb),
-                        (i8t.const_int(crate::value::TAG_STR, false), str_bb),
-                    ],
-                ).unwrap();
+                // dispatch on runtime tag; map case only reachable under `import std map`
+                let mut tag_cases = vec![
+                    (i8t.const_int(TAG_ARRAY, false), arr_bb),
+                    (i8t.const_int(crate::value::TAG_STR, false), str_bb),
+                ];
+                if has_map {
+                    tag_cases.push((i8t.const_int(crate::value::TAG_MAP, false), map_bb));
+                }
+                self.builder.build_switch(tag, bad_bb, &tag_cases).unwrap();
 
                 // array: len = verb_array_len(coll)
                 self.builder.position_at_end(arr_bb);
@@ -1788,6 +1804,20 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(lenp, slen).unwrap();
                 self.builder.build_store(kindp, i8t.const_int(1, false)).unwrap();
                 self.builder.build_unconditional_branch(setup_bb).unwrap();
+
+                // map: len = map_len(m), kind = 2
+                self.builder.position_at_end(map_bb);
+                if has_map {
+                    let mlen = self.call_named("map_len", &[collv.into()]).unwrap().into_struct_value();
+                    self.builder.build_store(lenp, self.payload_of(mlen)).unwrap();
+                    self.builder.build_store(kindp, i8t.const_int(2, false)).unwrap();
+                    self.builder.build_unconditional_branch(setup_bb).unwrap();
+                } else {
+                    // unreachable: no map value can exist without `import std map`,
+                    // so the tag switch never targets this block. Still terminate
+                    // it (branch to bad_bb) so the module verifies.
+                    self.builder.build_unconditional_branch(bad_bb).unwrap();
+                }
 
                 // non-iterable value: abort with its type name
                 self.builder.position_at_end(bad_bb);
@@ -1810,13 +1840,15 @@ impl<'ctx> Codegen<'ctx> {
                 let kind = self.builder.build_load(i8t, kindp, "fe.kind").unwrap().into_int_value();
                 let fetch_arr_bb = self.ctx.append_basic_block(f, "fe.fetch.array");
                 let fetch_str_bb = self.ctx.append_basic_block(f, "fe.fetch.string");
-                self.builder.build_switch(
-                    kind, fetch_arr_bb,
-                    &[
-                        (i8t.const_int(0, false), fetch_arr_bb),
-                        (i8t.const_int(1, false), fetch_str_bb),
-                    ],
-                ).unwrap();
+                let fetch_map_bb = self.ctx.append_basic_block(f, "fe.fetch.map");
+                let mut kind_cases = vec![
+                    (i8t.const_int(0, false), fetch_arr_bb),
+                    (i8t.const_int(1, false), fetch_str_bb),
+                ];
+                if has_map {
+                    kind_cases.push((i8t.const_int(2, false), fetch_map_bb));
+                }
+                self.builder.build_switch(kind, fetch_arr_bb, &kind_cases).unwrap();
 
                 self.builder.position_at_end(fetch_arr_bb);
                 let iv = self.make_val(TAG_INT, i);
@@ -1832,6 +1864,19 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap().into_struct_value();
                 self.builder.build_store(elemp, selem).unwrap();
                 self.builder.build_unconditional_branch(bound_bb).unwrap();
+
+                // map: fetch the idx-th key as a fresh +1 value (map_key_at retains)
+                self.builder.position_at_end(fetch_map_bb);
+                if has_map {
+                    let ivm = self.make_val(TAG_INT, i);
+                    let melem = self.call_named("map_key_at", &[collv.into(), ivm.into()])
+                        .unwrap().into_struct_value();
+                    self.builder.build_store(elemp, melem).unwrap();
+                    self.builder.build_unconditional_branch(bound_bb).unwrap();
+                } else {
+                    // unreachable: kind is never 2 without `import std map`.
+                    self.builder.build_unreachable().unwrap();
+                }
 
                 // bound: bind element to `name` in a fresh iteration scope, run body
                 self.builder.position_at_end(bound_bb);
@@ -2315,6 +2360,7 @@ const MAP_FUNCS: &[(&str, usize)] = &[
     ("map_has", 2),
     ("map_remove", 2),
     ("map_len", 1),
+    ("map_key_at", 2),
 ];
 
 fn map_func_arity(name: &str) -> Option<usize> {
