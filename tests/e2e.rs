@@ -138,6 +138,35 @@ fn array_literal_emits_malloc_and_store_in_ir() {
     assert!(ir.contains("@verb_print_value"), "no verb_print_value in IR:\n{ir}");
 }
 
+// ----- structs / records -----
+
+#[test]
+fn structs_basic_construct_get_set_print() { run_ok("structs_basic"); }
+
+#[test]
+fn structs_nested_hold_structs_and_arrays() { run_ok("structs_nested"); }
+
+#[test]
+fn structs_reassign_and_heap_fields_leak_nothing() {
+    run_ok("gc_structs");
+    assert_no_leaks("gc_structs");
+}
+
+#[test]
+fn struct_unknown_field_aborts() {
+    run_err("err_struct_field_unknown", "unknown field 'z'");
+}
+
+#[test]
+fn struct_wrong_arity_is_a_compile_error() {
+    compile_err("err_struct_arity", &["record 'Point' takes 2 field(s), got 1"]);
+}
+
+#[test]
+fn field_of_nonstruct_aborts() {
+    run_err("err_field_of_nonstruct", "'field access' needs a record, got int");
+}
+
 #[test]
 fn arith() { run_ok("arith"); }
 
@@ -877,6 +906,7 @@ fn gc_no_leaks_across_all_heap_kinds() {
         "gc_reassign_and_or", "gc_global_reassign", "gc_early_return_nested",
         "gc_arrays_nested", "gc_arrays_of_closures", "gc_arrays_regrow",
         "gc_map_heap_values", "gc_std_io_file_roundtrip",
+        "structs_basic", "structs_nested", "gc_structs",
     ] {
         assert_no_leaks(fixture);
     }

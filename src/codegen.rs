@@ -18,15 +18,28 @@ pub struct Codegen<'ctx> {
     value_ty: StructType<'ctx>,
     closure_ty: StructType<'ctx>,
     array_ty: StructType<'ctx>,
+    struct_hdr_ty: StructType<'ctx>,
     ptr_ty: PointerType<'ctx>,
     scopes: Vec<HashMap<String, PointerValue<'ctx>>>,
     globals: HashMap<String, PointerValue<'ctx>>,
     externs: HashMap<String, FunctionValue<'ctx>>,
+    records: HashMap<String, RecordInfo<'ctx>>,
     imports: Vec<String>,
     std_imports: Vec<String>,
     fn_depth: u32,
     fn_counter: u32,
     cur_file: String,
+}
+
+/// Compile-time info for a declared `record`: a pointer to its static
+/// descriptor global ({ i8* type_name, i64 nfields, [nfields x i8*]
+/// field_names }) and the ordered field names, used for construction
+/// arity-checking. Field *lookup* (get/set) is done by name at runtime
+/// against the descriptor, so a struct value carries its own type.
+#[derive(Clone)]
+struct RecordInfo<'ctx> {
+    descriptor: PointerValue<'ctx>,
+    fields: Vec<String>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -39,9 +52,14 @@ impl<'ctx> Codegen<'ctx> {
             ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into(), ptr_ty.into()], false);
         let array_ty =
             ctx.struct_type(&[ctx.i64_type().into(), ctx.i64_type().into(), ptr_ty.into()], false);
+        // Header shared by every struct/record heap block: { ptr descriptor,
+        // i64 nfields }. The nfields inline `value_ty` fields follow at
+        // byte offset 16 (see `struct_field_slot`).
+        let struct_hdr_ty = ctx.struct_type(&[ptr_ty.into(), ctx.i64_type().into()], false);
         let cg = Self {
-            ctx, module, builder, value_ty, closure_ty, array_ty, ptr_ty,
+            ctx, module, builder, value_ty, closure_ty, array_ty, struct_hdr_ty, ptr_ty,
             scopes: Vec::new(), globals: HashMap::new(), externs: HashMap::new(),
+            records: HashMap::new(),
             imports: Vec::new(), std_imports: Vec::new(), fn_depth: 0, fn_counter: 0,
             cur_file: String::new(),
         };
@@ -66,6 +84,10 @@ impl<'ctx> Codegen<'ctx> {
         // requires the callee to already exist in the module).
         cg.build_retain_value_fn();
         cg.build_release_value_fn();
+        // verb_struct_get/set call verb_retain_value/verb_release_value, so
+        // they must be built after those two exist in the module.
+        cg.build_struct_get_fn();
+        cg.build_struct_set_fn();
         cg.build_array_get_fn();
         cg.build_array_set_fn();
         cg.build_array_push_fn();
@@ -117,6 +139,22 @@ impl<'ctx> Codegen<'ctx> {
         unsafe {
             self.builder.build_in_bounds_gep(
                 self.ctx.i8_type(), payload, &[i64t.const_int((-8i64) as u64, true)], "hdr")
+        }.unwrap()
+    }
+
+    /// Pointer to field slot `idx` (a `value_ty`) inside a struct/record
+    /// heap block whose payload pointer is `sp`. Fields live inline after
+    /// the 16-byte `struct_hdr_ty` header, so slot `idx` is at
+    /// `sp + 16 + idx*16`. `idx` may be a compile-time constant (construction)
+    /// or a runtime value (GC cascade, field lookup).
+    fn struct_field_slot(&self, sp: PointerValue<'ctx>, idx: IntValue<'ctx>) -> PointerValue<'ctx> {
+        let i64t = self.ctx.i64_type();
+        let base = unsafe {
+            self.builder.build_in_bounds_gep(
+                self.ctx.i8_type(), sp, &[i64t.const_int(16, false)], "fbase")
+        }.unwrap();
+        unsafe {
+            self.builder.build_in_bounds_gep(self.value_ty, base, &[idx], "fslot")
         }.unwrap()
     }
 
@@ -222,7 +260,7 @@ impl<'ctx> Codegen<'ctx> {
         let mut cases = Vec::new();
         for (t, name) in [(TAG_NIL, "nil"), (TAG_BOOL, "bool"), (TAG_INT, "int"),
                           (TAG_FLOAT, "float"), (TAG_STR, "string"), (TAG_CLOSURE, "fn"),
-                          (TAG_ARRAY, "array"), (TAG_MAP, "map")] {
+                          (TAG_ARRAY, "array"), (TAG_MAP, "map"), (TAG_STRUCT, "struct")] {
             let bb = self.ctx.append_basic_block(f, name);
             self.builder.position_at_end(bb);
             let s = self.cstr(name);
@@ -338,6 +376,7 @@ impl<'ctx> Codegen<'ctx> {
         let clos_bb = self.ctx.append_basic_block(f, "closure");
         let arr_bb = self.ctx.append_basic_block(f, "array");
         let map_bb = self.ctx.append_basic_block(f, "map");
+        let struct_bb = self.ctx.append_basic_block(f, "struct");
         let done = self.ctx.append_basic_block(f, "done");
 
         let i8t = self.ctx.i8_type();
@@ -350,6 +389,7 @@ impl<'ctx> Codegen<'ctx> {
             (i8t.const_int(TAG_CLOSURE, false), clos_bb),
             (i8t.const_int(TAG_ARRAY, false), arr_bb),
             (i8t.const_int(TAG_MAP, false), map_bb),
+            (i8t.const_int(TAG_STRUCT, false), struct_bb),
         ]).unwrap();
 
         self.builder.position_at_end(nil_bb);
@@ -430,6 +470,62 @@ impl<'ctx> Codegen<'ctx> {
 
         self.builder.position_at_end(map_bb);
         self.call_named("printf", &[self.cstr("<map>\n").into()]);
+        self.builder.build_unconditional_branch(done).unwrap();
+
+        // ----- struct/record: Point{x: <v>, y: <v>} (generic via descriptor) -----
+        self.builder.position_at_end(struct_bb);
+        let i64t = self.ctx.i64_type();
+        let ssp = self.builder.build_int_to_ptr(pay, self.ptr_ty, "ssp").unwrap();
+        let sdescp = self.builder.build_struct_gep(self.struct_hdr_ty, ssp, 0, "sdescp").unwrap();
+        let sdesc = self.builder.build_load(self.ptr_ty, sdescp, "sdesc").unwrap().into_pointer_value();
+        // descriptor field 0 = type_name (i8*)
+        let tnamep = self.builder.build_struct_gep(self.struct_hdr_ty, sdesc, 0, "tnamep").unwrap();
+        let tname = self.builder.build_load(self.ptr_ty, tnamep, "tname").unwrap();
+        self.call_named("printf", &[self.cstr("%s{").into(), tname.into()]);
+        let snfp = self.builder.build_struct_gep(self.struct_hdr_ty, ssp, 1, "snfp").unwrap();
+        let snf = self.builder.build_load(i64t, snfp, "snf").unwrap().into_int_value();
+
+        let sidxp = self.entry_alloca(i64t.into(), "spidx");
+        self.builder.build_store(sidxp, i64t.const_zero()).unwrap();
+        let scond_bb = self.ctx.append_basic_block(f, "sp.cond");
+        let sbody_bb = self.ctx.append_basic_block(f, "sp.body");
+        let ssep_bb = self.ctx.append_basic_block(f, "sp.sep");
+        let sfield_bb = self.ctx.append_basic_block(f, "sp.field");
+        let send_bb = self.ctx.append_basic_block(f, "sp.end");
+        self.builder.build_unconditional_branch(scond_bb).unwrap();
+
+        self.builder.position_at_end(scond_bb);
+        let si = self.builder.build_load(i64t, sidxp, "si").unwrap().into_int_value();
+        let smore = self.builder.build_int_compare(inkwell::IntPredicate::SLT, si, snf, "smore").unwrap();
+        self.builder.build_conditional_branch(smore, sbody_bb, send_bb).unwrap();
+
+        self.builder.position_at_end(sbody_bb);
+        let sfirst = self.builder.build_int_compare(
+            inkwell::IntPredicate::EQ, si, i64t.const_zero(), "sfirst").unwrap();
+        self.builder.build_conditional_branch(sfirst, sfield_bb, ssep_bb).unwrap();
+
+        self.builder.position_at_end(ssep_bb);
+        self.call_named("printf", &[self.cstr(", ").into()]);
+        self.builder.build_unconditional_branch(sfield_bb).unwrap();
+
+        self.builder.position_at_end(sfield_bb);
+        // field name i: descriptor's names array begins at desc + 16, each ptr-sized.
+        let noff = self.builder.build_int_mul(si, i64t.const_int(8, false), "noff").unwrap();
+        let noff = self.builder.build_int_add(noff, i64t.const_int(16, false), "noff16").unwrap();
+        let namep_addr = unsafe {
+            self.builder.build_in_bounds_gep(self.ctx.i8_type(), sdesc, &[noff], "namep_addr")
+        }.unwrap();
+        let fname = self.builder.build_load(self.ptr_ty, namep_addr, "fname").unwrap();
+        self.call_named("printf", &[self.cstr("%s: ").into(), fname.into()]);
+        let sslot = self.struct_field_slot(ssp, si);
+        let sfv = self.builder.build_load(self.value_ty, sslot, "sfv").unwrap().into_struct_value();
+        self.call_named("verb_print_value", &[sfv.into()]);
+        let snext = self.builder.build_int_add(si, i64t.const_int(1, false), "snext").unwrap();
+        self.builder.build_store(sidxp, snext).unwrap();
+        self.builder.build_unconditional_branch(scond_bb).unwrap();
+
+        self.builder.position_at_end(send_bb);
+        self.call_named("printf", &[self.cstr("}").into()]);
         self.builder.build_unconditional_branch(done).unwrap();
 
         self.builder.position_at_end(done);
@@ -1190,8 +1286,10 @@ impl<'ctx> Codegen<'ctx> {
         let is_clos = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_CLOSURE, false), "is_clos").unwrap();
         let is_arr = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_ARRAY, false), "is_arr").unwrap();
         let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
+        let is_struct = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STRUCT, false), "is_struct").unwrap();
         let is_clos_or_arr = self.builder.build_or(is_clos, is_arr, "is_clos_or_arr").unwrap();
-        let is_heap = self.builder.build_or(is_clos_or_arr, is_map, "is_heap").unwrap();
+        let is_map_or_struct = self.builder.build_or(is_map, is_struct, "is_map_or_struct").unwrap();
+        let is_heap = self.builder.build_or(is_clos_or_arr, is_map_or_struct, "is_heap").unwrap();
         self.builder.build_conditional_branch(is_heap, heap_bump_bb, done_bb).unwrap();
 
         self.builder.position_at_end(heap_bump_bb);
@@ -1244,6 +1342,13 @@ impl<'ctx> Codegen<'ctx> {
         let map_bb = self.ctx.append_basic_block(f, "map");
         let map_dec_bb = self.ctx.append_basic_block(f, "map.dec");
         let map_free_bb = self.ctx.append_basic_block(f, "map.free");
+        let struct_check_bb = self.ctx.append_basic_block(f, "struct.check");
+        let struct_bb = self.ctx.append_basic_block(f, "struct");
+        let struct_dec_bb = self.ctx.append_basic_block(f, "struct.dec");
+        let struct_free_bb = self.ctx.append_basic_block(f, "struct.free");
+        let struct_loop_cond_bb = self.ctx.append_basic_block(f, "struct.loop.cond");
+        let struct_loop_body_bb = self.ctx.append_basic_block(f, "struct.loop.body");
+        let struct_loop_end_bb = self.ctx.append_basic_block(f, "struct.loop.end");
         let done_bb = self.ctx.append_basic_block(f, "done");
 
         self.builder.position_at_end(entry);
@@ -1366,7 +1471,7 @@ impl<'ctx> Codegen<'ctx> {
         // ----- map: cascade via runtime/verb_map.cpp, then free header -----
         self.builder.position_at_end(map_check_bb);
         let is_map = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_MAP, false), "is_map").unwrap();
-        self.builder.build_conditional_branch(is_map, map_bb, done_bb).unwrap();
+        self.builder.build_conditional_branch(is_map, map_bb, struct_check_bb).unwrap();
 
         self.builder.position_at_end(map_bb);
         let mp = self.builder.build_int_to_ptr(p, self.ptr_ty, "mp").unwrap();
@@ -1385,8 +1490,190 @@ impl<'ctx> Codegen<'ctx> {
         self.call_named("free", &[mhdr.into()]);
         self.builder.build_unconditional_branch(done_bb).unwrap();
 
+        // ----- struct/record: cascade into every field, then free the one block -----
+        self.builder.position_at_end(struct_check_bb);
+        let is_struct = self.builder.build_int_compare(EQ, t, i8t.const_int(TAG_STRUCT, false), "is_struct").unwrap();
+        self.builder.build_conditional_branch(is_struct, struct_bb, done_bb).unwrap();
+
+        self.builder.position_at_end(struct_bb);
+        let ssp = self.builder.build_int_to_ptr(p, self.ptr_ty, "ssp").unwrap();
+        let shdr2 = self.header_ptr(ssp);
+        let scur2 = self.builder.build_load(i64t, shdr2, "scur2").unwrap().into_int_value();
+        let snext2 = self.builder.build_int_sub(scur2, i64t.const_int(1, false), "snext2").unwrap();
+        self.builder.build_store(shdr2, snext2).unwrap();
+        let szero2 = self.builder.build_int_compare(EQ, snext2, i64t.const_zero(), "szero2").unwrap();
+        self.builder.build_conditional_branch(szero2, struct_dec_bb, done_bb).unwrap();
+        self.builder.position_at_end(struct_dec_bb);
+        self.builder.build_unconditional_branch(struct_free_bb).unwrap();
+
+        self.builder.position_at_end(struct_free_bb);
+        let snfp = self.builder.build_struct_gep(self.struct_hdr_ty, ssp, 1, "snfp").unwrap();
+        let snf = self.builder.build_load(i64t, snfp, "snf").unwrap().into_int_value();
+        let sidxp = self.entry_alloca(i64t.into(), "srelidx");
+        self.builder.build_store(sidxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(struct_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(struct_loop_cond_bb);
+        let si = self.builder.build_load(i64t, sidxp, "si").unwrap().into_int_value();
+        let smore = self.builder.build_int_compare(
+            inkwell::IntPredicate::SLT, si, snf, "smore").unwrap();
+        self.builder.build_conditional_branch(smore, struct_loop_body_bb, struct_loop_end_bb).unwrap();
+
+        self.builder.position_at_end(struct_loop_body_bb);
+        let sslot = self.struct_field_slot(ssp, si);
+        let sfv = self.builder.build_load(self.value_ty, sslot, "sfv").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[sfv.into()]);
+        let sinext = self.builder.build_int_add(si, i64t.const_int(1, false), "sinext").unwrap();
+        self.builder.build_store(sidxp, sinext).unwrap();
+        self.builder.build_unconditional_branch(struct_loop_cond_bb).unwrap();
+
+        self.builder.position_at_end(struct_loop_end_bb);
+        // A struct is a single verb_alloc block (fields inline, descriptor is
+        // a static global) -- one dec + one free, like a closure.
+        self.dec_live_counter();
+        self.call_named("free", &[shdr2.into()]);
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
         self.builder.position_at_end(done_bb);
         self.builder.build_return(None).unwrap();
+    }
+
+    /// Runtime helper:
+    /// verb_struct_find(value obj, ptr fname, i32 line, i32 col, ptr op) -> i64
+    /// Aborts unless `obj` is a struct/record that has a field named
+    /// `fname`; returns that field's index. `op` is a %s C string
+    /// ("field access" / "field assignment") for the not-a-record message.
+    /// Shared by verb_struct_get/verb_struct_set so field-name lookup lives
+    /// in exactly one place.
+    fn build_struct_find_fn(&self) {
+        use inkwell::IntPredicate::{EQ, SLT};
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_struct_find",
+            i64t.fn_type(
+                &[self.value_ty.into(), self.ptr_ty.into(), i32t.into(), i32t.into(), self.ptr_ty.into()],
+                false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let obj = f.get_nth_param(0).unwrap().into_struct_value();
+        let fname = f.get_nth_param(1).unwrap().into_pointer_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+        let op = f.get_nth_param(4).unwrap().into_pointer_value();
+
+        let ok_bb = self.ctx.append_basic_block(f, "ok");
+        let notstruct_bb = self.ctx.append_basic_block(f, "notstruct");
+        let cond_bb = self.ctx.append_basic_block(f, "cond");
+        let body_bb = self.ctx.append_basic_block(f, "body");
+        let found_bb = self.ctx.append_basic_block(f, "found");
+        let next_bb = self.ctx.append_basic_block(f, "next");
+        let notfound_bb = self.ctx.append_basic_block(f, "notfound");
+
+        let tag = self.tag_of(obj);
+        let is_struct = self.builder.build_int_compare(
+            EQ, tag, self.ctx.i8_type().const_int(TAG_STRUCT, false), "isstruct").unwrap();
+        self.builder.build_conditional_branch(is_struct, ok_bb, notstruct_bb).unwrap();
+
+        self.builder.position_at_end(notstruct_bb);
+        self.abort_at(line, col, "'%s' needs a record, got %s", &[op.into(), self.type_name(tag)]);
+
+        self.builder.position_at_end(ok_bb);
+        let sp = self.builder.build_int_to_ptr(self.payload_of(obj), self.ptr_ty, "sp").unwrap();
+        let descp = self.builder.build_struct_gep(self.struct_hdr_ty, sp, 0, "descp").unwrap();
+        let desc = self.builder.build_load(self.ptr_ty, descp, "desc").unwrap().into_pointer_value();
+        let nfp = self.builder.build_struct_gep(self.struct_hdr_ty, sp, 1, "nfp").unwrap();
+        let nf = self.builder.build_load(i64t, nfp, "nf").unwrap().into_int_value();
+        let idxp = self.entry_alloca(i64t.into(), "fidx");
+        self.builder.build_store(idxp, i64t.const_zero()).unwrap();
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.builder.position_at_end(cond_bb);
+        let i = self.builder.build_load(i64t, idxp, "i").unwrap().into_int_value();
+        let more = self.builder.build_int_compare(SLT, i, nf, "more").unwrap();
+        self.builder.build_conditional_branch(more, body_bb, notfound_bb).unwrap();
+
+        self.builder.position_at_end(body_bb);
+        // descriptor names array starts at desc + 16, ptr-sized elements.
+        let noff = self.builder.build_int_mul(i, i64t.const_int(8, false), "noff").unwrap();
+        let noff = self.builder.build_int_add(noff, i64t.const_int(16, false), "noff16").unwrap();
+        let namep_addr = unsafe {
+            self.builder.build_in_bounds_gep(self.ctx.i8_type(), desc, &[noff], "namep_addr")
+        }.unwrap();
+        let name_i = self.builder.build_load(self.ptr_ty, namep_addr, "name_i").unwrap().into_pointer_value();
+        let c = self.call_named("strcmp", &[name_i.into(), fname.into()]).unwrap().into_int_value();
+        let eq = self.builder.build_int_compare(EQ, c, i32t.const_zero(), "nameeq").unwrap();
+        self.builder.build_conditional_branch(eq, found_bb, next_bb).unwrap();
+
+        self.builder.position_at_end(found_bb);
+        self.builder.build_return(Some(&i)).unwrap();
+
+        self.builder.position_at_end(next_bb);
+        let inext = self.builder.build_int_add(i, i64t.const_int(1, false), "inext").unwrap();
+        self.builder.build_store(idxp, inext).unwrap();
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.builder.position_at_end(notfound_bb);
+        self.abort_at(line, col, "unknown field '%s'", &[fname.into()]);
+    }
+
+    /// Runtime helper: verb_struct_get(value obj, ptr fname, i32, i32) -> value.
+    /// Loads field `fname` from record `obj`, retaining the value handed
+    /// back (mirrors Expr::Var / verb_array_get).
+    fn build_struct_get_fn(&self) {
+        self.build_struct_find_fn();
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_struct_get",
+            self.value_ty.fn_type(&[self.value_ty.into(), self.ptr_ty.into(), i32t.into(), i32t.into()], false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let obj = f.get_nth_param(0).unwrap().into_struct_value();
+        let fname = f.get_nth_param(1).unwrap().into_pointer_value();
+        let line = f.get_nth_param(2).unwrap().into_int_value();
+        let col = f.get_nth_param(3).unwrap().into_int_value();
+        let op = self.cstr("field access");
+        let i = self.call_named("verb_struct_find",
+            &[obj.into(), fname.into(), line.into(), col.into(), op.into()])
+            .unwrap().into_int_value();
+        let sp = self.builder.build_int_to_ptr(self.payload_of(obj), self.ptr_ty, "sp").unwrap();
+        let slot = self.struct_field_slot(sp, i);
+        let v = self.builder.build_load(self.value_ty, slot, "v").unwrap().into_struct_value();
+        self.call_named("verb_retain_value", &[v.into()]);
+        self.builder.build_return(Some(&v)).unwrap();
+    }
+
+    /// Runtime helper: verb_struct_set(value obj, ptr fname, value v, i32, i32) -> value.
+    /// Releases the field's previous value, stores `v` and retains it (the
+    /// slot's new home), and returns `v` -- the array-set discipline.
+    fn build_struct_set_fn(&self) {
+        let i32t = self.ctx.i32_type();
+        let f = self.module.add_function(
+            "verb_struct_set",
+            self.value_ty.fn_type(
+                &[self.value_ty.into(), self.ptr_ty.into(), self.value_ty.into(), i32t.into(), i32t.into()],
+                false),
+            None);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.builder.position_at_end(entry);
+        let obj = f.get_nth_param(0).unwrap().into_struct_value();
+        let fname = f.get_nth_param(1).unwrap().into_pointer_value();
+        let v = f.get_nth_param(2).unwrap().into_struct_value();
+        let line = f.get_nth_param(3).unwrap().into_int_value();
+        let col = f.get_nth_param(4).unwrap().into_int_value();
+        let op = self.cstr("field assignment");
+        let i = self.call_named("verb_struct_find",
+            &[obj.into(), fname.into(), line.into(), col.into(), op.into()])
+            .unwrap().into_int_value();
+        let sp = self.builder.build_int_to_ptr(self.payload_of(obj), self.ptr_ty, "sp").unwrap();
+        let slot = self.struct_field_slot(sp, i);
+        let old = self.builder.build_load(self.value_ty, slot, "old").unwrap().into_struct_value();
+        self.call_named("verb_release_value", &[old.into()]);
+        self.call_named("verb_retain_value", &[v.into()]);
+        self.builder.build_store(slot, v).unwrap();
+        self.builder.build_return(Some(&v)).unwrap();
     }
 
     /// Runtime helper: verb_retain_cell(ptr cell) -> void. Cells are
@@ -1748,7 +2035,51 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_return(Some(&v)).unwrap();
                 Ok(())
             }
+            Stmt::Record { name, fields, .. } => {
+                self.gen_record(name, fields);
+                Ok(())
+            }
+            Stmt::FieldSet { obj, field, value, line, col } => {
+                let o = self.gen_expr(obj)?;
+                let val = self.gen_expr(value)?;
+                let fname = self.cstr(field);
+                let (lc, cc) = self.loc_consts(*line, *col);
+                let rv = self.call_named(
+                    "verb_struct_set", &[o.into(), fname.into(), val.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                // Release the struct temp and the returned value temp (which
+                // is `val`, retained once inside verb_struct_set for its new
+                // home in the field slot).
+                self.call_named("verb_release_value", &[o.into()]);
+                self.call_named("verb_release_value", &[rv.into()]);
+                Ok(())
+            }
         }
+    }
+
+    /// Builds a record's static descriptor global
+    /// ({ i8* type_name, i64 nfields, [nfields x i8*] field_names }) and
+    /// registers it in `self.records`. Emits no runtime instructions.
+    fn gen_record(&mut self, name: &str, fields: &[String]) {
+        let i64t = self.ctx.i64_type();
+        let n = fields.len() as u64;
+        let name_const = self.cstr(name);
+        let field_consts: Vec<PointerValue<'ctx>> = fields.iter().map(|fld| self.cstr(fld)).collect();
+        let names_arr = self.ptr_ty.const_array(&field_consts);
+        let desc_ty = self.ctx.struct_type(
+            &[self.ptr_ty.into(), i64t.into(), self.ptr_ty.array_type(n as u32).into()], false);
+        let init = desc_ty.const_named_struct(&[
+            name_const.into(),
+            i64t.const_int(n, false).into(),
+            names_arr.into(),
+        ]);
+        let g = self.module.add_global(desc_ty, None, &format!("verb.rec.{name}"));
+        g.set_initializer(&init);
+        g.set_constant(true);
+        self.records.insert(name.to_string(), RecordInfo {
+            descriptor: g.as_pointer_value(),
+            fields: fields.to_vec(),
+        });
     }
 
     fn gen_expr(&mut self, expr: &Expr) -> Result<StructValue<'ctx>, CompileError> {
@@ -1822,6 +2153,16 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(elemsp, elems_buf).unwrap();
                 let bits = self.builder.build_ptr_to_int(hdr, self.ctx.i64_type(), "abits").unwrap();
                 Ok(self.make_val(TAG_ARRAY, bits))
+            }
+            Expr::FieldGet { obj, field, line, col } => {
+                let o = self.gen_expr(obj)?;
+                let fname = self.cstr(field);
+                let (lc, cc) = self.loc_consts(*line, *col);
+                let rv = self.call_named(
+                    "verb_struct_get", &[o.into(), fname.into(), lc.into(), cc.into()])
+                    .unwrap().into_struct_value();
+                self.call_named("verb_release_value", &[o.into()]);
+                Ok(rv)
             }
         }
     }
@@ -1962,6 +2303,33 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap().into_struct_value();
                 self.call_named("verb_release_value", &[arr.into()]);
                 return Ok(rv);
+            }
+            // record construction: `Point(3, 4)` -> heap struct value
+            if let Some(info) = self.records.get(name).cloned() {
+                let n = info.fields.len();
+                if args.len() != n {
+                    return Err(CompileError::new(
+                        format!("record '{name}' takes {n} field(s), got {}", args.len()),
+                        line, col));
+                }
+                // Evaluate each field value first (owned temporaries); they are
+                // moved into the struct's inline slots, so no extra retain --
+                // an Expr::Var's load already retained, literals are owned.
+                let mut vals = Vec::with_capacity(n);
+                for a in args {
+                    vals.push(self.gen_expr(a)?);
+                }
+                let sp = self.malloc_bytes(16 + (n as u64) * 16);
+                let descp = self.builder.build_struct_gep(self.struct_hdr_ty, sp, 0, "descp").unwrap();
+                self.builder.build_store(descp, info.descriptor).unwrap();
+                let nfp = self.builder.build_struct_gep(self.struct_hdr_ty, sp, 1, "nfp").unwrap();
+                self.builder.build_store(nfp, self.ctx.i64_type().const_int(n as u64, false)).unwrap();
+                for (i, v) in vals.into_iter().enumerate() {
+                    let slot = self.struct_field_slot(sp, self.ctx.i64_type().const_int(i as u64, false));
+                    self.builder.build_store(slot, v).unwrap();
+                }
+                let bits = self.builder.build_ptr_to_int(sp, self.ctx.i64_type(), "sbits").unwrap();
+                return Ok(self.make_val(TAG_STRUCT, bits));
             }
             let is_bound = self.lookup(name).is_some();
             if !is_bound && self.std_imports.iter().any(|m| m == "io") {

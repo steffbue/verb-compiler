@@ -4,7 +4,7 @@ use crate::error::CompileError;
 pub enum TokenKind {
     Int(i64), Float(f64), Str(String), Ident(String),
     Assign, Be, Declare, Make, Return, Check, Orelse, Repeat, Loop, True, False, Nil, Begin, End,
-    Import, Mod, Std, List,
+    Import, Mod, Std, List, Record, Of,
     Add, Sub, Neg, Times, Div,
     Equals, Differs, Trails, Beats, Atmost, Atleast,
     And, Or, Not, Join,
@@ -162,6 +162,7 @@ pub fn lex_with_comments(src: &str) -> Result<(Vec<Token>, Vec<Comment>), Compil
                     "true" => True, "false" => False, "nil" => Nil,
                     "begin" => Begin, "end" => End,
                     "import" => Import, "mod" => Mod, "std" => Std, "list" => List,
+                    "record" => Record, "of" => Of,
                     "add" => Add, "sub" => Sub, "neg" => Neg,
                     "times" => Times, "div" => Div,
                     "equals" => Equals, "differs" => Differs, "trails" => Trails,
@@ -221,6 +222,16 @@ mod tests {
             kinds("plus if while fn c"),
             vec![Ident("plus".into()), Ident("if".into()), Ident("while".into()),
                  Ident("fn".into()), Ident("c".into()), Eof]
+        );
+    }
+
+    #[test]
+    fn scans_record_and_of_keywords() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("record Point begin x of p end"),
+            vec![Record, Ident("Point".into()), Begin, Ident("x".into()), Of,
+                 Ident("p".into()), End, Eof]
         );
     }
 

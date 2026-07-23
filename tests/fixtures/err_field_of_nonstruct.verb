@@ -1,0 +1,2 @@
+assign n 5;
+print(x of n);

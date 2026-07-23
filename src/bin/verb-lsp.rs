@@ -446,7 +446,13 @@ fn collect_from_stmts(stmts: &[Stmt], out: &mut Symbols) {
             }
             Stmt::While { body, .. } => collect_from_stmts(body, out),
             Stmt::Block(inner) => collect_from_stmts(inner, out),
-            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_) => {}
+            Stmt::Record { name, .. } => {
+                if !out.vars.contains(name) {
+                    out.vars.push(name.clone());
+                }
+            }
+            Stmt::Reassign { .. } | Stmt::Return { .. } | Stmt::ExprStmt(_)
+            | Stmt::FieldSet { .. } => {}
         }
     }
 }
